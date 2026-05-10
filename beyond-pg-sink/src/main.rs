@@ -423,7 +423,7 @@ fn start_retention_watcher(dir: String, retain: usize) -> std::thread::JoinHandl
         }
 
         unsafe { libc::close(fd) };
-    });
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
