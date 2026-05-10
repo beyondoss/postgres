@@ -1,0 +1,20 @@
+name: beyond-pg-sink build
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Cross-compile for Linux amd64
+        run: cross build --release -p beyond-pg-sink --target x86_64-unknown-linux-gnu
+      - name: Cross-compile for Linux arm64
+        run: cross build --release -p beyond-pg-sink --target aarch64-unknown-linux-gnu
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: beyond-pg-sink-${{ github.sha }}
+          path: |
+            target/x86_64-unknown-linux-gnu/release/beyond-pg-sink
+            target/aarch64-unknown-linux-gnu/release/beyond-pg-sink
+          retention-days: 14

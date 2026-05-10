@@ -9,11 +9,14 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # shellcheck source=/dev/null
 source "${HOME}/.cargo/env"
 
-echo "==> Building beyond-pg from staged source..."
+echo "==> Building beyond-pg and beyond-pg-sink from staged source..."
 cargo build --release --manifest-path /tmp/beyond-pg-src/Cargo.toml
 
 echo "==> Installing beyond-pg binary..."
 install -m 0755 /tmp/beyond-pg-src/target/release/beyond-pg /usr/local/bin/beyond-pg
+
+echo "==> Installing beyond-pg-sink binary..."
+install -m 0755 /tmp/beyond-pg-src/target/release/beyond-pg-sink /usr/local/bin/beyond-pg-sink
 
 echo "==> Creating hook directories..."
 # Empty in MVP; tier-specific scripts drop in later via image updates.

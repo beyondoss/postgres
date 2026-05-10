@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "beyond-pg-sink"]
+resolver = "2"
+
 [package]
 name = "beyond-pg"
 version = "0.1.0"

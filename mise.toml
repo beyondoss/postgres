@@ -3,12 +3,25 @@ dprint = "latest"
 rust = { version = "1.92", components = "rustfmt,clippy", targets = "aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu" }
 cargo-binstall = "latest"
 "cargo:cross" = "latest"
+postgres = "18"
+yamlfmt = "latest"
+
+[tasks."test:e2e"]
+description = "Run WAL sink end-to-end test (requires Docker and pg_receivewal on PATH)"
+run = "cargo test -p beyond-pg-sink --test e2e -- --include-ignored --nocapture"
 
 [tasks."build:rs"]
 run = "cargo build"
 
 [tasks."build:rs:release"]
 run = "cargo build --release"
+
+[tasks."build:sink"]
+description = "Cross-compile beyond-pg-sink for Linux amd64 + arm64 (requires Docker for cross)"
+run = '''
+cross build --release -p beyond-pg-sink --target x86_64-unknown-linux-gnu
+cross build --release -p beyond-pg-sink --target aarch64-unknown-linux-gnu
+'''
 
 [tasks."check:rs"]
 run = "cargo clippy --workspace -- -D warnings"
@@ -59,7 +72,7 @@ PG_SEARCH_VER=$(_toml "['paradedb']['pg_search']")
 # fork at snapshot-creation time via the chroot mechanism in beyond/boxes.
 mkdir -p packer/staging
 rsync -a --delete --exclude=target \
-  src/ Cargo.toml Cargo.lock rust-toolchain.toml \
+  src Cargo.toml Cargo.lock rust-toolchain.toml beyond-pg-sink \
   packer/staging/beyond-pg-src/
 
 IMAGE_VERSION=$(git rev-parse --short HEAD)

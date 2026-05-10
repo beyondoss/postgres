@@ -1,0 +1,10 @@
+name: WAL sink e2e
+on: [push, pull_request]
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Run WAL sink e2e test
+        run: mise run test:e2e

@@ -1,0 +1,16 @@
+[package]
+name = "beyond-pg-sink"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+
+[[bin]]
+name = "beyond-pg-sink"
+path = "src/main.rs"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+postgres = "0.19"
+testcontainers-modules = { version = "0.15", features = ["blocking", "postgres"] }
