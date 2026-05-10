@@ -1,5 +1,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Child;
 use std::time::Duration;
@@ -16,11 +18,13 @@ struct Sink {
 
 impl Drop for Sink {
     fn drop(&mut self) {
-        // SIGTERM lets beyond-pg-sink forward the signal to pg_receivewal and
-        // wait for it to exit, avoiding an orphaned child that retries after drop.
+        // beyond-pg-sink was spawned as its own process group leader (pgid == pid).
+        // Killing the negative pgid takes both it and its pg_receivewal child down
+        // together, so no orphan keeps reconnecting and spamming stderr.
         #[cfg(unix)]
         unsafe {
-            libc::kill(self.process.id() as libc::pid_t, libc::SIGTERM);
+            let pid = self.process.id() as i32;
+            libc::kill(-pid, libc::SIGKILL);
         }
         #[cfg(not(unix))]
         let _ = self.process.kill();
@@ -141,19 +145,22 @@ fn wal_sink_streams_from_primary() {
     drop(probe);
 
     let connstr = format!("host=127.0.0.1 port={pg_port} user=postgres");
-    let process = std::process::Command::new(BIN)
-        .args([
-            "--connstr",
-            &connstr,
-            "--dir",
-            sink_dir.to_str().unwrap(),
-            "--port",
-            &http_port.to_string(),
-            "--slot",
-            "wal_sink",
-        ])
-        .spawn()
-        .expect("failed to spawn beyond-pg-sink");
+    let mut cmd = std::process::Command::new(BIN);
+    cmd.args([
+        "--connstr",
+        &connstr,
+        "--dir",
+        sink_dir.to_str().unwrap(),
+        "--port",
+        &http_port.to_string(),
+        "--slot",
+        "wal_sink",
+    ]);
+    // New process group so Sink::drop can SIGKILL the whole group, including
+    // the pg_receivewal child, instead of orphaning it.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let process = cmd.spawn().expect("failed to spawn beyond-pg-sink");
 
     // _sink is declared after container so it drops first — process killed
     // before the container is stopped.
