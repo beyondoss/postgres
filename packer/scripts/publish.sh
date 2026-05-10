@@ -2,10 +2,10 @@
 # Publish rootfs images to S3 for fleet distribution
 set -e
 
-: "${S3_BUCKET:?S3_BUCKET required (e.g., paraglide-images-staging)}"
+: "${S3_BUCKET:?S3_BUCKET required (e.g., beyond-images-staging)}"
 : "${AWS_REGION:=us-east-2}"
 
-IMAGE_DIR="${IMAGE_DIR:-/var/lib/paraglide/images/rootfs}"
+IMAGE_DIR="${IMAGE_DIR:-/var/lib/beyond/images/rootfs}"
 IMAGE_NAME="${1:-ubuntu-jammy}"
 TIER="${2:-128g}"
 S3_PREFIX="${S3_PREFIX:-rootfs}"

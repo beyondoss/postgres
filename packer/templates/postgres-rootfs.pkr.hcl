@@ -26,7 +26,7 @@ variable "postgres_version" {
 
 variable "output_dir" {
   type        = string
-  default     = "/pglide/images/postgres"
+  default     = "/beyond/images/postgres"
   description = "Directory for output images"
 }
 

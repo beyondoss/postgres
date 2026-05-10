@@ -112,7 +112,7 @@ Beyond's atomic unit is the box. Box-manager resizes boxes in place: volumes are
 That makes vertical scaling the default lever.
 
 ```
-glide pg scale --memory 64gb
+byd pg scale --memory 64gb
 ```
 
 A control-plane operation against the existing primitive. No coordination. No replication topology change. No re-shard. No downtime worth measuring. The auto-tuning service reads the new RAM size from MMDS and rewrites the tuning conf on next boot.

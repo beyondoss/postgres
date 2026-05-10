@@ -14,7 +14,7 @@ No SDK, no proprietary surface — the abstraction is `psql localhost`.
 - A drop-in Postgres that **just works** on Beyond. Connect to
   `localhost:5432`, get a database. Same command in dev, same in prod.
 - **Forks with the platform.** All persistent state lives on a single
-  GlideFS portable volume; `glide fork` carries it for free, and
+  GlideFS portable volume; `byd fork` carries it for free, and
   Postgres' own crash-recovery handles the consistency story.
 - **Extensions the modern stack expects**: `pgvector`, `pg_trgm`,
   `postgis`, `pg_cron`, `pg_partman`, `pg_jsonschema`, `hypopg`,
@@ -178,11 +178,11 @@ Cross-team dependencies the image cannot run without. Each is a small,
 generic Beyond capability — none Postgres-specific, all useful for
 sibling official images (queue, auth, kv).
 
-| Prerequisite                                | Owner                     | Status    | What we need                                                                                                                                                                                                                                        |
-| ------------------------------------------- | ------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pre-fork CHECKPOINT before snapshot         | box-manager + GlideFS API | Required  | Box-manager (or whichever component drives `glide fork`) calls our `checkpoint` vsock RPC on the source VM before `POST /snapshot`. Without it, fork-boot WAL replay can take 5–30 s for a hot source — undermines the substrate-thesis fork pitch. |
-| GlideFS `ephemeral=true` per-export policy  | GlideFS                   | Confirmed | Beyond marks dev/preview/branch volumes ephemeral; writes never flush to S3 (B-009).                                                                                                                                                                |
-| GlideFS `bless --hot-set` for fork prefetch | GlideFS                   | Confirmed | Used to prefetch `pg_class`/`pg_attribute`/recent WAL on fork boot.                                                                                                                                                                                 |
+| Prerequisite                                | Owner                     | Status    | What we need                                                                                                                                                                                                                                      |
+| ------------------------------------------- | ------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pre-fork CHECKPOINT before snapshot         | box-manager + GlideFS API | Required  | Box-manager (or whichever component drives `byd fork`) calls our `checkpoint` vsock RPC on the source VM before `POST /snapshot`. Without it, fork-boot WAL replay can take 5–30 s for a hot source — undermines the substrate-thesis fork pitch. |
+| GlideFS `ephemeral=true` per-export policy  | GlideFS                   | Confirmed | Beyond marks dev/preview/branch volumes ephemeral; writes never flush to S3 (B-009).                                                                                                                                                              |
+| GlideFS `bless --hot-set` for fork prefetch | GlideFS                   | Confirmed | Used to prefetch `pg_class`/`pg_attribute`/recent WAL on fork boot.                                                                                                                                                                               |
 
 The image will not work in production without the first prerequisite.
 The CHECKPOINT requirement is tracked alongside phase 3 (end-to-end boot)
@@ -223,7 +223,7 @@ Three block devices. Two used in MVP, one reserved.
 | `vdc`  | (reserved — local NVMe scratch)        | Host     | Future Tier 2: `pg_wal` only                 |
 
 **Why one volume in MVP, not two.** Putting WAL on the same volume as
-data means forks atomically include WAL. `glide fork` produces a
+data means forks atomically include WAL. `byd fork` produces a
 crash-consistent block snapshot; Postgres' own recovery replays
 uncheckpointed WAL on the fork the same way it would after a power
 loss. No `pg_resetwal`, no pre-fork coordination, no special path.
@@ -1010,11 +1010,11 @@ distinction. ORMs target 5432.
 Both Postgres and PgBouncer write to stderr. `beyond-pg` spawns each
 with a piped stderr, reads lines from both pipes via async Tokio tasks,
 and forwards them over vsock to box-manager as `UserProcessStreamData`
-frames — the same wire format `paraglide-agent` uses for user-app
+frames — the same wire format `beyond-agent` uses for user-app
 supervised processes. Box-manager emits structured log events with full
 context (`box_id`, `vm_id`, `execution_id`, stream type).
 
-The rate-limit and wire format match `paraglide-agent`'s
+The rate-limit and wire format match `beyond-agent`'s
 `log_forwarder.rs` exactly: 500 lines/sec sustained, 1000 line burst;
 lines truncated at `MAX_USER_PROCESS_LINE_BYTES`; a synthetic
 `[beyond-pg: dropped N log lines]` frame inserted before the next
@@ -1064,7 +1064,7 @@ the primitive; the image inherits it.
 | Backup operation        | Implementation                                                                                          |
 | ----------------------- | ------------------------------------------------------------------------------------------------------- |
 | Daily / hourly backup   | `POST /api/exports/{vol}/snapshot` on a schedule. Atomic, CoW-cheap.                                    |
-| Restore from backup     | `glide fork <snapshot-id>` → boots a Postgres VM at that snapshot's state.                              |
+| Restore from backup     | `byd fork <snapshot-id>` → boots a Postgres VM at that snapshot's state.                                |
 | PITR within an interval | `archive_command` ships WAL segments to S3 between snapshots; replay applies them up to the target LSN. |
 | Cross-region DR         | GlideFS replicates volume backing across regions (substrate feature, async).                            |
 
@@ -1098,14 +1098,14 @@ What lives outside the image:
   `POST /api/exports/{vol}/snapshot` on the desired cadence. Tens of
   lines of glue, not a service. Tracked separately.
 - **Snapshot retention policy.** Same place.
-- **PITR target/restore UX** (`glide pg restore --to-time T`). CLI
+- **PITR target/restore UX** (`byd pg restore --to-time T`). CLI
   surface, post-MVP.
 
 ---
 
 ## The fork story
 
-`glide fork` snapshots `vdb`. The block-level snapshot is
+`byd fork` snapshots `vdb`. The block-level snapshot is
 crash-consistent (taken under GlideFS' write-cache rotation lock —
 `glidefs/src/block/write_cache/flush.rs:441-568`) — equivalent to
 yanking power from the source VM at the snapshot timestamp. ext4's
@@ -1223,7 +1223,7 @@ always preserved across image swaps and tier changes.
 ### What Tier 2 looks like, concretely
 
 ```
-control-plane: glide pg promote-to-ha myapp
+control-plane: byd pg promote-to-ha myapp
   │
   ├─ provision 2 replica VMs (box-manager hint: "different host than primary")
   │  └─ each boots with BEYOND_PG_TIER=replica, primary_conninfo in MMDS
@@ -1289,7 +1289,7 @@ postgres/
 No systemd. `beyond-pg` is PID 1 — `/sbin/init` symlinks to
 `/usr/local/bin/beyond-pg`. The same binary runs in Firecracker and
 in Docker for local dev. Box-manager injects the standard
-`paraglide-init` and `paraglide-agent` binaries into the rootfs (as
+`beyond-init` and `beyond-agent` binaries into the rootfs (as
 it does for every image) but neither is started — `/sbin/init` points
 to `beyond-pg`.
 

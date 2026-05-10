@@ -1,7 +1,7 @@
 # Phase 4 — Fork validation
 
 A Postgres VM that boots cleanly is half the product. The other half
-is forking. This phase proves `glide fork` against a Postgres volume
+is forking. This phase proves `byd fork` against a Postgres volume
 produces a working forked database, end-to-end, in 200 ms (snapshot)
 plus boot time.
 
@@ -9,7 +9,7 @@ This is the wedge demo. Get it right.
 
 ## Goal
 
-A live Postgres VM with real data. Run `glide fork`. The forked VM
+A live Postgres VM with real data. Run `byd fork`. The forked VM
 boots, has the same data, has the same extensions installed, accepts
 queries. Production keeps moving. Branches diverge.
 
@@ -53,7 +53,7 @@ queries. Production keeps moving. Branches diverge.
    - Run a write on the fork. Run a write on the source. Confirm
      they don't see each other.
 
-6. **Measure cold-fork boot latency.** From `glide fork` invocation
+6. **Measure cold-fork boot latency.** From `byd fork` invocation
    to first successful `psql` query against the fork:
    - Snapshot time (S3 manifest PUT).
    - VM provisioning time (Firecracker startup).
@@ -91,7 +91,7 @@ queries. Production keeps moving. Branches diverge.
 
 ## Acceptance criteria
 
-- [ ] A Postgres VM forks via `glide fork` (or the equivalent API
+- [ ] A Postgres VM forks via `byd fork` (or the equivalent API
       call) and the fork accepts queries within 30 s of the snapshot
       command returning.
 - [ ] Forked database has identical row counts to source at snapshot

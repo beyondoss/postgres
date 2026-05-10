@@ -4,14 +4,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v6
+      - name: Install system dependencies
+        run: sudo apt-get install -y libreadline-dev
+      - uses: jdx/mise-action@v4
       - name: Cross-compile for Linux amd64
         run: cross build --release -p beyond-pg-sink --target x86_64-unknown-linux-gnu
       - name: Cross-compile for Linux arm64
         run: cross build --release -p beyond-pg-sink --target aarch64-unknown-linux-gnu
       - name: Upload binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: beyond-pg-sink-${{ github.sha }}
           path: |

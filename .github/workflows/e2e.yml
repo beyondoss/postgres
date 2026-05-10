@@ -4,7 +4,9 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v6
+      - name: Install system dependencies
+        run: sudo apt-get install -y libreadline-dev
+      - uses: jdx/mise-action@v4
       - name: Run WAL sink e2e test
         run: mise run test:e2e

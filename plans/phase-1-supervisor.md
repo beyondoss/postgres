@@ -39,12 +39,12 @@ beyond-pg
 
 0. **PID 1 init (`init.rs`).** `beyond-pg` detects `getpid() == 1` in
    `main.rs` and calls `init::run()` before anything else. `init::run()`
-   performs the Linux init responsibilities that `paraglide-init` used to
+   performs the Linux init responsibilities that `beyond-init` used to
    handle, then falls through to `supervisor::run()`.
 
    Steps, in order:
 
-   a. **Mount essential filesystems.** Same set as `paraglide-init`:
+   a. **Mount essential filesystems.** Same set as `beyond-init`:
 
    ```rust
    mount("proc",  "/proc",     "proc",   MS_NOSUID|MS_NOEXEC|MS_NODEV, "");
@@ -81,11 +81,11 @@ beyond-pg
    TAP on the host). Fall back to the IPv4 gateway. Always append
    `nameserver 8.8.8.8`.
 
-   e. **zram swap.** Mirror `paraglide-init`: create a zram device,
+   e. **zram swap.** Mirror `beyond-init`: create a zram device,
    format as swap, `swapon`. Size: 10% of RAM or 256 MB, whichever is
    smaller. Best-effort — log and continue if it fails.
 
-   f. **sysctl.** Apply the same tuning from `paraglide-init`:
+   f. **sysctl.** Apply the same tuning from `beyond-init`:
    `vm.swappiness`, `net.core.somaxconn`, etc. Shell out to `sysctl -w`
    or write `/proc/sys/` directly.
 
@@ -171,7 +171,7 @@ beyond-pg
 6. **Restart logic (`supervisor.rs::supervise`).** On child exit:
    - If exit was clean and supervisor is shutting down: skip restart.
    - Otherwise: exponential backoff (start 100 ms, max 30 s, reset
-     after 60 s of stable runtime). Mirror `paraglide-init`'s shape.
+     after 60 s of stable runtime). Mirror `beyond-init`'s shape.
    - Log every restart with reason.
 
 7. **Signal handling (`supervisor.rs`).** `signalfd` for SIGTERM and
@@ -192,7 +192,7 @@ beyond-pg
 
 8. **`log_forwarder.rs`.** Read lines from a child's stdout/stderr
    pipe, frame them, ship over vsock. Wire format mirrors
-   `paraglide-agent`'s `log_forwarder.rs` so the host receiver can't
+   `beyond-agent`'s `log_forwarder.rs` so the host receiver can't
    tell the difference. Cite
    `beyond/boxes/guest-agent/src/supervisor/log_forwarder.rs` and
    match the `UserProcessStreamData` payload format from
@@ -339,7 +339,7 @@ pooler immediately, no PgBouncer restart.
   table.
 - DECISIONS.md G-001 (idempotent every-boot setup), G-004 (beyond-pg
   as PID 1), L-001 (vsock RPC).
-- `beyond/boxes/paraglide-init/src/main.rs` — reference for mount
+- `beyond/boxes/beyond-init/src/main.rs` — reference for mount
   sequence, network setup, zram, and signal handling shape to mirror.
 - `beyond/boxes/guest-agent/src/supervisor/log_forwarder.rs` — log
   shipping wire format to mirror.

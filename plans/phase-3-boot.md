@@ -9,7 +9,7 @@ this is where Postgres-on-Beyond exists for the first time.
 
 ## Goal
 
-`glide pg create myapp` (or whatever the temporary control-plane
+`byd pg create myapp` (or whatever the temporary control-plane
 incantation is) provisions a Firecracker VM from the postgres image
 against a fresh GlideFS data volume, and a developer can
 `psql -h <vm-ip>` and run SQL within 30 seconds.
@@ -31,7 +31,7 @@ against a fresh GlideFS data volume, and a developer can
 
 1. **Box-manager prerequisite: pre-fork CHECKPOINT hook.** Before
    calling `POST /api/exports/{vol}/snapshot` on a Postgres VM's data
-   volume, box-manager (or whichever component drives `glide fork`)
+   volume, box-manager (or whichever component drives `byd fork`)
    sends `{ "cmd": "checkpoint" }` to our supervisor's vsock RPC port
    on the source VM. The RPC blocks until the CHECKPOINT completes
    (~tens of ms on a small DB, longer on a hot one); then the snapshot
@@ -50,7 +50,7 @@ Out of this repo, but tracked alongside #1. Validated in phase 4.
 
 2. **Kernel cmdline.** Verify `packer/scripts/post-process.sh` boot_args
    are `root=/dev/vda console=ttyS0 reboot=k panic=1 pci=off` with no
-   `paraglide.agent_path=` — `beyond-pg` is PID 1, no agent path needed.
+   `beyond.agent_path=` — `beyond-pg` is PID 1, no agent path needed.
 
 3. **Provisioning script.** A throwaway shell or Rust script
    (`scripts/provision-test-vm.sh`) that:
@@ -63,7 +63,7 @@ Out of this repo, but tracked alongside #1. Validated in phase 4.
      postgres -c "SELECT 1"` to succeed.
 
    This is a phase-3-only test driver. The real CLI surface
-   (`glide pg create`) is post-MVP.
+   (`byd pg create`) is post-MVP.
 
 4. **End-to-end boot test.** Run the provisioning script. Watch
    logs via box-manager's log API. Expect:
@@ -116,7 +116,7 @@ Out of this repo, but tracked alongside #1. Validated in phase 4.
 
 ## Out of scope
 
-- A user-facing CLI (`glide pg create`). The phase-3 driver is a
+- A user-facing CLI (`byd pg create`). The phase-3 driver is a
   test script.
 - Multi-VM scenarios (replicas, HA). Single VM only.
 - Backups, archiving with a real target. Stub paths only.

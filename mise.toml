@@ -36,7 +36,7 @@ run = "dprint fmt"
 description = "Build Postgres rootfs image with Packer"
 usage = '''
 arg "[version]" help="Ubuntu version (noble)" default="noble"
-arg "[output_dir]" help="Output directory" default="/pglide/images/postgres"
+arg "[output_dir]" help="Output directory" default="/beyond/images/postgres"
 flag "--arch <arch>" help="Target architecture (amd64, arm64). Auto-detected if not specified."
 flag "--bless" help="Bless image for GlideFS direct boot after build"
 flag "--tier <tier>" help="Space-separated tiers to build (e.g. '16g' or '16g 32g'). Default: 16g"
@@ -46,7 +46,7 @@ run = '''
 set -euo pipefail
 
 UBUNTU_VERSION="${version:-noble}"
-OUTPUT_DIR="${output_dir:-/pglide/images/postgres}"
+OUTPUT_DIR="${output_dir:-/beyond/images/postgres}"
 ARCH="${arch:-amd64}"
 BUILD_TIERS="${tier:-16g}"
 
@@ -68,7 +68,7 @@ PG_REPACK_VER=$(_toml "['pgdg']['pg_repack']")
 PG_SEARCH_VER=$(_toml "['paradedb']['pg_search']")
 
 # Stage Rust source for in-container build.
-# paraglide-init is NOT staged here — box-manager injects it into the GlideFS
+# beyond-init is NOT staged here — box-manager injects it into the GlideFS
 # fork at snapshot-creation time via the chroot mechanism in beyond/boxes.
 mkdir -p packer/staging
 rsync -a --delete --exclude=target \
@@ -129,7 +129,7 @@ run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 : "${S3_BUCKET:?S3_BUCKET required}"
-IMAGE_DIR="${OUTPUT_DIR:-/pglide/images/postgres}"
+IMAGE_DIR="${OUTPUT_DIR:-/beyond/images/postgres}"
 exec env IMAGE_DIR="${IMAGE_DIR}" packer/scripts/publish.sh \
   "${image_name:-postgres-noble}" "${tier:-16g}"
 '''

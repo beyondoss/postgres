@@ -278,7 +278,7 @@ RDS or Supabase, with the substrate doing more of the work.
 - Snapshot scheduling cadence (hourly / daily / both). Tens of lines
   of control-plane glue, not a service.
 - Snapshot retention policy. Same place.
-- User-facing restore UX (`glide pg restore --to-time T`). CLI
+- User-facing restore UX (`byd pg restore --to-time T`). CLI
   surface, post-MVP.
 
 **What stays in the image:**
@@ -538,7 +538,7 @@ plus the vCPU-derived parallelism knobs (`max_worker_processes`,
 
 **Why.** Static defaults are wrong everywhere except one size. The
 image runs on 4 GB / 2 vCPU dev boxes and 256 GB / 64 vCPU production
-boxes from the same artifact. Resizing a box (`glide pg scale`) should
+boxes from the same artifact. Resizing a box (`byd pg scale`) should
 leave the database correctly tuned without a manual step. Regenerating
 every boot makes that automatic.
 
@@ -740,7 +740,7 @@ the same binary works locally without MMDS infrastructure.
   the volume; MMDS is the existing channel.
 - _Env vars only (no MMDS)._ Rejected: doesn't compose with Firecracker
   boot where secrets aren't baked into the image or environment block.
-- _Have paraglide-init write MMDS data to `/etc/environment`; read from
+- _Have beyond-init write MMDS data to `/etc/environment`; read from
   there._ Rejected: ties the image to a platform binary. Env var fallback
   achieves the same local-dev composability without the dependency.
 
@@ -774,18 +774,18 @@ in a single self-contained process. No intermediate init binary.
 2. **Open-source legibility.** This is a public repo. The boot path —
    `kernel → /sbin/init → beyond-pg → postgres` — is self-contained.
    Anyone can understand how the image boots without knowing Beyond's
-   internal toolchain. A binary named `paraglide-init` in `/sbin/init`
+   internal toolchain. A binary named `beyond-init` in `/sbin/init`
    requires context that no external reader has.
 
 3. **Minimum effective abstraction.** A two-tier model (outer init +
    inner binary) would save ~200 lines of init code at the cost of:
-   - A binary dependency on a Beyond-internal `paraglide-init`
+   - A binary dependency on a Beyond-internal `beyond-init`
    - An extra process slot per VM
    - Inter-process coordination (MMDS data from outer tier → inner tier)
    - A Postgres image that only works on Beyond's platform
      Not the right trade for a database image that must also run locally.
 
-4. **`paraglide-agent` is the wrong inner tier.** It carries ~20 kLoC
+4. **`beyond-agent` is the wrong inner tier.** It carries ~20 kLoC
    of features for the user-app loop (file watching, rsync, MCP,
    lifecycle phases, PTY). None of it applies to a database. We'd carry
    dead weight to use 200 lines of supervision logic.
@@ -807,12 +807,12 @@ if a backup is running.
 
 **Alternatives considered.**
 
-- _Two-tier: `paraglide-init` outer (PID 1) + `beyond-pg supervisor`
+- _Two-tier: `beyond-init` outer (PID 1) + `beyond-pg supervisor`
   inner._ Rejected: see reasons 1–3 above. The two-tier model existed
   to reuse Beyond's generic init work; the cost (platform binary in
   image, no local-dev composability, abstraction leak) outweighs the
   benefit (~200 saved lines of Rust).
-- _`paraglide-agent` as the inner tier, unmodified._ Rejected: ~20 kLoC
+- _`beyond-agent` as the inner tier, unmodified._ Rejected: ~20 kLoC
   of user-app features, none of which applies to a database. File
   watching during `initdb` is a footgun.
 - _systemd as PID 1._ Rejected: no other Beyond image runs systemd.
@@ -826,7 +826,7 @@ if a backup is running.
 - `beyond-pg` is ~400 lines longer than it would be without init
   responsibilities (zombie reap, signal handling, mount setup, network
   config). Worth it for composability and legibility.
-- Box-manager injects the standard `paraglide-init` and `paraglide-agent`
+- Box-manager injects the standard `beyond-init` and `beyond-agent`
   into the rootfs (as it does for all images), but neither is started.
   `/sbin/init` points to `beyond-pg`. Content-addressed blocks are
   shared; storage cost is zero.
@@ -844,7 +844,7 @@ if a backup is running.
 **Decision.** `beyond-pg` spawns postgres and pgbouncer with piped
 stderr, reads lines via async Tokio tasks, and forwards them over vsock
 as `UserProcessStreamData` frames — the same wire format and rate-limit
-parameters as `paraglide-agent`'s `log_forwarder.rs` (500 lines/sec
+parameters as `beyond-agent`'s `log_forwarder.rs` (500 lines/sec
 sustained, 1000 burst, truncation at `MAX_USER_PROCESS_LINE_BYTES`).
 
 Log shipping mode is **auto-detected at startup**: if vsock connects
@@ -866,7 +866,7 @@ vsock dependency would break `docker run beyond-postgres`. Auto-detect
 with pass-through fallback gives composability without giving up proper
 Beyond integration.
 
-**Why match `paraglide-agent` wire format exactly.** Box-manager's
+**Why match `beyond-agent` wire format exactly.** Box-manager's
 `UserProcessStreamData` handler emits structured log events (`box.log`
 tracing target) with full context fields. Matching the format means the
 host receiver needs no changes — the Postgres image plugs into the
@@ -1218,7 +1218,7 @@ Beyond; the Postgres image doesn't ask them to learn anything new.
 
 **Where we deliberately diverge:**
 
-- _PID 1 (G-004)._ User-app images use `paraglide-init` as PID 1 with
+- _PID 1 (G-004)._ User-app images use `beyond-init` as PID 1 with
   guest-agent in the inner slot. We use `beyond-pg` as PID 1 directly.
   Composability and open-source legibility outweigh the saved init code.
 - _Log shipping mode (H-001)._ We auto-detect vsock availability rather

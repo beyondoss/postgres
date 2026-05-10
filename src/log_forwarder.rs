@@ -10,7 +10,7 @@
 //! Each `spawn_reader_task` call consumes one stdio pipe, reads lines, applies
 //! per-stream token-bucket rate limiting, and sends `LogFrame`s to the shared
 //! channel. The channel is bounded (capacity 1024); when full, new frames are
-//! dropped with a counter that synthesizes a single "[paraglide: dropped N log
+//! dropped with a counter that synthesizes a single "[beyond: dropped N log
 //! lines]" message before the next successful send.
 //!
 //! The child process is never blocked — all pipe I/O is non-blocking and reads
@@ -184,7 +184,7 @@ async fn send_frame(
     if *dropped > 0 {
         let notice = LogFrame {
             stream,
-            line: format!("[paraglide: dropped {} log lines]", *dropped),
+            line: format!("[beyond: dropped {} log lines]", *dropped),
             truncated: false,
             execution_id: Arc::clone(execution_id),
         };

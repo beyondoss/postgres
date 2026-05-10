@@ -121,7 +121,7 @@ work end-to-end.
 
 - [ ] `mise run image:postgres:build noble` succeeds on a Linux
       builder host, producing tiered `.img` files in
-      `/pglide/images/postgres/`.
+      `/beyond/images/postgres/`.
 - [ ] Each `.img` boots in Firecracker against a blank data volume
       and a working MMDS (with `POSTGRES_PASSWORD` set), and:
       - [ ] Postgres listens on `127.0.0.1:5433`.

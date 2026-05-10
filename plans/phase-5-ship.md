@@ -104,7 +104,7 @@ ready for the first wave of internal Beyond projects to use it.
 ## Acceptance criteria
 
 - [ ] `mise run image:postgres:publish` ships an image to S3.
-- [ ] Manifest includes the correct `paraglide.agent_path=` boot arg and the extensions
+- [ ] Manifest includes the correct `beyond.agent_path=` boot arg and the extensions
       pin snapshot.
 - [ ] Fleet hosts auto-pull on NATS notification.
 - [ ] CI builds and smoke-tests every PR + main + tag.
@@ -115,7 +115,7 @@ ready for the first wave of internal Beyond projects to use it.
 
 ## Out of scope
 
-- A user-facing CLI surface (`glide pg create/scale/promote-to-ha`).
+- A user-facing CLI surface (`byd pg create/scale/promote-to-ha`).
   Tracked separately.
 - Tier 2 (HA, sync replication). Documented as future work in
   `docs/upgrades.md` but not implemented.
