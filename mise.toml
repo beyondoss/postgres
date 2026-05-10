@@ -6,6 +6,10 @@ cargo-binstall = "latest"
 postgres = "18"
 yamlfmt = "latest"
 
+[tasks."test:unit"]
+description = "Run unit tests only (no Docker required)"
+run = "cargo test --workspace"
+
 [tasks."test:e2e"]
 description = "Run WAL sink end-to-end test (requires Docker and pg_receivewal on PATH)"
 run = "cargo test -p beyond-pg-sink --test e2e -- --include-ignored --nocapture"

@@ -1,12 +1,12 @@
-name: WAL sink e2e
+name: tests
 on: [push, pull_request]
 jobs:
-  e2e:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install system dependencies
         run: sudo apt-get install -y libreadline-dev uuid-dev
       - uses: jdx/mise-action@v4
-      - name: Run WAL sink e2e test
-        run: mise run test:e2e
+      - name: test
+        run: mise run "test:*"
