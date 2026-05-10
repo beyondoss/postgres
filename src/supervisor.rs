@@ -586,7 +586,9 @@ async fn log_writer_task(mut log_rx: mpsc::Receiver<LogFrame>) {
     use tokio::io::AsyncWriteExt;
 
     loop {
-        match tokio_vsock::VsockStream::connect(HOST_CID, VSOCK_PORT).await {
+        match tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(HOST_CID, VSOCK_PORT))
+            .await
+        {
             Ok(mut stream) => {
                 info!("log forwarder connected to vsock {HOST_CID}:{VSOCK_PORT}");
                 while let Some(frame) = log_rx.recv().await {

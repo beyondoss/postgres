@@ -15,7 +15,7 @@
 #[cfg(target_os = "linux")]
 mod inner {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_vsock::{VMADDR_CID_ANY, VsockListener, VsockStream};
+    use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener, VsockStream};
     use tracing::{error, info, warn};
 
     use crate::vsock::RPC_PORT;
@@ -51,7 +51,7 @@ mod inner {
     }
 
     pub async fn serve() {
-        let listener = match VsockListener::bind(VMADDR_CID_ANY, RPC_PORT) {
+        let listener = match VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, RPC_PORT)) {
             Ok(l) => l,
             Err(e) => {
                 error!("rpc: failed to bind vsock port {RPC_PORT}: {e}");

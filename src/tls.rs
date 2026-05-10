@@ -214,7 +214,7 @@ fn chown_postgres(cert_path: &Path, key_path: &Path) -> Result<(), TlsError> {
     let (uid, gid) = unsafe { ((*pwd).pw_uid, (*pwd).pw_gid) };
 
     for path in [cert_path, key_path] {
-        let path_c = CString::new(path.as_os_str().as_bytes())
+        let path_c = CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|e| TlsError::Io(std::io::Error::other(e.to_string())))?;
         // SAFETY: path_c is a valid NUL-terminated path string.
         if unsafe { libc::chown(path_c.as_ptr(), uid, gid) } != 0 {
