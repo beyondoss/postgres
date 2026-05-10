@@ -62,19 +62,19 @@ ship.
 The platform commits to three answers. MVP ships #1 of each; the
 seams in this image make #2 a config flag away.
 
-### Durability — quorum-replicated WAL via Postgres sync replication
+### Durability — quorum-replicated WAL, lightest mechanism first
 
 Every committed transaction on a production database lives on **≥2
 independent failure domains** before the client gets an ack.
-Mechanism: Postgres sync replication with
-`synchronous_commit = remote_write` and
-`synchronous_standby_names = 'ANY 1 (r1, r2)'`.
+Tier 1.5 achieves this with a WAL sink (`pg_receivewal --synchronous`)
+and no full data replica. Tier 2 adds a promotable standby on top.
 
-| Tier             | Environment | Mechanism                                        | Host-loss data loss         |
-| ---------------- | ----------- | ------------------------------------------------ | --------------------------- |
-| 1 — single (MVP) | durable     | GlideFS write-behind (S3 flush every 5 s)        | Up to 5 s / 64 MB acked WAL |
-| 1 — single (MVP) | ephemeral   | GlideFS export `ephemeral=true` — local SSD only | Volume gone on host loss    |
-| 2 — HA           | durable     | Sync replication, ≥2 replicas, quorum on ANY 1   | Zero (any single host loss) |
+| Tier             | Environment | Mechanism                                                    | Host-loss data loss         |
+| ---------------- | ----------- | ------------------------------------------------------------ | --------------------------- |
+| 1 — single (MVP) | durable     | GlideFS write-behind (S3 flush every 5 s)                    | Up to 5 s / 64 MB acked WAL |
+| 1 — single (MVP) | ephemeral   | GlideFS export `ephemeral=true` — local SSD only             | Volume gone on host loss    |
+| 1.5 — WAL sink   | durable     | `pg_receivewal --synchronous`; gap fetch in `beyond-pg boot` | Zero (any single host loss) |
+| 2 — HA           | durable     | Sync replication, ≥2 replicas, quorum on ANY 1               | Zero (any single host loss) |
 
 Ephemerality is a substrate property, not a Postgres feature.
 Beyond marks preview, branch, and throwaway-fork environments as
@@ -374,12 +374,19 @@ subcommand because there's no external invoker that needs a CLI surface.
    - `POSTGRES_PASSWORD` (required; fail closed if missing)
    - `POSTGRES_DATABASE` (default `postgres`)
    - `BEYOND_PG_ARCHIVE_TARGET` (optional)
+   - `BEYOND_PG_WAL_SINK` (optional; HTTP endpoint of WAL sink; enables Tier 1.5 durability)
 2. If `PGDATA/PG_VERSION` exists, skip to step (5).
 3. Run `initdb -D /var/lib/postgresql/18/main --auth=scram-sha-256
    --encoding=UTF8 --locale=en_US.UTF-8 --pwfile=<MMDS password>`.
 4. Symlink `pg_wal` according to `BEYOND_PG_TIER`:
    - `single` → `/var/lib/postgresql/18/wal` on `vdb`
    - `primary` / `replica` → `/var/lib/postgresql/18/wal` on `vdc`
+     4a. If `BEYOND_PG_WAL_SINK` is set, fetch any WAL gap before booting.
+     Read `pg_controldata` to find the last valid WAL location. Fetch
+     any segments past that point from the sink's HTTP endpoint. Place
+     them in `pg_wal/`. Idempotent: no-op if no gap exists. This closes
+     the GlideFS write-behind window; Postgres sees no missing WAL and
+     recovers normally.
 5. Drop `conf.d/00-beyond.conf` (overwriting). Drop `pg_hba.conf`
    (overwriting). If `BEYOND_VOLUME_EPHEMERAL=true`, drop
    `conf.d/02-durability.conf` with `synchronous_commit = off`;

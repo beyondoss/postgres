@@ -147,38 +147,63 @@ Beyond-internal features (e.g. `beyond_queue` event sourcing).
 **Cost.** ~10 % more WAL volume than `replica`. At MVP traffic
 levels, immaterial.
 
-### B-006 — Tier 2 durability via Postgres sync replication (not storage-layer quorum)
+### B-006 — Production durability via Postgres-native WAL quorum, not storage-layer quorum
 
-**Decision.** When Tier 2 ships, durability comes from
-`synchronous_commit = remote_write` + `synchronous_standby_names =
-'ANY 1 (r1, r2)'` — a Postgres-native primitive — not from a custom
-storage protocol underneath Postgres.
+**Decision.** Quorum-durable WAL is achieved via Postgres-native
+mechanisms (`pg_receivewal --synchronous` for Tier 1.5; full sync
+replication for Tier 2), not via a custom storage protocol underneath
+Postgres. GlideFS remains write-behind.
 
-**Why.** Three reasons.
-
-1. **Beyond's substrate hands us multi-VM as a primitive.** Spinning
-   up replica VMs is a 200 ms control-plane op against an existing
-   primitive. Sync replication just plugs into that.
-2. **Standard Postgres replication is battle-tested.** Two decades of
-   production use, every monitoring tool understands it, every DBA
-   knows how to debug it. Custom storage protocols don't have this.
-3. **GlideFS does the storage-layer-CoW work already.** The reason
-   Aurora and Neon built custom storage was to get CoW + S3 + local
-   caching. We have those. The remaining gap is quorum-durable WAL,
-   which is exactly what sync replication provides.
+**Why.** The reason Aurora and Neon built custom storage was to get
+CoW + S3 + local-SSD caching. GlideFS already provides those. The
+remaining gap is WAL landing on a second failure domain before a
+commit is acked. Postgres already solves that — we use it, we don't
+reinvent it.
 
 **Alternatives considered.**
 
+- _GlideFS adds synchronous WAL replication._ GlideFS is a general
+  block device; WAL semantics don't belong there. Wrong layer.
 - _Aurora-style: WAL is the only thing the primary writes; data
-  reconstructed from WAL by storage nodes._ Rejected: requires
-  forking Postgres (custom `smgr`); buys stateless-compute failover
-  (sub-second) over warm-standby failover (seconds); not worth a
-  person-year of fork maintenance for the operational delta.
-- _Neon-style: Safekeepers (Paxos WAL log) + Pageserver._ Rejected:
-  same reasoning — Pageserver's job is GlideFS' job already, and
-  Safekeepers' job is sync replication's job already.
-- _GlideFS adds a "durable WAL" mode._ Out of scope. Possible
-  long-term GlideFS work but not on the critical path.
+  reconstructed from WAL by storage nodes._ Requires forking Postgres
+  (custom `smgr`); buys sub-second failover over seconds; not worth a
+  person-year of fork maintenance for the delta.
+- _Neon-style: Safekeepers (Paxos WAL log) + Pageserver._ Pageserver's
+  job is GlideFS' job. Safekeepers' job is what `pg_receivewal
+  --synchronous` does, without a Postgres fork.
+
+### B-006a — Tier 1.5: WAL sink before full replicas
+
+**Decision.** The first production durability tier is a WAL sink —
+a small VM running `pg_receivewal --synchronous` — not a full
+streaming replica. Full replicas (Tier 2) come later when the
+availability SLA requires fast failover.
+
+**Why not jump straight to full replicas.**
+
+A full replica carries a complete copy of the data plus a running
+Postgres process. For durability alone, none of that is necessary.
+What's needed is the WAL on a second host's disk before the commit
+returns. `pg_receivewal --synchronous` does exactly that: it
+connects via the streaming replication protocol, receives WAL records
+as they're flushed, and sends acknowledgment back to the primary. The
+primary counts it in `synchronous_standby_names`. Storage cost is
+proportional to WAL retention, not database size.
+
+**Recovery without box-manager involvement.** On host failure,
+box-manager rehomes the VM and the GlideFS volume reattaches —
+same as today. The only new step is the WAL gap fill. `beyond-pg
+boot` reads `BEYOND_PG_WAL_SINK` from MMDS, checks `pg_controldata`
+for the last valid WAL location, fetches any missing segments from
+the sink's HTTP endpoint, places them in `pg_wal/`, and proceeds.
+Postgres sees no WAL gap and recovers normally. Box-manager is
+unchanged.
+
+**What Tier 2 adds on top.** A full replica is promotable. When the
+primary fails, the replica promotes and PgBouncer reroutes — seconds
+of downtime, not minutes. Tier 2 also provides read scaling. Tier 1.5
+provides neither; it only closes the data-loss window. The right
+choice depends on the availability SLA, not the durability requirement.
 
 ### B-007 — Generous replication knobs in MVP
 

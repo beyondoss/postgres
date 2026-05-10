@@ -49,15 +49,20 @@ For dev, preview, and branch databases, the five-second window is fine. The data
 
 For a production database holding committed customer transactions, it is not fine.
 
-We had three options.
+We had four options.
 
-| Path                                     | What it requires                                                | What it gives                                         | Verdict       |
-| ---------------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------- | ------------- |
-| Storage-layer quorum in GlideFS          | Custom cross-host replication protocol underneath every export. | EBS-equivalent fsync durability.                      | Out of scope. |
-| Fork Postgres, ship WAL to a Safekeeper. | A Postgres fork. A Paxos WAL service. Maintained forever.       | Aurora/Neon-equivalent durability. Stateless compute. | Not worth it. |
-| Postgres synchronous replication.        | Replicas. A SIGHUP.                                             | Quorum durability across independent failure domains. | Yes.          |
+| Path                                      | What it requires                                                      | What it gives                                          | Verdict         |
+| ----------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------ | --------------- |
+| Storage-layer quorum in GlideFS           | Custom cross-host replication protocol underneath every export.       | EBS-equivalent fsync durability.                       | Out of scope.   |
+| Fork Postgres, ship WAL to a Safekeeper.  | A Postgres fork. A Paxos WAL service. Maintained forever.             | Aurora/Neon-equivalent durability. Stateless compute.  | Not worth it.   |
+| WAL sink (`pg_receivewal --synchronous`). | A small VM. A directory served over HTTP. A step in `beyond-pg boot`. | Quorum-durable WAL. No data copy. No full replica.     | Yes — Tier 1.5. |
+| Postgres sync replication (full replica). | Full standbys. A SIGHUP.                                              | Quorum durability + promotable standby + read scaling. | Yes — Tier 2.   |
 
-Sync replication is a stock Postgres feature. Two decades of production use. Every monitoring tool understands it. Every DBA can debug it. With `synchronous_commit = remote_write` and `synchronous_standby_names = 'ANY 1 (r1, r2)'`, a transaction commits when at least one replica has the WAL on its local SSD. Lose the primary: a replica still has it. Lose a replica: the other one still has it. Quorum, in different failure domains.
+The WAL sink is the right first answer. A small VM runs `pg_receivewal --synchronous`, which streams WAL from the primary and acknowledges each record. The primary includes it in `synchronous_standby_names` with `synchronous_commit = remote_write`. A transaction commits when the WAL is on the sink's local SSD — a second failure domain. No data copy. Storage proportional to WAL retention, not database size.
+
+Recovery is handled by `beyond-pg boot`: it reads `BEYOND_PG_WAL_SINK` from MMDS, checks `pg_controldata` for the last valid WAL location, fetches any gap from the sink's HTTP endpoint, places the segments in `pg_wal/`, and boots Postgres normally. Box-manager does what it already does — rehome the VM, reattach the volume. The WAL injection is one more step in the idempotent boot sequence. Nothing new at the orchestration layer.
+
+Full replicas (Tier 2) add promotability and fast failover on top of that. The right answer when the availability SLA demands seconds of downtime, not minutes. But zero data loss doesn't require them.
 
 That's the durability story. Not the fastest answer. The one that's correct using primitives nobody has to audit a second time.
 
@@ -142,13 +147,14 @@ That's the substrate showing up in the bill.
 
 ## Tiers
 
-Two of them. The same image plays both roles. The third axis (ephemeral or not) is set by the substrate, not the image.
+Three of them. The same image plays all roles. The fourth axis (ephemeral or not) is set by the substrate, not the image.
 
-| Tier   | Environment | Durability                                                  | Availability                           | Use                                   |
-| ------ | ----------- | ----------------------------------------------------------- | -------------------------------------- | ------------------------------------- |
-| Single | Durable     | GlideFS write-behind. ~5 s window on host loss.             | Volume rehomes on a new host. Minutes. | Most production. Single-instance dev. |
-| Single | Ephemeral   | Local SSD only. Volume gone on host loss.                   | Volume rehomes if it can. Often, not.  | Preview. Branch. Throwaway forks.     |
-| HA     | Durable     | Sync replication. Quorum across failure domains. Zero loss. | Warm standby promotes. Seconds.        | Production at scale.                  |
+| Tier              | Environment | Durability                                                  | Availability                           | Use                               |
+| ----------------- | ----------- | ----------------------------------------------------------- | -------------------------------------- | --------------------------------- |
+| Single            | Durable     | GlideFS write-behind. ~5 s window on host loss.             | Volume rehomes on a new host. Minutes. | Dev. Low-stakes production.       |
+| Single            | Ephemeral   | Local SSD only. Volume gone on host loss.                   | Volume rehomes if it can. Often, not.  | Preview. Branch. Throwaway forks. |
+| Single + WAL sink | Durable     | WAL sink quorum. Zero data loss on host failure.            | Volume rehomes on a new host. Minutes. | Production without HA budget.     |
+| HA                | Durable     | Sync replication. Quorum across failure domains. Zero loss. | Warm standby promotes. Seconds.        | Production needing fast failover. |
 
 `HA + ephemeral` is permitted but meaningless. There is nothing to be highly available about if the volume is throwaway.
 
