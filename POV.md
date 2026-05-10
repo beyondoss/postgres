@@ -170,6 +170,8 @@ The substrate-thesis playing out as a consequence list.
 
 **A query proxy that hides our limitations.** PgBouncer is the only proxy. If a tool needs more, the answer is a different tool.
 
+**A backup service.** GlideFS snapshots are backups. Atomic at the block layer, CoW-cheap, restored by forking. Most managed-PG providers ship `pg_basebackup` to S3 on a schedule and call it a backup. We get the same thing — strictly cheaper, faster, more correct — from the substrate's existing snapshot primitive. Sub-snapshot-interval PITR is `archive_command` shipping WAL to S3 between snapshots, which we already wire.
+
 Every "why aren't you building X?" reduces to the same answer. Beyond already has the primitive. The primitive composes.
 
 ---

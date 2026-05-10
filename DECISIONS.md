@@ -202,6 +202,74 @@ restarting Postgres. Same argument as B-005, B-007: pay the cost in
 MVP, never restart for this reason later. Tomorrow's PITR is a MMDS
 config change, not an image rebuild.
 
+### B-009b — Backups are GlideFS snapshots; the image doesn't ship a backup service
+
+> Numbering note: this decision was added after B-009 was already
+> stable in references; promoted to a `b` suffix to avoid renumbering
+> rather than placed at B-010 (which is reserved for a future entry).
+
+**Decision.** Beyond's backup story for this image is GlideFS
+snapshots, scheduled by the control plane. The image ships
+`archive_mode = on` + `archive_command` for sub-snapshot-interval
+PITR (WAL segments shipped to S3 between snapshots) and a `backup`
+vsock RPC that runs `pg_basebackup` on demand for the cases that
+need it. There is no separate "backup service" in this repo.
+
+**Why.** The substrate already does the hard part. GlideFS snapshots
+are:
+
+- Atomic at the block layer (taken under the write-cache rotation
+  lock — `glidefs/src/block/write_cache/flush.rs:441-568`). Crash-
+  consistent by construction; Postgres' standard recovery handles
+  the rest. No `pg_start_backup`/`pg_stop_backup` coordination.
+- CoW-cheap. Each snapshot ships only the diff against the previous
+  to S3. `pg_basebackup` always re-ships everything.
+- Restore = fork. The same primitive we use for branching. Sub-
+  second to first query (with pre-fork CHECKPOINT — see
+  Prerequisites in DESIGN.md).
+
+What 90 % of managed-PG providers ship as "backup":
+
+- Daily base backup → `pg_basebackup` to S3 _or_ a volume snapshot.
+- WAL archive between backups → `archive_command` to S3.
+- Restore → replay base + WAL.
+
+Snapshot-based version is strictly cheaper, faster, and more
+correct. Only thing missing is sub-snapshot-interval PITR, which
+`archive_command` already covers. We do exactly the same thing as
+RDS or Supabase, with the substrate doing more of the work.
+
+**Alternatives considered.**
+
+- _Build a separate "backup service" that runs `pg_basebackup` to
+  S3 on a schedule._ Rejected: reinvents what GlideFS snapshots
+  already do, with worse performance and worse atomicity guarantees.
+- _Ship `pg_basebackup` as the only backup path, no snapshot
+  integration._ Rejected: throws away the substrate's free
+  primitive.
+
+**What lives outside the image:**
+
+- Snapshot scheduling cadence (hourly / daily / both). Tens of lines
+  of control-plane glue, not a service.
+- Snapshot retention policy. Same place.
+- User-facing restore UX (`glide pg restore --to-time T`). CLI
+  surface, post-MVP.
+
+**What stays in the image:**
+
+- `archive_command` wired to `beyond-pg archive`, which ships WAL
+  segments to `BEYOND_PG_ARCHIVE_TARGET` (S3 path from MMDS).
+- `backup` vsock RPC on the supervisor — runs `pg_basebackup` for
+  the rare cases that need a logical-base-backup-shaped artifact
+  (cross-major-version migration setup, logical replication
+  initialization). Stub in MVP.
+
+This is the substrate-thesis playing out for backup the same way it
+does for storage CoW (we don't build a pageserver) and durability
+(Tier 2 uses stock PG sync replication). The substrate already has
+the primitive; the image inherits it.
+
 ### B-009 — Ephemerality is a substrate property; image inherits via MMDS flag
 
 **Decision.** Preview, branch, and throwaway environments are marked
@@ -429,21 +497,59 @@ this way means image upgrades pick up new defaults from the base
 file, while user customizations and RAM-derived tuning survive the
 upgrade because they're on the persistent volume.
 
-### F-003 — Auto-tune from MMDS RAM at every boot
+### F-003 — Auto-tune from VM resources every boot, cgroup-aware
 
-**Decision.** A one-shot service reads VM RAM size from MMDS, writes
-`shared_buffers`, `effective_cache_size`, `work_mem`,
-`maintenance_work_mem`, `wal_buffers`, `max_connections` to
-`01-tuning.conf`. Runs on every boot.
+**Decision.** `beyond-pg supervisor` reads VM RAM and vCPU count at
+every boot and writes `01-tuning.conf` with derived values. RAM is
+read from `/sys/fs/cgroup/memory.max` first, falling back to
+`/proc/meminfo`. vCPUs from `/sys/fs/cgroup/cpu.max` first, falling
+back to `/proc/cpuinfo`.
 
-**Why.** Every tier ships the same image but at different sizes
-(16 GB box, 64 GB box, 256 GB box). Static defaults are wrong
-everywhere except one size. RAM-derived tuning gives sane settings
-at every tier with zero user input.
+Tuned values include: `shared_buffers`, `effective_cache_size`,
+`maintenance_work_mem`, `work_mem`, `max_connections`, `wal_buffers`,
+plus the vCPU-derived parallelism knobs (`max_worker_processes`,
+`max_parallel_workers`, `max_parallel_workers_per_gather`,
+`max_parallel_maintenance_workers`).
 
-**Why every boot, not just first boot.** Because users resize
-boxes — `glide pg scale --memory 64gb` should leave the database
-correctly tuned for the new RAM without a manual step.
+**Why.** Static defaults are wrong everywhere except one size. The
+image runs on 4 GB / 2 vCPU dev boxes and 256 GB / 64 vCPU production
+boxes from the same artifact. Resizing a box (`glide pg scale`) should
+leave the database correctly tuned without a manual step. Regenerating
+every boot makes that automatic.
+
+**Why cgroup-aware.** Inside Docker for `beyond dev`, `/proc/meminfo`
+reports host RAM, not the container's cgroup limit. If we set
+`shared_buffers = 25 % of host RAM` against an 8 GB cgroup limit,
+Postgres OOMs at startup. Reading the cgroup limit fixes this. In
+Firecracker the VM's view is the actual VM RAM, so both paths give
+the same answer.
+
+**`work_mem` formula** (current):
+
+```
+work_mem = max(32MB, ram_mb / 2 / (pgbouncer.default_pool_size * 5))
+```
+
+Earlier formula (`ram * 0.01 / max_connections`) was too conservative
+for the bundled extensions. On a 64 GB box at pool size 20 it produced
+~7 MB — every pgvector/postgis/pg_search query would log temp-files
+warnings on the workloads the image is bundled to support. The current
+formula bounds peak query-workspace memory to ~50 % of RAM assuming
+pool-size × 5 ops worth of concurrent hash/sort work. Floor 32 MB so
+small boxes still get usable space.
+
+**`max_connections` formula** (current):
+
+```
+max_connections = clamp(vcpus * 25, 100, ram_mb / 50)
+```
+
+Earlier formula (`pool_size * 2 + 50`) was fixed at 90 across all box
+sizes. On a 64-vCPU box that left port 5433 (the direct-PG path docs
+explicitly point ETL/migrations/parallel queries at) capped at ~40
+slots. New formula scales with vCPUs (25 per core), floors at 100,
+ceilings at `ram_mb / 50` (each connection costs ~10 MB process
+overhead).
 
 ### F-004 — User overrides preserved across image swaps via `99-user.conf`
 
@@ -454,6 +560,119 @@ it as an empty file on first init and never writes to it again.
 Anything they put in `99-user.conf` overrides our defaults because
 of include order — and survives every image rebuild because it's on
 the data volume.
+
+### F-005 — Storage cost model tuned for SSD-class storage
+
+**Decision.** `00-beyond.conf` sets:
+
+```
+random_page_cost = 1.1
+effective_io_concurrency = 200
+```
+
+**Why.** PG defaults (`random_page_cost = 4`, `effective_io_concurrency = 1`)
+assume rotational storage. They make the planner prefer sequential
+scans over indexes on SSD-class storage and disable prefetch. GlideFS'
+hot path is local-SSD-fast (random I/O ~10–50 µs). `1.1` is the
+SSD-tuned community default. `200` is the standard prefetch setting
+for any SSD-class storage; PG handles ~1000 concurrent I/Os easily.
+
+Cold S3 backfills are bounded by S3 latency, but those are rare on
+the steady-state hot path and the planner has no way to differentiate
+"hot block on local SSD" from "cold block on S3" in its cost model
+anyway. Optimize for the common case.
+
+### F-006 — Defensive timeouts and connection liveness
+
+**Decision.** `00-beyond.conf` sets:
+
+```
+idle_in_transaction_session_timeout = 5min
+lock_timeout = 30s
+tcp_keepalives_idle = 60
+tcp_keepalives_interval = 10
+tcp_keepalives_count = 6
+```
+
+**Why.** Idle-in-transaction is a real-world footgun: a misbehaving
+client (network blip, debugger paused, SIGSTOP'd process) holds row
+locks indefinitely and prevents vacuum. Auto-rolling back after 5 min
+is a defense, not a guarantee. Long-running admin transactions can
+override in `99-user.conf`.
+
+`lock_timeout = 30s` makes DDL fail fast instead of blocking forever
+behind a long transaction. The operator sees the failure and decides
+what to do; current default (no timeout) makes DDL hang silently.
+
+TCP keepalives detect dead connections within ~120 s. PG default `0`
+means "use OS default," which is 7200 s (2 hours) on Linux. Without
+keepalives, PgBouncer-to-Postgres connections through Beyond's private
+network can stay open across VM reboots, network reconvergence, or
+partial failures — pool fills with zombies that consume `max_connections`
+slots until next use.
+
+**`statement_timeout` left unset.** Different workloads have wildly
+different reasonable upper bounds. PgBouncer's `query_wait_timeout`
+provides per-pool backpressure instead.
+
+### F-007 — Autovacuum tightened for write-heavy bundled workloads
+
+**Decision.**
+
+```
+autovacuum_vacuum_scale_factor = 0.1
+autovacuum_naptime = 30s
+```
+
+**Why.** PG defaults (0.2 / 1 min) are tuned for general use.
+pgvector/postgis indexes get bloated quickly under heavy
+insert/update workloads — the workloads the image is bundled to
+support. Tighter scale factor triggers vacuum on smaller table
+changes; shorter naptime means autovacuum re-evaluates more often.
+Cost is a slight increase in background CPU; in exchange the
+planner's stats stay fresh and the indexes stay tight.
+
+### F-008 — Lock budget for `pg_partman`
+
+**Decision.** `max_locks_per_transaction = 256` (default 64).
+
+**Why.** Default 64 collides with `pg_partman` partition setups.
+Monthly partitions over 5 years × multiple indexes per partition × a
+cross-partition query and you're out. 256 is conservative headroom
+at trivial per-connection memory cost (~~200 bytes per slot).
+
+### F-009 — Kernel sysctls and disabled THP
+
+**Decision.** Image installs `/etc/sysctl.d/99-postgres.conf`:
+
+```
+vm.swappiness = 10
+vm.overcommit_memory = 2
+```
+
+And sets `transparent_hugepage=never` on the kernel cmdline at image
+build time.
+
+**Why `vm.swappiness = 10`.** Linux defaults to 60 — swaps out
+application pages (including `shared_buffers`) under modest memory
+pressure to grow the page cache. Backwards for a database:
+`shared_buffers` _is_ the cache we want to keep. 10 keeps it in RAM
+until things are genuinely tight.
+
+**Why `vm.overcommit_memory = 2`.** PG community recommendation. With
+overcommit on (default), the OOM killer chooses victims when memory
+runs out — can mean killing the postmaster and dropping every
+connection. Overcommit = 2 makes allocations fail at malloc time
+beyond `swap + (RAM × overcommit_ratio / 100)`, which Postgres handles
+gracefully (returns ERROR, keeps running).
+
+**Why `transparent_hugepage=never`.** THP's `khugepaged` daemon
+periodically defragments memory by promoting 4 KB pages into 2 MB
+pages. Causes unpredictable latency spikes on busy databases —
+well-known PG footgun. Disable it. Use explicit huge pages
+(`vm.nr_hugepages` + `huge_pages = on`) for `shared_buffers` if we
+want them; PG default `huge_pages = try` is fine without explicit
+setup.
 
 ---
 
@@ -477,22 +696,28 @@ resized VM picks up new tuning automatically.
 
 ### G-002 — MMDS for superuser password and tier configuration
 
-**Decision.** `beyond-pg boot` reads `POSTGRES_PASSWORD`,
+**Decision.** `beyond-pg` reads `POSTGRES_PASSWORD`,
 `POSTGRES_DATABASE`, `BEYOND_PG_TIER`, `BEYOND_VOLUME_EPHEMERAL`,
-`BEYOND_PG_ARCHIVE_TARGET` from MMDS.
+`BEYOND_PG_ARCHIVE_TARGET` directly from MMDS at
+`169.254.169.254/latest/meta-data/` at startup, with env var fallback
+for local dev (Docker, direct invocation).
 
-**Why.** Parity with the rootfs MMDS pattern
-(`beyond/packer/scripts/05-mmds.sh`). Beyond already has this
-primitive; reusing it costs nothing and keeps the operational model
-consistent.
+**Why.** MMDS is how Firecracker delivers secrets and config to guests
+without baking them into the image. Direct read — rather than having
+an outer init write them to `/etc/environment` first — keeps the code
+path simple: one binary, one MMDS read, done. Env var fallback means
+the same binary works locally without MMDS infrastructure.
 
 **Alternatives considered.**
 
 - _Generate a password on first boot, store on volume._ Rejected:
   Beyond can't surface the password without round-tripping through
   the volume; MMDS is the existing channel.
-- _Environment variables._ Rejected: doesn't compose with guest-agent
-  restarts cleanly; Beyond's existing pattern is MMDS.
+- _Env vars only (no MMDS)._ Rejected: doesn't compose with Firecracker
+  boot where secrets aren't baked into the image or environment block.
+- _Have paraglide-init write MMDS data to `/etc/environment`; read from
+  there._ Rejected: ties the image to a platform binary. Env var fallback
+  achieves the same local-dev composability without the dependency.
 
 ### G-003 — `CREATE EXTENSION` runs every boot (idempotent)
 
@@ -505,126 +730,131 @@ call is a no-op if the extension is already installed.
 existing volume. Without this, extension upgrades would require a
 manual user step.
 
-### G-004 — Two-tier supervision: `paraglide-init` outer, our binary inner
+### G-004 — `beyond-pg` as PID 1
 
-**Decision.** The Postgres image reuses Beyond's existing two-tier
-supervision shape but slots its own binary into the inner tier:
-
-- **Outer tier — `paraglide-init`** (Beyond's generic init,
-  unchanged). PID 1. Mounts virtual filesystems, configures network,
-  fetches MMDS, sets up zram, reaps zombies, powers off cleanly.
-  Supervises one child at `/usr/local/bin/paraglide-agent` with
-  restart-on-crash and a 10-second SIGTERM drain. Zero
-  Postgres-specific code.
-- **Inner tier — `beyond-pg supervisor`** (our binary, ships in this
-  image at `/usr/local/bin/paraglide-agent`). Runs boot-time setup
-  (initdb if needed, drop config, regenerate tuning, etc.), spawns
-  and supervises postgres + pgbouncer with restart-on-crash,
-  forwards their stdio over vsock to the host log pipeline, runs
-  CREATE EXTENSION post-start, listens on vsock for control-plane
-  RPC.
-- **`beyond-pg` binary** has three callable subcommands: `supervisor`
-  (the long-running everything daemon), `boot` (boot-time setup
-  exposed for ops re-execution; called inline by `supervisor`),
-  `archive` (per-WAL hook invoked by Postgres' `archive_command`).
-  Backup is a vsock RPC handled inside `supervisor`.
+**Decision.** `beyond-pg` is PID 1. `/sbin/init` symlinks to
+`/usr/local/bin/beyond-pg`. The binary handles zombie reaping, signal
+handling, network configuration, MMDS reading, and Postgres supervision
+in a single self-contained process. No intermediate init binary.
 
 **Why.**
 
-1. **`paraglide-init` was already designed for this.** Its contract
-   is "supervise one child, restart on crash, drain on shutdown."
-   That is exactly the contract the inner tier needs. We slot in.
-   Zero changes to `paraglide-init`.
-2. **`paraglide-agent` is the wrong inner tier for this image.**
-   It carries ~20 kLoC of features built for the user-app loop
-   (file change detection, mirror bridge for rsync-from-host, MCP
-   server, lifecycle phases for setup/build/start, workload
-   watcher, PTY support, checkpoint scanner, exec-from-host). None
-   of it applies to a database. We'd carry the weight to use 200
-   lines of supervision logic.
-3. **No Postgres knowledge in Beyond's primitives.** `paraglide-
-   init` stays generic. `paraglide-agent` is unmodified for user
-   apps. Box-manager doesn't grow Postgres awareness. The vsock
-   protocol doesn't grow Postgres tasks. Database-specific behavior
-   is entirely confined to `/usr/local/bin/paraglide-agent` on this
-   image — and that's our binary, not Beyond's.
-4. **One binary, one thing to ship.** Three subcommands instead of
-   five separate binaries. Standard pattern for this shape
-   (`kubelet`, `git`, `cargo`).
+1. **Composability.** `beyond-pg` reads MMDS directly with env var
+   fallback. The same binary works in Firecracker (`psql localhost`
+   with MMDS config) and in Docker (`docker run beyond-postgres` with
+   env vars). A two-tier model where an outer init writes MMDS data to
+   `/etc/environment` would require a platform binary in every local dev
+   environment. That's the wrong abstraction boundary.
+
+2. **Open-source legibility.** This is a public repo. The boot path —
+   `kernel → /sbin/init → beyond-pg → postgres` — is self-contained.
+   Anyone can understand how the image boots without knowing Beyond's
+   internal toolchain. A binary named `paraglide-init` in `/sbin/init`
+   requires context that no external reader has.
+
+3. **Minimum effective abstraction.** A two-tier model (outer init +
+   inner binary) would save ~200 lines of init code at the cost of:
+   - A binary dependency on a Beyond-internal `paraglide-init`
+   - An extra process slot per VM
+   - Inter-process coordination (MMDS data from outer tier → inner tier)
+   - A Postgres image that only works on Beyond's platform
+     Not the right trade for a database image that must also run locally.
+
+4. **`paraglide-agent` is the wrong inner tier.** It carries ~20 kLoC
+   of features for the user-app loop (file watching, rsync, MCP,
+   lifecycle phases, PTY). None of it applies to a database. We'd carry
+   dead weight to use 200 lines of supervision logic.
+
+**`beyond-pg` binary layout.**
+
+Three callable subcommands:
+
+- `supervisor` — the long-running process (runs as PID 1; also callable
+  for debugging). Init responsibilities + Postgres supervision.
+- `boot` — boot-time setup exposed as a standalone subcommand for ops
+  re-execution. Called inline by `supervisor`.
+- `archive %p %f` — per-WAL hook invoked by `archive_command`.
+
+**Process count at runtime.**
+
+`beyond-pg` (PID 1), `postgres`, `pgbouncer`. Three processes. Four
+if a backup is running.
 
 **Alternatives considered.**
 
-- _Use `paraglide-agent` unmodified plus a control plane that pushes
-  task definitions over vsock at boot._ Rejected: requires either
-  (a) a Postgres-specific service in the Beyond control plane that
-  knows what tasks to send to a Postgres VM, or (b) extending
-  `paraglide-agent` with a "read tasks from local manifest" feature.
-  Both push Postgres knowledge into shared infrastructure. The image
-  itself is the right place for image-specific knowledge.
-- _Extend `paraglide-agent` with the inner-tier behavior we need._
-  Rejected: we'd be carrying 20× the code we use. Forking it would
-  burden us with maintenance against upstream. Most of its features
-  conflict with database semantics (file watching during `initdb`
-  is a footgun).
+- _Two-tier: `paraglide-init` outer (PID 1) + `beyond-pg supervisor`
+  inner._ Rejected: see reasons 1–3 above. The two-tier model existed
+  to reuse Beyond's generic init work; the cost (platform binary in
+  image, no local-dev composability, abstraction leak) outweighs the
+  benefit (~200 saved lines of Rust).
+- _`paraglide-agent` as the inner tier, unmodified._ Rejected: ~20 kLoC
+  of user-app features, none of which applies to a database. File
+  watching during `initdb` is a footgun.
 - _systemd as PID 1._ Rejected: no other Beyond image runs systemd.
-  Diverges from the supervision model operators already understand.
-- _Run `beyond-pg` as PID 1 directly, replace `paraglide-init`
-  too._ Rejected: reinvents zombie reaping, signal handling, MMDS
-  fetching, network setup, zram. Beyond already has a battle-tested
-  PID 1; we use it.
+  Diverges from the operational model operators already understand.
 - _Five separate binaries (one per concern) instead of subcommands._
-  Rejected: each was its own deploy unit, version surface, and place
-  for shared logic to drift.
-
-**Box-manager prerequisite.**
-
-`paraglide-agent` is normally injected into VMs by box-manager via a
-GlideFS derived snapshot. For this image that injection would shadow
-our binary at `/usr/local/bin/paraglide-agent` and break us.
-Box-manager needs a generic capability: **skip agent injection when
-the image manifest declares `self_supervised: true`**. Not
-Postgres-specific — every official image (queue, auth, kv) wants
-the same behavior. Out of this image's scope but a prerequisite to
-running it.
+  Rejected: each would be its own deploy unit, version surface, and
+  place for shared logic to drift.
 
 **Consequences.**
 
-- No `.service` files, no systemd, no custom init in the image.
-  `/sbin/init` symlinks to `paraglide-init` (same as every Beyond
-  rootfs).
-- One Rust crate at `packer/files/beyond-pg/`. Subcommand dispatch
-  in `main`. `supervisor.rs` is the long-running entry; everything
-  else is library code it calls into.
-- Total processes at runtime: `paraglide-init` (PID 1), `beyond-pg
-  supervisor` (one inner-tier child), `postgres`, `pgbouncer`. Four
-  processes. Five if a backup is running.
-- Beyond's primitives (`paraglide-init`, `paraglide-agent`,
-  box-manager, vsock protocol) require **one** generic feature
-  (`self_supervised: true` flag on the image manifest) to support
-  this image. Nothing more.
+- `beyond-pg` is ~400 lines longer than it would be without init
+  responsibilities (zombie reap, signal handling, mount setup, network
+  config). Worth it for composability and legibility.
+- Box-manager injects the standard `paraglide-init` and `paraglide-agent`
+  into the rootfs (as it does for all images), but neither is started.
+  `/sbin/init` points to `beyond-pg`. Content-addressed blocks are
+  shared; storage cost is zero.
+- No `.service` files, no custom init in the image beyond the symlink.
+- One Rust crate (`src/`). Subcommand dispatch in `main.rs`.
+  `supervisor.rs` is the long-running entry; everything else is library
+  code it calls into.
 
 ---
 
 ## H — Logging
 
-### H-001 — stderr → `beyond-pg supervisor` → vsock
+### H-001 — vsock log forwarding with local-dev pass-through fallback
 
-**Decision.** Postgres and PgBouncer write to stderr. `beyond-pg
-supervisor` spawns each with piped stdio, reads lines from both pipes,
-and forwards them over vsock to the host log pipeline using the same
-wire format `paraglide-agent` uses for user-app logs.
+**Decision.** `beyond-pg` spawns postgres and pgbouncer with piped
+stderr, reads lines via async Tokio tasks, and forwards them over vsock
+as `UserProcessStreamData` frames — the same wire format and rate-limit
+parameters as `paraglide-agent`'s `log_forwarder.rs` (500 lines/sec
+sustained, 1000 burst, truncation at `MAX_USER_PROCESS_LINE_BYTES`).
 
-**Why.** Same log pipeline the rest of Beyond uses (the host receiver
-doesn't distinguish official-image traffic from user-app traffic).
-Mirroring the wire format keeps the host side generic. Watching
-journald instead would require a different pipeline; writing to log
-files would bloat snapshots on every fork.
+Log shipping mode is **auto-detected at startup**: if vsock connects
+successfully, pipe-and-forward is enabled; if the connection fails (no
+`/dev/vsock`, Docker, direct invocation), child stderr is inherited
+directly and the terminal / `docker logs` captures it.
+`BEYOND_LOG_VSOCK=false` forces pass-through even in Firecracker.
 
-**Cost.** Rate limit is ~500 lines/sec sustained per stream, 1000
-burst (host pipeline default). Configuration must respect this —
-`log_statement = 'all'` would trip the limit. Default `log_statement
-= 'ddl'` + `log_min_duration_statement = 1000` keeps us comfortably
-under.
+**Why vsock (not serial console).** Box-manager does not read the
+Firecracker serial console for application logs — it reads exclusively
+from vsock (`box-manager/src/vsock/connection/message_handler.rs`).
+Serial console output goes to a Firecracker-internal log file and is
+not forwarded to the Beyond log pipeline. Vsock is the only path logs
+can take to reach the host.
+
+**Why auto-detect (not a required flag).** The binary must work in
+Docker for local dev without any Beyond infrastructure. A hard
+vsock dependency would break `docker run beyond-postgres`. Auto-detect
+with pass-through fallback gives composability without giving up proper
+Beyond integration.
+
+**Why match `paraglide-agent` wire format exactly.** Box-manager's
+`UserProcessStreamData` handler emits structured log events (`box.log`
+tracing target) with full context fields. Matching the format means the
+host receiver needs no changes — the Postgres image plugs into the
+existing log pipeline.
+
+**Alternatives considered.**
+
+- _Serial console only._ Rejected: box-manager does not capture it for
+  application logs. Logs would be silently lost in production.
+- _Log files in PGDATA._ Rejected: fork with every branch; bloat every
+  snapshot.
+- _journald._ Rejected: adds a daemon and socket; not present on the
+  rootfs; unnecessary given vsock already covers the use case.
 
 ### H-002 — No `logging_collector`, no log files
 
@@ -640,20 +870,59 @@ satisfies both constraints.
 
 ## I — Security
 
-### I-001 — TLS off in MVP
+### I-001 — TLS on by default with auto-provisioned self-signed cert
 
-**Decision.** `ssl = off`. No certificates managed by the image.
+**Decision.** `ssl = on` in `00-beyond.conf`. `beyond-pg supervisor`
+generates a self-signed cert at first boot under
+`PGDATA/beyond/server.{crt,key}` and regenerates it within 30 days
+of expiry. Cert lives on the data volume so it forks with the
+database identity. PgBouncer terminates client TLS on port 5432
+using the same cert; PgBouncer→PG runs over the unix socket
+(no TLS needed).
 
-**Why.** Beyond's network is the perimeter:
+**Why.** Earlier sketch was `ssl = off`, reasoning that "Beyond's
+network is the perimeter (mTLS tunnel, private VXLAN, eBPF)." That's
+correct for VM-to-VM but the user-facing port 5432 is the connection
+an app makes — defense in depth at the wire is nearly free if we
+auto-provision the cert. Once we ship TLS-off, turning it on later
+is a breaking change for some clients (driver `sslmode` defaults
+vary). Pay the cost in MVP, never break an upgrade for it.
 
-- The Beyond tunnel does mTLS.
-- Internal traffic runs over private VXLAN with eBPF policy.
-- Postgres' connection is never on a public network at MVP.
+**Why self-signed and not real CA.** A real CA chain (Let's Encrypt
+via ACME, or a Beyond-internal CA) is its own infrastructure.
+MVP's floor is "the wire is encrypted, even if the cert isn't
+chain-validated." Customers with strict CA-chain requirements
+override `ssl_cert_file` / `ssl_key_file` in `99-user.conf` and
+supply their own. The auto-provisioned cert is the floor, not the
+ceiling.
 
-Adding PG-level TLS in MVP costs CPU + cert management for zero
-marginal security gain. Users who need defense in depth or have apps
-connecting outside Beyond's tunnel can flip `ssl = on` in
-`99-user.conf` and provide certs.
+**Alternatives considered.**
+
+- _Keep `ssl = off`, document `99-user.conf` override._ Rejected:
+  shifts cert provisioning to every customer. Most won't bother and
+  ship plaintext. Also turning on later breaks some clients.
+- _Real CA via ACME / internal CA at first boot._ Rejected for MVP:
+  requires a public-DNS-resolvable hostname for ACME, or a
+  Beyond-internal CA infrastructure that doesn't exist yet. Both
+  worth doing later; not blockers for shipping.
+- _PgBouncer-only TLS, plaintext PG._ Rejected: clients hitting the
+  direct port 5433 (ETL, dumps) get plaintext. Want consistent
+  posture across both ports.
+
+**Cost / consequences.**
+
+- ~30–40 lines in `boot.rs` for cert generation (using `rcgen` crate
+  or shelling out to `openssl`).
+- Cert renewal is idempotent in `boot.rs`: if cert exists and is
+  outside the 30-day-to-expiry window, leave alone; otherwise
+  regenerate and `pg_ctl reload`.
+- `client_encoding`-style cert mode (`sslmode=prefer` clients accept
+  the cert; `sslmode=verify-full` clients reject the self-signed cert
+  and need the override path). Document this in user-facing
+  connection examples.
+- Self-signed certs do not satisfy compliance regimes that require
+  CA-chain validation (HIPAA tech-implementation, PCI). Documented
+  user-facing as a known limit; real CA is the compliance path.
 
 ### I-002 — `scram-sha-256` for password auth
 
@@ -755,6 +1024,27 @@ fast if pinned version isn't in S3.
 - _Path dependencies in Cargo._ Same problems as above plus binds
   the build to a monorepo layout we don't have.
 
+### J-004a — Sibling extensions downloaded from GitHub Releases (supersedes J-004)
+
+**Decision.** `beyond_auth` and `beyond_queue` are fetched at Packer build
+time as pre-built `.deb` packages from their GitHub Release assets, pinned
+by tag. `extensions.toml` stores the GitHub repo URL and tag for each.
+Build fails if the release asset is absent.
+
+**Why.** S3-based distribution (J-004) leaks internal infrastructure and
+requires AWS credentials at image build time. GitHub Releases are public,
+credential-free, and auditable — the artifact URL is derivable from the
+repo URL and tag alone.
+
+**Why not build from source (git clone + cargo pgrx).** Building from
+source drags the pgrx toolchain and a full `cargo build` into the Packer
+container (minutes of compile time, cargo registry fetches, cargo-pgrx
+version-matching against the extension's Cargo.toml). Downloading a
+pre-built `.deb` is seconds and needs only `curl`. The sibling repos'
+release pipelines own the build; the Postgres image only consumes the
+artifact. J-004's original "decouple release cadence" rationale stands —
+we just use a public artifact host instead of internal S3.
+
 ---
 
 ## K — Build pipeline
@@ -782,15 +1072,36 @@ boot.
 "Postgres-specific" blank (e.g. with PGDATA pre-seeded) buys nothing
 the bootstrap doesn't already do, and adds another SKU to manage.
 
-### K-003 — Image versioned with git SHA + extensions manifest pin
+### K-003 — Image versioned with git SHA; pin every extension version
 
 **Decision.** Image filename: `postgres-noble-{git_sha}.img`. An
-`extensions.toml` at the repo root pins exact versions of every
-non-PGDG extension (specifically `beyond_auth`, `beyond_queue`).
+`extensions.toml` at the repo root pins exact versions of **every**
+extension shipped in the image — bundled (pg_stat_statements, pg_trgm),
+PGDG (pgvector, postgis, pg_cron, etc.), ParadeDB (pg_search), and
+sibling Beyond .debs (beyond_auth, beyond_queue). The Packer build
+runs `apt install postgresql-18-<name>=<version>` for PGDG packages
+and fails fast if any pinned version is unavailable.
 
-**Why.** Reproducible builds. Anyone can rebuild a historical image
-exactly. Extension version mismatches fail at build time, not at
-first boot.
+**Why pin everything.** Earlier sketch only pinned the sibling .debs
+and let PGDG packages float. That's a footgun: pgvector 0.7 → 0.8
+introduced an index format break (real, not hypothetical). A
+no-code-change image rebuild that pulls a different pgvector version
+silently changes index behavior. Pin everything or pin nothing —
+the split is the worst of both.
+
+**Cost.** PGDG removes old versions over time, so a rebuild from a
+historical SHA may fail if the pinned version has aged out. Two
+mitigations available, both out of MVP:
+(a) Mirror the apt repo to an internal S3 bucket at first publish,
+so we control retention.
+(b) Document "rebuild from old SHA may fail; bump pins or use the
+archived .img" as the operator procedure.
+
+(b) is acceptable for MVP. (a) is the durable answer for a serious
+managed service and tracked separately.
+
+**Bumping a pin** = a new image build = an image-swap rollout against
+existing volumes. Standard ops procedure.
 
 ---
 
@@ -873,13 +1184,21 @@ share a pattern: they're **operationally hostile to change later**
 (config tweaks). Whenever a setting falls into both categories, MVP
 sets it.
 
-### P-002 — Mirror the substrate's existing patterns
+### P-002 — Mirror the substrate's existing patterns where they fit
 
-Same MMDS pattern as the rootfs (G-002). Same logging pattern as
-guest-agent (H-001). Same Packer pipeline as `beyond/packer`
-(K-001). Same scripts directory layout (K-001). Same `mise.toml`
-task shape (K-001). Operators already know how to operate Beyond;
-the Postgres image doesn't ask them to learn anything new.
+Same MMDS pattern as the rootfs (G-002). Same Packer pipeline as
+`beyond/packer` (K-001). Same scripts directory layout (K-001). Same
+`mise.toml` task shape (K-001). Operators already know how to operate
+Beyond; the Postgres image doesn't ask them to learn anything new.
+
+**Where we deliberately diverge:**
+
+- _PID 1 (G-004)._ User-app images use `paraglide-init` as PID 1 with
+  guest-agent in the inner slot. We use `beyond-pg` as PID 1 directly.
+  Composability and open-source legibility outweigh the saved init code.
+- _Log shipping mode (H-001)._ We auto-detect vsock availability rather
+  than requiring it. Same wire format as guest-agent when vsock is
+  present; pass-through to stderr when it isn't (local dev, Docker).
 
 ### P-003 — The wire protocol is the SDK
 

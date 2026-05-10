@@ -1,3 +1,8 @@
+## Start here
+
+Read in order: `POV.md` → `DESIGN.md` → `DECISIONS.md` → `plans/` (phase docs).
+Wiki is indexed: use `wiki_query` / `wiki_answer` before grepping raw files.
+
 ## Documentation
 
 **Keep docs in sync**: When changing code that affects documented behavior (data flows, state machines, APIs, config), update the ARCHITECTURE.md in the same commit. Stale docs are worse than no docs.

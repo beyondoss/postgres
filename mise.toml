@@ -1,8 +1,6 @@
 [tools]
 dprint = "latest"
-node = "lts"
 rust = { version = "1.92", components = "rustfmt,clippy", targets = "aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu" }
-yamlfmt = "latest"
 cargo-binstall = "latest"
 "cargo:cross" = "latest"
 
@@ -12,18 +10,8 @@ run = "cargo build"
 [tasks."build:rs:release"]
 run = "cargo build --release"
 
-[tasks."build:ts"]
-run = "npm run build"
-dir = "sdk/ts"
-depends = ["generate:types"]
-
 [tasks."check:rs"]
 run = "cargo clippy --workspace -- -D warnings"
-
-[tasks."check:ts"]
-run = "npm run typecheck"
-dir = "sdk/ts"
-depends = ["generate:types"]
 
 [tasks."check:fmt"]
 run = "dprint check"
@@ -31,68 +19,104 @@ run = "dprint check"
 [tasks."format"]
 run = "dprint fmt"
 
-[tasks."install:ts"]
-run = "npm ci"
-dir = "sdk/ts"
+[tasks."build:image"]
+description = "Build Postgres rootfs image with Packer"
+usage = '''
+arg "[version]" help="Ubuntu version (noble)" default="noble"
+arg "[output_dir]" help="Output directory" default="/pglide/images/postgres"
+flag "--arch <arch>" help="Target architecture (amd64, arm64). Auto-detected if not specified."
+flag "--bless" help="Bless image for GlideFS direct boot after build"
+flag "--tier <tier>" help="Space-separated tiers to build (e.g. '16g' or '16g 32g'). Default: 16g"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
 
-[tasks."test:unit:rs"]
-run = "cargo test --lib"
+UBUNTU_VERSION="${version:-noble}"
+OUTPUT_DIR="${output_dir:-/pglide/images/postgres}"
+ARCH="${arch:-amd64}"
+BUILD_TIERS="${tier:-16g}"
 
-[tasks."test:integration:rs"]
-run = "cargo test --test cross_shard --test http --test resp"
+# Parse pinned versions from extensions.toml using python3 tomllib (stdlib 3.11+)
+_toml() { python3 -c "import tomllib,sys; d=tomllib.load(open('extensions.toml','rb')); print(d$1)"; }
 
-[tasks."test:integration:ts"]
-description = "Run TypeScript SDK e2e tests against a freshly-built debug server"
-run = "npm test"
-dir = "sdk/ts"
-depends = ["generate:types", "build:rs"]
+AUTH_GIT=$(_toml "['beyond']['auth']['git']")
+AUTH_TAG=$(_toml "['beyond']['auth']['tag']")
+QUEUE_GIT=$(_toml "['beyond']['queue']['git']")
+QUEUE_TAG=$(_toml "['beyond']['queue']['tag']")
+PGVECTOR_VER=$(_toml "['pgdg']['pgvector']")
+PGVECTORSCALE_VER=$(_toml "['pgdg']['pgvectorscale']")
+POSTGIS_VER=$(_toml "['pgdg']['postgis']")
+PG_CRON_VER=$(_toml "['pgdg']['pg_cron']")
+PG_PARTMAN_VER=$(_toml "['pgdg']['pg_partman']")
+PG_JSONSCHEMA_VER=$(_toml "['pgdg']['pg_jsonschema']")
+HYPOPG_VER=$(_toml "['pgdg']['hypopg']")
+PG_REPACK_VER=$(_toml "['pgdg']['pg_repack']")
+PG_SEARCH_VER=$(_toml "['paradedb']['pg_search']")
 
-[tasks."generate:openapi"]
-description = "Generate openapi/v1.json from annotated routes"
-run = "cargo run -p beyond-kv -- generate-openapi"
+# Stage Rust source for in-container build.
+# paraglide-init is NOT staged here — box-manager injects it into the GlideFS
+# fork at snapshot-creation time via the chroot mechanism in beyond/boxes.
+mkdir -p packer/staging
+rsync -a --delete --exclude=target \
+  src/ Cargo.toml Cargo.lock rust-toolchain.toml \
+  packer/staging/beyond-pg-src/
 
-[tasks."generate:types"]
-description = "Generate TypeScript types from the OpenAPI spec"
-run = "cd ts/kv && node scripts/generate-types.mjs"
-dir = "sdk"
-depends = ["install:ts", "generate:openapi"]
+IMAGE_VERSION=$(git rev-parse --short HEAD)
 
-[tasks."bench"]
-run = "cargo bench -p beyond-kv-engine --bench engine"
+packer build \
+  -var "ubuntu_version=${UBUNTU_VERSION}" \
+  -var "image_version=${IMAGE_VERSION}" \
+  -var "target_arch=${ARCH}" \
+  -var "output_dir=${OUTPUT_DIR}" \
+  -var "build_tiers=${BUILD_TIERS}" \
+  -var "auth_ext_version=${AUTH_VER}" \
+  -var "queue_ext_version=${QUEUE_VER}" \
+  -var "pgvector_version=${PGVECTOR_VER}" \
+  -var "pgvectorscale_version=${PGVECTORSCALE_VER}" \
+  -var "postgis_version=${POSTGIS_VER}" \
+  -var "pg_cron_version=${PG_CRON_VER}" \
+  -var "pg_partman_version=${PG_PARTMAN_VER}" \
+  -var "pg_jsonschema_version=${PG_JSONSCHEMA_VER}" \
+  -var "hypopg_version=${HYPOPG_VER}" \
+  -var "pg_repack_version=${PG_REPACK_VER}" \
+  -var "pg_search_version=${PG_SEARCH_VER}" \
+  packer/templates/postgres-rootfs.pkr.hcl
 
-[tasks."bench:quick"]
-run = "cargo bench -p beyond-kv-engine --bench engine -- --sample-count 20"
+if [[ "${bless:-}" == "true" ]]; then
+  IMAGE_NAME="postgres-${UBUNTU_VERSION}"
+  for tier in ${BUILD_TIERS}; do
+    IMG="${OUTPUT_DIR}/${IMAGE_NAME}-${tier}-${IMAGE_VERSION}.img"
+    BASE="${IMAGE_NAME}-${tier}"
+    echo "==> Blessing ${BASE}..."
+    packer/scripts/bless.sh --image "${IMG}" --name "${BASE}"
+  done
+fi
+'''
 
-# Full honest comparison: Beyond (1 shard) vs Redis, same container, matched
-# durability. batch=100 MGET/MSET sweep gives the latency-throughput curve.
-# Append --shards=N to run Beyond with N worker threads instead.
-[tasks."bench:compare"]
-run = """
-TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
-bash crates/bench/docker/run.sh \
-  --keys 500000 \
-  --value-size 256 \
-  --concurrency 64 \
-  --duration 30s \
-  --warmup 5s \
-  --populate \
-  --batch 100 \
-  --sweep 1k,3k,6k,10k,15k,20k \
-  --out "/results/${TS}-e2e-batch100.json" \
-  "$@"
-"""
+[tasks."bless:image"]
+description = "Bless an existing Postgres image for GlideFS direct boot"
+usage = '''
+arg "<image_path>" help="Path to the .img file to bless"
+arg "<base_name>" help="Human-readable base name (e.g., postgres-noble-16g)"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+exec packer/scripts/bless.sh --image "${image_path}" --name "${base_name}"
+'''
 
-# Faster iteration: shorter duration, fewer sweep points, smaller keyspace.
-[tasks."bench:compare:quick"]
-run = """
-bash crates/bench/docker/run.sh \
-  --keys 100000 \
-  --value-size 256 \
-  --concurrency 32 \
-  --duration 10s \
-  --warmup 2s \
-  --populate \
-  --batch 100 \
-  --sweep 3k,6k,10k,15k,20k \
-  "$@"
-"""
+[tasks."publish:image"]
+description = "Publish Postgres rootfs image to S3"
+usage = '''
+arg "[image_name]" help="Image name to publish" default="postgres-noble"
+arg "[tier]" help="Tier to publish" default="16g"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+: "${S3_BUCKET:?S3_BUCKET required}"
+IMAGE_DIR="${OUTPUT_DIR:-/pglide/images/postgres}"
+exec env IMAGE_DIR="${IMAGE_DIR}" packer/scripts/publish.sh \
+  "${image_name:-postgres-noble}" "${tier:-16g}"
+'''

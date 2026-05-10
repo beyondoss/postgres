@@ -1,0 +1,28 @@
+[package]
+name = "beyond-pg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+
+[[bin]]
+name = "beyond-pg"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rcgen = "0.14"
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["std"] }
+tokio = { version = "1", features = ["rt", "io-util", "fs", "time", "signal", "sync", "process", "macros", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x509-parser = "0.18"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+nix = { version = "0.31", features = ["signal", "process"] }
+tokio-vsock = "0.7"

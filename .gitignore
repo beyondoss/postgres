@@ -1,4 +1,8 @@
 target/
+.DS_Store
+*.box
+packer_cache/
+packer/staging/
 dist/
 **/*.rs.bk
 .env

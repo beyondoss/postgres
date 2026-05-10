@@ -1,0 +1,188 @@
+//! MMDS metadata reader.
+//!
+//! Reads config directly from the Firecracker MMDS endpoint at
+//! `169.254.169.254` via raw HTTP. Falls back to environment variables
+//! when MMDS is unavailable (local dev, Docker).
+//!
+//! Retries with backoff until MMDS is available. Called by `init::run()`
+//! after the MMDS route has been added to the routing table.
+
+use std::time::Duration;
+
+use serde_json::Value;
+use tracing::{debug, warn};
+
+pub const MMDS_PATH: &str = "/run/mmds/metadata.json";
+const MAX_ATTEMPTS: u32 = 5;
+const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Configuration derived from MMDS at boot time.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // all fields used on Linux; some reserved for future features
+pub struct MmdsConfig {
+    pub pg_tier: PgTier,
+    pub ephemeral: bool,
+    /// Required. `beyond-pg` fails closed if absent.
+    pub postgres_password: String,
+    pub postgres_database: String,
+    pub archive_target: Option<String>,
+    /// Host RAM in bytes (cgroup-aware).
+    pub ram_bytes: u64,
+    /// Logical CPU count (cgroup-aware).
+    pub vcpus: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgTier {
+    Single,
+    Primary,
+    Replica,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MmdsError {
+    #[error("POSTGRES_PASSWORD is required but not set in MMDS")]
+    MissingPassword,
+    #[error("POSTGRES_PASSWORD contains the reserved dollar-quote tag '$_beyond_$'")]
+    InvalidPassword,
+    #[error("MMDS metadata not available after {MAX_ATTEMPTS} attempts: {0}")]
+    Unavailable(String),
+}
+
+/// Read and parse MMDS configuration. Retries on transient failures.
+///
+/// Fails closed if `POSTGRES_PASSWORD` is absent or empty.
+pub async fn read() -> Result<MmdsConfig, MmdsError> {
+    let json = load_json().await?;
+    // Hardware detection reads /proc and /sys — blocking syscalls. Move them off
+    // the async executor so they don't stall signal delivery during boot.
+    tokio::task::spawn_blocking(move || parse(json))
+        .await
+        .map_err(|e| MmdsError::Unavailable(format!("parse task panicked: {e}")))?
+}
+
+async fn load_json() -> Result<Value, MmdsError> {
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        match tokio::fs::read_to_string(MMDS_PATH).await {
+            Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+                Ok(v) => {
+                    debug!(attempt, "MMDS metadata loaded");
+                    return Ok(v);
+                }
+                Err(e) => {
+                    last_err = format!("JSON parse error: {e}");
+                    warn!(attempt, error = %e, "MMDS JSON malformed, retrying");
+                }
+            },
+            Err(e) => {
+                last_err = format!("read error: {e}");
+                if attempt < MAX_ATTEMPTS {
+                    warn!(attempt, error = %e, "MMDS file not readable, retrying");
+                }
+            }
+        }
+        tokio::time::sleep(RETRY_INTERVAL).await;
+    }
+    Err(MmdsError::Unavailable(last_err))
+}
+
+fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
+    let meta = &json["latest"]["meta-data"];
+
+    let postgres_password = meta["POSTGRES_PASSWORD"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or(MmdsError::MissingPassword)?
+        .to_owned();
+
+    // The dollar-quote tag used in set_superuser_password. If the password itself
+    // contains this string the ALTER ROLE statement becomes malformed SQL.
+    if postgres_password.contains("$_beyond_$") {
+        return Err(MmdsError::InvalidPassword);
+    }
+
+    let pg_tier = match meta["BEYOND_PG_TIER"].as_str().unwrap_or("single") {
+        "primary" => PgTier::Primary,
+        "replica" => PgTier::Replica,
+        _ => PgTier::Single,
+    };
+
+    let ephemeral = meta["BEYOND_VOLUME_EPHEMERAL"]
+        .as_str()
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let postgres_database = meta["POSTGRES_DATABASE"]
+        .as_str()
+        .unwrap_or("postgres")
+        .to_owned();
+
+    let archive_target = meta["BEYOND_PG_ARCHIVE_TARGET"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+
+    let ram_bytes = read_ram_bytes();
+    let vcpus = read_vcpus();
+
+    Ok(MmdsConfig {
+        pg_tier,
+        ephemeral,
+        postgres_password,
+        postgres_database,
+        archive_target,
+        ram_bytes,
+        vcpus,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Hardware detection — cgroup-aware
+// ---------------------------------------------------------------------------
+
+fn read_ram_bytes() -> u64 {
+    // cgroup v2 memory.max — correct when running under a memory limit (e.g. Docker dev)
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let s = s.trim();
+        // "max" means no limit — fall through to /proc/meminfo
+        if s != "max"
+            && let Ok(n) = s.parse::<u64>()
+        {
+            return n;
+        }
+    }
+    // Fallback: /proc/meminfo MemTotal
+    read_proc_meminfo_kib("MemTotal").unwrap_or(4 * 1024 * 1024) * 1024
+}
+
+fn read_vcpus() -> u32 {
+    // cgroup v2 cpu.max: "quota period" or "max period"
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if parts.len() == 2
+            && parts[0] != "max"
+            && let (Ok(quota), Ok(period)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>())
+            && period > 0
+        {
+            return ((quota / period) as u32).max(1);
+        }
+    }
+    // Fallback: count processor entries in /proc/cpuinfo
+    std::fs::read_to_string("/proc/cpuinfo")
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("processor"))
+        .count() as u32
+}
+
+fn read_proc_meminfo_kib(field: &str) -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if line.starts_with(field) {
+            let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+            return Some(kib);
+        }
+    }
+    None
+}

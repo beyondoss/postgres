@@ -1,0 +1,56 @@
+# Pinned versions for every extension shipped in the image.
+#
+# Pin everything (PGDG + sibling .debs) so image rebuilds from a given
+# git SHA are reproducible. PGDG repos remove old versions over time,
+# so a build against a stale pin may fail; that's a known trade-off
+# (DECISIONS.md K-003). The Packer build fails fast if any pinned
+# version is unavailable at build time, rather than silently floating
+# to whatever's current.
+#
+# Bumping a pin = a new image build = an image-swap rollout.
+
+[postgres]
+version = "18.0"
+
+# ---------------------------------------------------------------------------
+# Bundled with PG 18 (postgresql-contrib). Versions track PG; pin documents
+# the expected version at this image's PG.
+# ---------------------------------------------------------------------------
+[bundled]
+pg_stat_statements = "1.11"
+auto_explain = "any" # not a CREATE EXTENSION; loaded via shared_preload_libraries
+pg_trgm = "1.6"
+
+# ---------------------------------------------------------------------------
+# PGDG apt — versions of the form "<extension-version>-<pgdg-revision>".
+# `apt install postgresql-18-<name>=<version>` is exact; build fails on miss.
+# ---------------------------------------------------------------------------
+[pgdg]
+pgvector = "0.8.0"
+pgvectorscale = "0.4.0"
+postgis = "3.5.0"
+pg_cron = "1.6.4"
+pg_partman = "5.1.0"
+pg_jsonschema = "0.3.3"
+hypopg = "1.4.1"
+pg_repack = "1.5.2"
+
+# ---------------------------------------------------------------------------
+# ParadeDB apt
+# ---------------------------------------------------------------------------
+[paradedb]
+pg_search = "0.15.0"
+
+# ---------------------------------------------------------------------------
+# Beyond sibling repos — cloned from public git and built in-container (J-004a).
+# Set `tag` to a release tag (e.g. "v0.1.0") or use `sha` for a commit pin.
+# Build fails if the tag/SHA is absent in the remote.
+# TODO: confirm public git URLs with auth/queue repo owners before first build.
+# ---------------------------------------------------------------------------
+[beyond.auth]
+git = "https://github.com/beyondoss/auth"
+tag = "server/v0.1.0" # placeholder — bump when first release is cut
+
+[beyond.queue]
+git = "https://github.com/beyondoss/queue"
+tag = "ext-v0.1.0" # placeholder — bump when first release is cut
