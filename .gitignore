@@ -1,0 +1,13 @@
+target/
+dist/
+**/*.rs.bk
+.env
+.env.*
+!.env.example
+.claude/settings.local.json
+.sqlx
+.wiki
+node_modules/
+bench/out/
+.mcp.json
+.claude

@@ -1,0 +1,98 @@
+[tools]
+dprint = "latest"
+node = "lts"
+rust = { version = "1.92", components = "rustfmt,clippy", targets = "aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu" }
+yamlfmt = "latest"
+cargo-binstall = "latest"
+"cargo:cross" = "latest"
+
+[tasks."build:rs"]
+run = "cargo build"
+
+[tasks."build:rs:release"]
+run = "cargo build --release"
+
+[tasks."build:ts"]
+run = "npm run build"
+dir = "sdk/ts"
+depends = ["generate:types"]
+
+[tasks."check:rs"]
+run = "cargo clippy --workspace -- -D warnings"
+
+[tasks."check:ts"]
+run = "npm run typecheck"
+dir = "sdk/ts"
+depends = ["generate:types"]
+
+[tasks."check:fmt"]
+run = "dprint check"
+
+[tasks."format"]
+run = "dprint fmt"
+
+[tasks."install:ts"]
+run = "npm ci"
+dir = "sdk/ts"
+
+[tasks."test:unit:rs"]
+run = "cargo test --lib"
+
+[tasks."test:integration:rs"]
+run = "cargo test --test cross_shard --test http --test resp"
+
+[tasks."test:integration:ts"]
+description = "Run TypeScript SDK e2e tests against a freshly-built debug server"
+run = "npm test"
+dir = "sdk/ts"
+depends = ["generate:types", "build:rs"]
+
+[tasks."generate:openapi"]
+description = "Generate openapi/v1.json from annotated routes"
+run = "cargo run -p beyond-kv -- generate-openapi"
+
+[tasks."generate:types"]
+description = "Generate TypeScript types from the OpenAPI spec"
+run = "cd ts/kv && node scripts/generate-types.mjs"
+dir = "sdk"
+depends = ["install:ts", "generate:openapi"]
+
+[tasks."bench"]
+run = "cargo bench -p beyond-kv-engine --bench engine"
+
+[tasks."bench:quick"]
+run = "cargo bench -p beyond-kv-engine --bench engine -- --sample-count 20"
+
+# Full honest comparison: Beyond (1 shard) vs Redis, same container, matched
+# durability. batch=100 MGET/MSET sweep gives the latency-throughput curve.
+# Append --shards=N to run Beyond with N worker threads instead.
+[tasks."bench:compare"]
+run = """
+TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+bash crates/bench/docker/run.sh \
+  --keys 500000 \
+  --value-size 256 \
+  --concurrency 64 \
+  --duration 30s \
+  --warmup 5s \
+  --populate \
+  --batch 100 \
+  --sweep 1k,3k,6k,10k,15k,20k \
+  --out "/results/${TS}-e2e-batch100.json" \
+  "$@"
+"""
+
+# Faster iteration: shorter duration, fewer sweep points, smaller keyspace.
+[tasks."bench:compare:quick"]
+run = """
+bash crates/bench/docker/run.sh \
+  --keys 100000 \
+  --value-size 256 \
+  --concurrency 32 \
+  --duration 10s \
+  --warmup 2s \
+  --populate \
+  --batch 100 \
+  --sweep 3k,6k,10k,15k,20k \
+  "$@"
+"""
