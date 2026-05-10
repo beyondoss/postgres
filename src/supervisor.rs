@@ -462,6 +462,20 @@ async fn post_start(cfg: &MmdsConfig) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
+    if cfg.wal_sink.is_some() {
+        pg::psql(
+            "DO $$
+             BEGIN
+               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'replicator') THEN
+                 CREATE ROLE replicator LOGIN REPLICATION PASSWORD NULL;
+               END IF;
+             END
+             $$",
+        )
+        .await
+        .map_err(|e| format!("failed to create replicator role: {e}"))?;
+    }
+
     boot::run_hook_scripts("/etc/postgresql/18/hooks/post-start.d")
         .await
         .map_err(|e| format!("post-start hook failed: {e}"))?;

@@ -26,6 +26,9 @@ pub struct MmdsConfig {
     pub postgres_password: String,
     pub postgres_database: String,
     pub archive_target: Option<String>,
+    /// HTTP base URL of the WAL sink (e.g. `http://10.0.0.5:9000`).
+    /// Set via MMDS key `BEYOND_PG_WAL_SINK`. Absent or empty → `None`.
+    pub wal_sink: Option<String>,
     /// Host RAM in bytes (cgroup-aware).
     pub ram_bytes: u64,
     /// Logical CPU count (cgroup-aware).
@@ -123,6 +126,11 @@ fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned());
 
+    let wal_sink = meta["BEYOND_PG_WAL_SINK"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_owned());
+
     let ram_bytes = read_ram_bytes();
     let vcpus = read_vcpus();
 
@@ -132,6 +140,7 @@ fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         postgres_password,
         postgres_database,
         archive_target,
+        wal_sink,
         ram_bytes,
         vcpus,
     })

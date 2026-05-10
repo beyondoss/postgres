@@ -75,6 +75,7 @@ pub async fn do_boot(cfg: &MmdsConfig) -> Result<(), BootError> {
     ensure_conf_d()?;
     maybe_initdb(cfg).await?;
     verify_wal_symlink()?;
+    fetch_wal_gap(cfg).await?;
     write_config_files(cfg)?;
     let shared_buffers_mb = (cfg.ram_bytes / (1024 * 1024) / 4).max(128);
     apply_kernel_settings(shared_buffers_mb);
@@ -203,6 +204,166 @@ fn verify_wal_symlink() -> Result<(), BootError> {
 }
 
 // ---------------------------------------------------------------------------
+// WAL gap recovery from sink
+// ---------------------------------------------------------------------------
+
+/// Fetch WAL segments from the WAL sink that are missing from the local pg_wal
+/// directory. Called after verify_wal_symlink and before write_config_files.
+///
+/// All network and pg_controldata errors are non-fatal: we warn and return Ok(())
+/// so boot can proceed. If WAL is genuinely missing, Postgres will fail to start
+/// and the supervisor will retry (which will re-run do_boot including this step).
+async fn fetch_wal_gap(cfg: &MmdsConfig) -> Result<(), BootError> {
+    let sink_url = match &cfg.wal_sink {
+        Some(url) => url.clone(),
+        None => return Ok(()),
+    };
+
+    // Parse the last needed WAL segment from pg_controldata.
+    let redo_segment = match pg_controldata_redo_wal().await {
+        Some(s) => s,
+        None => {
+            // PGDATA not initialized yet (first boot) or pg_controldata unavailable.
+            return Ok(());
+        }
+    };
+
+    info!(redo_segment, "wal-gap: fetching WAL list from sink");
+
+    // Fetch the list of available segments from the sink.
+    let list_body = match http_get(&format!("{sink_url}/list")).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("wal-gap: sink unreachable, skipping WAL fetch: {e}");
+            return Ok(());
+        }
+    };
+
+    let listing = match std::str::from_utf8(&list_body) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("wal-gap: sink returned non-UTF-8 listing: {e}");
+            return Ok(());
+        }
+    };
+
+    let mut fetched = 0u32;
+
+    for segment in listing.lines() {
+        let segment = segment.trim();
+        // WAL segment names are exactly 24 hex characters.
+        if segment.len() != 24 || !segment.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        // Only fetch segments at or after the last checkpoint's REDO WAL file.
+        // Lexicographic order is correct within a single timeline.
+        if segment < redo_segment.as_str() {
+            continue;
+        }
+
+        let dest = Path::new(PG_WAL_LINK).join(segment);
+        if dest.exists() {
+            continue;
+        }
+
+        match http_get(&format!("{sink_url}/{segment}")).await {
+            Ok(bytes) => match config::write_atomic_bytes(&dest, &bytes) {
+                Ok(()) => {
+                    fetched += 1;
+                    info!(segment, "wal-gap: fetched WAL segment");
+                }
+                Err(e) => warn!(segment, "wal-gap: failed to write segment: {e}"),
+            },
+            Err(e) => warn!(segment, "wal-gap: failed to fetch segment: {e}"),
+        }
+    }
+
+    info!(fetched, "wal-gap: WAL gap recovery complete");
+    Ok(())
+}
+
+/// Run `pg_controldata` and extract the `Latest checkpoint's REDO WAL file` value.
+/// Returns `None` if PGDATA is not initialized or the output can't be parsed.
+async fn pg_controldata_redo_wal() -> Option<String> {
+    let output = tokio::process::Command::new("pg_controldata")
+        .arg("-D")
+        .arg(PGDATA)
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = std::str::from_utf8(&output.stdout).ok()?;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("Latest checkpoint's REDO WAL file:") {
+            let segment = rest.trim().to_owned();
+            if segment.len() == 24 && segment.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(segment);
+            }
+        }
+    }
+
+    None
+}
+
+/// Minimal HTTP/1.1 GET over a plain TCP connection. Returns the response body.
+/// Only supports `http://` (no TLS needed — WAL sink is on a private overlay network).
+async fn http_get(url: &str) -> Result<Vec<u8>, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let without_scheme = url
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("only http:// URLs are supported: {url}"))?;
+
+    let (hostport, path) = match without_scheme.find('/') {
+        Some(i) => (&without_scheme[..i], &without_scheme[i..]),
+        None => (without_scheme, "/"),
+    };
+
+    let mut stream = TcpStream::connect(hostport)
+        .await
+        .map_err(|e| format!("connect {hostport}: {e}"))?;
+
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .map_err(|e| format!("read: {e}"))?;
+
+    // Split headers from body at \r\n\r\n.
+    let header_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "response missing header terminator".to_string())?;
+
+    let header_section = std::str::from_utf8(&response[..header_end])
+        .map_err(|e| format!("non-UTF-8 headers: {e}"))?;
+
+    let status_line = header_section.lines().next().unwrap_or("");
+    // Expect "HTTP/1.1 200 OK" or similar 2xx.
+    let status_code: u32 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if status_code / 100 != 2 {
+        return Err(format!("HTTP {status_line}"));
+    }
+
+    Ok(response[header_end + 4..].to_vec())
+}
+
+// ---------------------------------------------------------------------------
 // Config file writes
 // ---------------------------------------------------------------------------
 
@@ -233,6 +394,18 @@ fn write_config_files(cfg: &MmdsConfig) -> Result<(), BootError> {
         )?;
     } else {
         match std::fs::remove_file(&durability_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(BootError::Io(e)),
+        }
+    }
+
+    // 03-wal-sink.conf — present only when BEYOND_PG_WAL_SINK is set
+    let wal_sink_path = config::wal_sink_conf_path();
+    if cfg.wal_sink.is_some() {
+        write_atomic(Path::new(&wal_sink_path), &config::wal_sink_conf())?;
+    } else {
+        match std::fs::remove_file(&wal_sink_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(BootError::Io(e)),
