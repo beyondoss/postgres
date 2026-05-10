@@ -16,6 +16,13 @@ struct Sink {
 
 impl Drop for Sink {
     fn drop(&mut self) {
+        // SIGTERM lets beyond-pg-sink forward the signal to pg_receivewal and
+        // wait for it to exit, avoiding an orphaned child that retries after drop.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(self.process.id() as libc::pid_t, libc::SIGTERM);
+        }
+        #[cfg(not(unix))]
         let _ = self.process.kill();
         let _ = self.process.wait();
         let _ = std::fs::remove_dir_all(&self.dir);

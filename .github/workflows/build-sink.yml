@@ -1,5 +1,15 @@
 name: beyond-pg-sink build
-on: [push, pull_request]
+on:
+  push:
+    paths:
+      - 'beyond-pg-sink/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    paths:
+      - 'beyond-pg-sink/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
 jobs:
   build:
     runs-on: ubuntu-latest
