@@ -342,7 +342,10 @@ fn cdc_slot_preserves_wal_across_restart() {
 
     let port = 9092u16;
 
-    // Phase 1: start CDC, deliver an event, then kill the process.
+    // Phase 1: start CDC, deliver row 1, then kill the process.
+    // After delivery, CDC reports flush_lsn = LSN(row 1), so the slot's
+    // confirmed_flush_lsn advances past row 1. On restart Postgres will
+    // NOT replay row 1 — only WAL received after this point.
     {
         let _cdc = spawn_cdc("127.0.0.1", pg_port, port);
         wait_ready(port);
@@ -356,13 +359,16 @@ fn cdc_slot_preserves_wal_across_restart() {
         // _cdc drops → process killed; rx drops → subscriber pruned on next broadcast
     }
 
-    // Phase 2: restart CDC and verify it resumes delivering events.
+    // Phase 2: restart CDC and verify slot durability.
     //
-    // We subscribe *before* inserting so there is no queued WAL when the
-    // replication thread starts — eliminating the race between WAL replay and
-    // subscriber registration. The rows inserted after subscription are
-    // guaranteed to arrive because the subscriber is already in the broadcast
-    // list when the events are decoded.
+    // We subscribe *before* inserting to avoid the replay race: CDC may start
+    // replaying buffered WAL before a late subscriber connects. By registering
+    // first, every broadcast lands in our channel.
+    //
+    // Slot durability is proven by the absence of row 1: if flush_lsn were
+    // not advanced correctly (the pre-fix bug), the slot would replay from an
+    // earlier position and row 1 would re-appear. Instead we assert that only
+    // the two new rows arrive — the slot remembered exactly where it left off.
     {
         let _cdc = spawn_cdc("127.0.0.1", pg_port, port);
         wait_ready(port);
@@ -382,6 +388,12 @@ fn cdc_slot_preserves_wal_across_restart() {
             .unwrap();
 
         let events = recv_n(&rx, 2, Duration::from_secs(30));
+
+        // Row 1 must NOT be replayed — the slot advanced past it.
+        assert!(
+            events.iter().all(|e| e["new"]["id"] != 1),
+            "slot must not replay already-acknowledged row 1 (flush_lsn regression)"
+        );
         assert!(
             events.iter().any(|e| e["new"]["id"] == 2),
             "post-restart insert id=2 not received"

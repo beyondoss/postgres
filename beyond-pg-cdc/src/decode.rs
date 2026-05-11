@@ -3,8 +3,6 @@
 
 use std::collections::HashMap;
 
-use serde_json::{Map, Value};
-
 use crate::lsn::Lsn;
 
 // Postgres OIDs we render as JSON-native types instead of strings.
@@ -29,14 +27,12 @@ pub struct RelationInfo {
 
 pub struct Decoder {
     relations: HashMap<u32, RelationInfo>,
-    commit_lsn: Option<Lsn>,
 }
 
 impl Decoder {
     pub fn new() -> Self {
         Self {
             relations: HashMap::new(),
-            commit_lsn: None,
         }
     }
 
@@ -76,23 +72,15 @@ impl Decoder {
                 );
                 None
             }
-            b'B' => {
-                // BEGIN: int64 final_lsn + int64 ts + int32 xid
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(p.bytes(8)?);
-                self.commit_lsn = Some(Lsn::from_be_bytes(buf));
-                None
-            }
-            b'C' => {
-                self.commit_lsn = None;
-                None
-            }
+            // BEGIN and COMMIT carry no per-row data we need; pgoutput provides
+            // per-event LSN on each DML message directly.
+            b'B' | b'C' => None,
             b'I' => {
                 let rel_oid = p.u32()?;
                 p.u8()?; // 'N'
                 let new_tuple = read_tuple(&mut p)?;
                 let rel = self.relations.get(&rel_oid)?;
-                Some(emit_dml(lsn, "insert", rel, None, Some(&new_tuple)))
+                emit_dml(lsn, "insert", rel, None, Some(&new_tuple))
             }
             b'U' => {
                 let rel_oid = p.u32()?;
@@ -107,13 +95,7 @@ impl Decoder {
                 }
                 let new_tuple = read_tuple(&mut p)?;
                 let rel = self.relations.get(&rel_oid)?;
-                Some(emit_dml(
-                    lsn,
-                    "update",
-                    rel,
-                    old_tuple.as_deref(),
-                    Some(&new_tuple),
-                ))
+                emit_dml(lsn, "update", rel, old_tuple.as_deref(), Some(&new_tuple))
             }
             b'D' => {
                 let rel_oid = p.u32()?;
@@ -123,7 +105,7 @@ impl Decoder {
                 }
                 let old_tuple = read_tuple(&mut p)?;
                 let rel = self.relations.get(&rel_oid)?;
-                Some(emit_dml(lsn, "delete", rel, Some(&old_tuple), None))
+                emit_dml(lsn, "delete", rel, Some(&old_tuple), None)
             }
             // 'T' (truncate), 'Y' (type), 'O' (origin), 'M' (message) — cache-only / unsupported
             _ => None,
@@ -191,7 +173,7 @@ impl<'a> Parser<'a> {
         if self.i >= self.buf.len() {
             return None;
         }
-        let s = String::from_utf8_lossy(&self.buf[start..self.i]).into_owned();
+        let s = String::from_utf8(self.buf[start..self.i].to_vec()).ok()?;
         self.i += 1; // skip NUL
         Some(s)
     }
@@ -210,7 +192,7 @@ fn read_tuple(p: &mut Parser<'_>) -> Option<Vec<TupleVal>> {
                     return None;
                 }
                 let bytes = p.bytes(len as usize)?;
-                out.push(TupleVal::Text(String::from_utf8_lossy(bytes).into_owned()));
+                out.push(TupleVal::Text(String::from_utf8(bytes.to_vec()).ok()?));
             }
             _ => return None,
         }
@@ -218,37 +200,101 @@ fn read_tuple(p: &mut Parser<'_>) -> Option<Vec<TupleVal>> {
     Some(out)
 }
 
-fn tuple_to_json(rel: &RelationInfo, tuple: &[TupleVal]) -> Value {
-    let mut map = Map::new();
+// --- inline JSON writer ----------------------------------------------------
+// Avoids serde_json Map/Value allocations per event. Column names and schema/
+// table strings are written directly into the output buffer with proper escaping.
+
+fn write_json_str(out: &mut Vec<u8>, s: &str) {
+    out.push(b'"');
+    for b in s.bytes() {
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x00..=0x1f => {
+                out.extend_from_slice(b"\\u00");
+                let hi = b >> 4;
+                let lo = b & 0xf;
+                out.push(if hi < 10 { b'0' + hi } else { b'a' + hi - 10 });
+                out.push(if lo < 10 { b'0' + lo } else { b'a' + lo - 10 });
+            }
+            other => out.push(other),
+        }
+    }
+    out.push(b'"');
+}
+
+fn write_json_value(out: &mut Vec<u8>, type_oid: u32, s: &str) {
+    match type_oid {
+        OID_BOOL => match s {
+            "t" => out.extend_from_slice(b"true"),
+            "f" => out.extend_from_slice(b"false"),
+            _ => write_json_str(out, s),
+        },
+        OID_INT2 | OID_INT4 | OID_INT8 => {
+            if s.parse::<i64>().is_ok() {
+                out.extend_from_slice(s.as_bytes());
+            } else {
+                write_json_str(out, s);
+            }
+        }
+        OID_FLOAT4 | OID_FLOAT8 => {
+            match s.parse::<f64>() {
+                Ok(f) if f.is_finite() => {
+                    // Use serde_json's number formatter for correct representation.
+                    let n = serde_json::Number::from_f64(f).unwrap();
+                    out.extend_from_slice(n.to_string().as_bytes());
+                }
+                _ => write_json_str(out, s),
+            }
+        }
+        // NUMERIC is exact-decimal; emit as a JSON string to preserve precision.
+        // Parsing via f64 would silently corrupt values like 99.9999999999999.
+        OID_NUMERIC => write_json_str(out, s),
+        _ => write_json_str(out, s),
+    }
+}
+
+fn write_tuple_json(out: &mut Vec<u8>, rel: &RelationInfo, tuple: &[TupleVal]) -> bool {
+    if tuple.len() != rel.columns.len() {
+        eprintln!(
+            "error: {}.{} column count mismatch: {} cols in schema, {} in tuple; dropping event",
+            rel.schema,
+            rel.table,
+            rel.columns.len(),
+            tuple.len()
+        );
+        return false;
+    }
+    out.push(b'{');
+    let mut first = true;
     for (col, val) in rel.columns.iter().zip(tuple.iter()) {
         match val {
-            TupleVal::Unchanged => {} // omit TOAST sentinels
+            TupleVal::Unchanged => continue, // omit TOAST sentinels
             TupleVal::Null => {
-                map.insert(col.name.clone(), Value::Null);
+                if !first {
+                    out.push(b',');
+                }
+                first = false;
+                write_json_str(out, &col.name);
+                out.push(b':');
+                out.extend_from_slice(b"null");
             }
             TupleVal::Text(s) => {
-                map.insert(col.name.clone(), text_to_json(col.type_oid, s));
+                if !first {
+                    out.push(b',');
+                }
+                first = false;
+                write_json_str(out, &col.name);
+                out.push(b':');
+                write_json_value(out, col.type_oid, s);
             }
         }
     }
-    Value::Object(map)
-}
-
-fn text_to_json(type_oid: u32, s: &str) -> Value {
-    match type_oid {
-        OID_BOOL => Value::Bool(s == "t"),
-        OID_INT2 | OID_INT4 | OID_INT8 => s
-            .parse::<i64>()
-            .map(|n| Value::Number(n.into()))
-            .unwrap_or_else(|_| Value::String(s.to_owned())),
-        OID_FLOAT4 | OID_FLOAT8 | OID_NUMERIC => s
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::String(s.to_owned())),
-        _ => Value::String(s.to_owned()),
-    }
+    out.push(b'}');
+    true
 }
 
 fn emit_dml(
@@ -257,24 +303,45 @@ fn emit_dml(
     rel: &RelationInfo,
     old: Option<&[TupleVal]>,
     new: Option<&[TupleVal]>,
-) -> Vec<u8> {
-    let mut out = Map::new();
-    out.insert("lsn".to_owned(), Value::String(lsn.to_string()));
-    out.insert("op".to_owned(), Value::String(op.to_owned()));
-    out.insert("schema".to_owned(), Value::String(rel.schema.clone()));
-    out.insert("table".to_owned(), Value::String(rel.table.clone()));
+) -> Option<Vec<u8>> {
+    let lsn_str = lsn.to_string();
+    let mut out = Vec::with_capacity(256);
+    out.push(b'{');
+    write_json_str(&mut out, "lsn");
+    out.push(b':');
+    write_json_str(&mut out, &lsn_str);
+    out.extend_from_slice(b",");
+    write_json_str(&mut out, "op");
+    out.push(b':');
+    write_json_str(&mut out, op);
+    out.extend_from_slice(b",");
+    write_json_str(&mut out, "schema");
+    out.push(b':');
+    write_json_str(&mut out, &rel.schema);
+    out.extend_from_slice(b",");
+    write_json_str(&mut out, "table");
+    out.push(b':');
+    write_json_str(&mut out, &rel.table);
     if let Some(t) = old {
-        out.insert("old".to_owned(), tuple_to_json(rel, t));
+        out.extend_from_slice(b",\"old\":");
+        if !write_tuple_json(&mut out, rel, t) {
+            return None;
+        }
     }
     if let Some(t) = new {
-        out.insert("new".to_owned(), tuple_to_json(rel, t));
+        out.extend_from_slice(b",\"new\":");
+        if !write_tuple_json(&mut out, rel, t) {
+            return None;
+        }
     }
-    serde_json::to_vec(&Value::Object(out)).expect("Map<String,Value> serializes")
+    out.push(b'}');
+    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn build_relation_msg(oid: u32, schema: &str, table: &str, cols: &[(&str, u32)]) -> Vec<u8> {
         let mut m = vec![b'R'];
@@ -445,7 +512,8 @@ mod tests {
         assert_eq!(v["new"]["flag"], true);
         assert!(v["new"]["score"].is_f64());
         assert!((v["new"]["score"].as_f64().unwrap() - 3.14).abs() < 1e-9);
-        assert!(v["new"]["amount"].is_f64());
+        // NUMERIC is emitted as a JSON string to preserve exact decimal precision.
+        assert_eq!(v["new"]["amount"], "99.99");
         assert!(v["new"]["small"].is_f64());
         assert_eq!(v["new"]["count"], 42);
     }
@@ -479,5 +547,27 @@ mod tests {
         assert_eq!(v["op"], "delete");
         assert_eq!(v["old"]["id"], 9);
         assert!(v.get("new").is_none());
+    }
+
+    #[test]
+    fn json_string_escaping() {
+        let mut out = Vec::new();
+        write_json_str(&mut out, "tab\there\nnewline\\back\"quote");
+        let s = std::str::from_utf8(&out).unwrap();
+        // Should round-trip through serde_json
+        let parsed: Value = serde_json::from_str(s).unwrap();
+        assert_eq!(parsed.as_str().unwrap(), "tab\there\nnewline\\back\"quote");
+    }
+
+    #[test]
+    fn begin_commit_return_none() {
+        let mut d = Decoder::new();
+        // BEGIN: int64 final_lsn + int64 ts + int32 xid
+        let mut begin = vec![b'B'];
+        begin.extend_from_slice(&[0u8; 20]);
+        assert!(d.decode(Lsn::ZERO, &begin).is_none());
+        // COMMIT: similar layout
+        let commit = vec![b'C', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(d.decode(Lsn::ZERO, &commit).is_none());
     }
 }

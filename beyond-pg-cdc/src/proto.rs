@@ -52,6 +52,34 @@ impl Write for Conn {
     }
 }
 
+// --- error type ------------------------------------------------------------
+
+/// Categorized error for the replication loop. `Config` variants are fatal
+/// (auth method mismatch, invalid slot name, etc.) and must not be retried.
+/// `Io` and `Protocol` variants are potentially transient.
+#[derive(Debug)]
+pub enum CdcError {
+    Io(io::Error),
+    Protocol(String),
+    Config(String),
+}
+
+impl std::fmt::Display for CdcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CdcError::Io(e) => write!(f, "io: {e}"),
+            CdcError::Protocol(s) => write!(f, "protocol: {s}"),
+            CdcError::Config(s) => write!(f, "config: {s}"),
+        }
+    }
+}
+
+impl From<io::Error> for CdcError {
+    fn from(e: io::Error) -> Self {
+        CdcError::Io(e)
+    }
+}
+
 // --- low-level framing -----------------------------------------------------
 
 /// Read one tagged backend message: `byte(tag) + int32(len incl. self) + payload`.
@@ -104,8 +132,14 @@ pub fn send_startup<W: Write>(w: &mut W, params: &[(&str, &str)]) -> io::Result<
 // --- error helpers ---------------------------------------------------------
 
 /// Decode an ErrorResponse / NoticeResponse payload into a human-readable line.
+/// Includes severity, SQLSTATE code, message, detail, and hint where present.
 fn decode_error(payload: &[u8]) -> String {
+    let mut severity = String::new();
+    let mut code = String::new();
     let mut msg = String::new();
+    let mut detail = String::new();
+    let mut hint = String::new();
+
     let mut i = 0;
     while i < payload.len() {
         let field = payload[i];
@@ -118,19 +152,44 @@ fn decode_error(payload: &[u8]) -> String {
             i += 1;
         }
         let value = String::from_utf8_lossy(&payload[start..i]);
-        if field == b'M' {
-            msg = value.into_owned();
-            break;
+        match field {
+            b'S' => severity = value.into_owned(),
+            b'C' => code = value.into_owned(),
+            b'M' => msg = value.into_owned(),
+            b'D' => detail = value.into_owned(),
+            b'H' => hint = value.into_owned(),
+            _ => {}
         }
         if i < payload.len() {
             i += 1; // skip null terminator
         }
     }
+
     if msg.is_empty() {
-        "unknown postgres error".to_owned()
-    } else {
-        msg
+        return "unknown postgres error".to_owned();
     }
+
+    let mut out = String::new();
+    if !severity.is_empty() {
+        out.push_str(&severity);
+        out.push(' ');
+    }
+    if !code.is_empty() {
+        out.push_str(&code);
+        out.push_str(": ");
+    }
+    out.push_str(&msg);
+    if !detail.is_empty() {
+        out.push_str(" (DETAIL: ");
+        out.push_str(&detail);
+        out.push(')');
+    }
+    if !hint.is_empty() {
+        out.push_str(" (HINT: ");
+        out.push_str(&hint);
+        out.push(')');
+    }
+    out
 }
 
 // --- connect + auth --------------------------------------------------------
@@ -141,14 +200,15 @@ pub fn connect(
     user: &str,
     dbname: &str,
     replication: bool,
-) -> Result<Conn, String> {
-    let mut conn = if let Some(dir) = host.strip_prefix('/').map(|_| host) {
-        let path = format!("{dir}/.s.PGSQL.{port}");
-        let s = UnixStream::connect(&path).map_err(|e| format!("unix connect {path}: {e}"))?;
+) -> Result<Conn, CdcError> {
+    let mut conn = if host.starts_with('/') {
+        let path = format!("{host}/.s.PGSQL.{port}");
+        let s = UnixStream::connect(&path)
+            .map_err(|e| CdcError::Protocol(format!("unix connect {path}: {e}")))?;
         Conn::Unix(s)
     } else {
         let s = TcpStream::connect((host, port))
-            .map_err(|e| format!("tcp connect {host}:{port}: {e}"))?;
+            .map_err(|e| CdcError::Protocol(format!("tcp connect {host}:{port}: {e}")))?;
         Conn::Tcp(s)
     };
 
@@ -160,97 +220,50 @@ pub fn connect(
     if replication {
         params.push(("replication", "database"));
     }
-    send_startup(&mut conn, &params).map_err(|e| format!("send startup: {e}"))?;
+    send_startup(&mut conn, &params)
+        .map_err(|e| CdcError::Protocol(format!("send startup: {e}")))?;
 
     loop {
-        let (tag, payload) = read_msg(&mut conn).map_err(|e| format!("read auth msg: {e}"))?;
+        let (tag, payload) =
+            read_msg(&mut conn).map_err(|e| CdcError::Protocol(format!("read auth msg: {e}")))?;
         match tag {
             b'R' => {
                 if payload.len() < 4 {
-                    return Err("auth: short Authentication message".into());
+                    return Err(CdcError::Protocol(
+                        "auth: short Authentication message".into(),
+                    ));
                 }
                 let kind = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 if kind != 0 {
-                    return Err(format!(
+                    return Err(CdcError::Config(format!(
                         "auth: only trust (AuthenticationOk) is supported, got method {kind}"
-                    ));
+                    )));
                 }
             }
             b'S' | b'K' | b'N' => {
                 // ParameterStatus / BackendKeyData / NoticeResponse — informational
             }
             b'Z' => return Ok(conn),
-            b'E' => return Err(format!("postgres error: {}", decode_error(&payload))),
+            b'E' => {
+                return Err(CdcError::Protocol(format!(
+                    "postgres error: {}",
+                    decode_error(&payload)
+                )));
+            }
             other => {
-                return Err(format!("unexpected message tag {other:?} during connect"));
+                return Err(CdcError::Protocol(format!(
+                    "unexpected message tag {other:?} during connect"
+                )));
             }
         }
     }
-}
-
-// --- simple query ----------------------------------------------------------
-
-#[allow(dead_code)]
-pub fn query(conn: &mut Conn, sql: &str) -> Result<Vec<Vec<Option<String>>>, String> {
-    let mut payload = Vec::with_capacity(sql.len() + 1);
-    payload.extend_from_slice(sql.as_bytes());
-    payload.push(0);
-    write_msg(conn, b'Q', &payload).map_err(|e| format!("write query: {e}"))?;
-
-    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-    let mut err: Option<String> = None;
-    loop {
-        let (tag, body) = read_msg(conn).map_err(|e| format!("read query response: {e}"))?;
-        match tag {
-            b'T' | b'C' | b'I' | b'S' | b'N' | b'n' | b'1' | b'2' | b'3' => {
-                // RowDescription / CommandComplete / EmptyQuery / ParameterStatus /
-                // Notice / NoData / Parse|Bind|CloseComplete — ignored
-            }
-            b'D' => {
-                if body.len() < 2 {
-                    return Err("DataRow too short".into());
-                }
-                let ncols = u16::from_be_bytes([body[0], body[1]]) as usize;
-                let mut i = 2;
-                let mut row = Vec::with_capacity(ncols);
-                for _ in 0..ncols {
-                    if i + 4 > body.len() {
-                        return Err("DataRow truncated".into());
-                    }
-                    let len_bytes = [body[i], body[i + 1], body[i + 2], body[i + 3]];
-                    i += 4;
-                    let len = i32::from_be_bytes(len_bytes);
-                    if len < 0 {
-                        row.push(None);
-                    } else {
-                        let len = len as usize;
-                        if i + len > body.len() {
-                            return Err("DataRow value truncated".into());
-                        }
-                        let s = String::from_utf8_lossy(&body[i..i + len]).into_owned();
-                        i += len;
-                        row.push(Some(s));
-                    }
-                }
-                rows.push(row);
-            }
-            b'E' => err = Some(decode_error(&body)),
-            b'Z' => break,
-            _ => {}
-        }
-    }
-
-    if let Some(e) = err {
-        return Err(format!("postgres error: {e}"));
-    }
-    Ok(rows)
 }
 
 // --- logical replication ---------------------------------------------------
 
 pub enum WalMsg {
     XLogData { lsn: Lsn, data: Vec<u8> },
-    Keepalive { reply_needed: bool },
+    Keepalive { server_lsn: Lsn, reply_needed: bool },
 }
 
 pub fn start_replication(
@@ -258,21 +271,27 @@ pub fn start_replication(
     slot: &str,
     publication: &str,
     lsn: Lsn,
-) -> Result<(), String> {
+) -> Result<(), CdcError> {
     let sql = format!(
         "START_REPLICATION SLOT {slot} LOGICAL {lsn} (proto_version '1', publication_names '{publication}')"
     );
     let mut payload = Vec::with_capacity(sql.len() + 1);
     payload.extend_from_slice(sql.as_bytes());
     payload.push(0);
-    write_msg(conn, b'Q', &payload).map_err(|e| format!("write START_REPLICATION: {e}"))?;
+    write_msg(conn, b'Q', &payload)
+        .map_err(|e| CdcError::Protocol(format!("write START_REPLICATION: {e}")))?;
 
     loop {
-        let (tag, body) =
-            read_msg(conn).map_err(|e| format!("read START_REPLICATION response: {e}"))?;
+        let (tag, body) = read_msg(conn)
+            .map_err(|e| CdcError::Protocol(format!("read START_REPLICATION response: {e}")))?;
         match tag {
             b'W' => return Ok(()), // CopyBothResponse — streaming begins
-            b'E' => return Err(format!("postgres error: {}", decode_error(&body))),
+            b'E' => {
+                return Err(CdcError::Protocol(format!(
+                    "postgres error: {}",
+                    decode_error(&body)
+                )));
+            }
             // T (RowDescription), D (DataRow), C (CommandComplete), N (Notice),
             // S (ParameterStatus) may precede 'W' depending on server version.
             _ => {}
@@ -282,7 +301,7 @@ pub fn start_replication(
 
 pub fn recv_wal(conn: &mut Conn) -> io::Result<WalMsg> {
     loop {
-        let (tag, body) = read_msg(conn)?;
+        let (tag, mut body) = read_msg(conn)?;
         match tag {
             b'd' => {
                 // CopyData — first byte is the streaming sub-message type.
@@ -301,19 +320,26 @@ pub fn recv_wal(conn: &mut Conn) -> io::Result<WalMsg> {
                         let mut lsn_bytes = [0u8; 8];
                         lsn_bytes.copy_from_slice(&body[1..9]);
                         let lsn = Lsn::from_be_bytes(lsn_bytes);
-                        let data = body[25..].to_vec();
-                        return Ok(WalMsg::XLogData { lsn, data });
+                        // Drain the 25-byte header in-place; body becomes the pgoutput payload.
+                        body.drain(..25);
+                        return Ok(WalMsg::XLogData { lsn, data: body });
                     }
                     b'k' => {
-                        // PrimaryKeepalive: int64 lsn + int64 ts + int8 reply_requested
+                        // PrimaryKeepalive: int64 server_lsn + int64 ts + int8 reply_requested
                         if body.len() < 1 + 17 {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "short PrimaryKeepalive",
                             ));
                         }
+                        let mut lsn_bytes = [0u8; 8];
+                        lsn_bytes.copy_from_slice(&body[1..9]);
+                        let server_lsn = Lsn::from_be_bytes(lsn_bytes);
                         let reply_needed = body[17] != 0;
-                        return Ok(WalMsg::Keepalive { reply_needed });
+                        return Ok(WalMsg::Keepalive {
+                            server_lsn,
+                            reply_needed,
+                        });
                     }
                     other => {
                         return Err(io::Error::new(
@@ -342,7 +368,10 @@ pub fn recv_wal(conn: &mut Conn) -> io::Result<WalMsg> {
     }
 }
 
-pub fn send_status(conn: &mut Conn, lsn: Lsn) -> io::Result<()> {
+/// Send a StandbyStatusUpdate. `write_lsn` is the highest LSN received;
+/// `flush_lsn` is the highest LSN whose event has been delivered downstream.
+/// Postgres uses `flush_lsn` to advance `confirmed_flush_lsn` and recycle WAL.
+pub fn send_status(conn: &mut Conn, write_lsn: Lsn, flush_lsn: Lsn) -> io::Result<()> {
     let now_us = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| {
@@ -354,10 +383,10 @@ pub fn send_status(conn: &mut Conn, lsn: Lsn) -> io::Result<()> {
     // Sub-payload: 'r' + 4 * int64 + int8(reply_now=0) = 1 + 32 + 1 = 34 bytes
     let mut sub = [0u8; 34];
     sub[0] = b'r';
-    sub[1..9].copy_from_slice(&lsn.to_be_bytes()); // write
-    sub[9..17].copy_from_slice(&lsn.to_be_bytes()); // flush
-    sub[17..25].copy_from_slice(&lsn.to_be_bytes()); // apply
-    sub[25..33].copy_from_slice(&(now_us as i64).to_be_bytes());
+    sub[1..9].copy_from_slice(&write_lsn.to_be_bytes()); // write
+    sub[9..17].copy_from_slice(&flush_lsn.to_be_bytes()); // flush
+    sub[17..25].copy_from_slice(&flush_lsn.to_be_bytes()); // apply
+    sub[25..33].copy_from_slice(&(now_us.min(i64::MAX as u64) as i64).to_be_bytes());
     sub[33] = 0;
 
     write_msg(conn, b'd', &sub)
@@ -393,6 +422,21 @@ mod tests {
     fn decode_error_extracts_message_field() {
         // S=ERROR, C=42P01, M=table not found
         let payload = b"SERROR\0C42P01\0Mtable not found\0\0";
-        assert_eq!(decode_error(payload), "table not found");
+        assert_eq!(decode_error(payload), "ERROR 42P01: table not found");
+    }
+
+    #[test]
+    fn decode_error_includes_detail_and_hint() {
+        let payload = b"SERROR\0C42P01\0Mmsg\0Dsome detail\0Htry this\0\0";
+        let out = decode_error(payload);
+        assert!(out.contains("msg"));
+        assert!(out.contains("DETAIL: some detail"));
+        assert!(out.contains("HINT: try this"));
+    }
+
+    #[test]
+    fn decode_error_unknown_when_no_message() {
+        let payload = b"\0";
+        assert_eq!(decode_error(payload), "unknown postgres error");
     }
 }

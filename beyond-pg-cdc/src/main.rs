@@ -11,13 +11,13 @@ mod proto;
 mod resp;
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::decode::Decoder;
 use crate::lsn::Lsn;
-use crate::proto::{Conn, WalMsg};
+use crate::proto::{CdcError, Conn, WalMsg};
 use crate::resp::Subscribers;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -27,11 +27,29 @@ extern "C" fn handle_signal(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Release);
 }
 
+/// Shared runtime counters exposed via the RESP3 STATS command.
+pub struct Stats {
+    pub events_total: AtomicU64,
+    pub reconnects_total: AtomicU64,
+    pub last_flush_lsn: Mutex<Lsn>,
+}
+
+impl Stats {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            events_total: AtomicU64::new(0),
+            reconnects_total: AtomicU64::new(0),
+            last_flush_lsn: Mutex::new(Lsn::ZERO),
+        })
+    }
+}
+
 struct Args {
     socket_dir: String,
     pg_port: u16,
     user: String,
     dbname: String,
+    bind: String,
     port: u16,
     slot: String,
     publication: String,
@@ -44,6 +62,7 @@ impl Args {
             pg_port: 5433,
             user: "replicator".to_owned(),
             dbname: "postgres".to_owned(),
+            bind: "127.0.0.1".to_owned(),
             port: 9001,
             slot: "cdc".to_owned(),
             publication: "cdc".to_owned(),
@@ -60,9 +79,27 @@ fn parse_args() -> Args {
             "--pg-port" => args.pg_port = parse(require(&mut it, "--pg-port"), "--pg-port"),
             "--user" => args.user = require(&mut it, "--user"),
             "--dbname" => args.dbname = require(&mut it, "--dbname"),
+            "--bind" => args.bind = require(&mut it, "--bind"),
             "--port" => args.port = parse(require(&mut it, "--port"), "--port"),
             "--slot" => args.slot = require(&mut it, "--slot"),
             "--publication" => args.publication = require(&mut it, "--publication"),
+            "--help" => {
+                eprintln!("Usage: beyond-pg-cdc [OPTIONS]");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!(
+                    "  --socket-dir DIR    Postgres Unix socket directory (default: /var/run/postgresql)"
+                );
+                eprintln!("  --pg-port PORT      Postgres port in socket filename (default: 5433)");
+                eprintln!("  --user USER         Postgres replication user (default: replicator)");
+                eprintln!("  --dbname DB         Database name (default: postgres)");
+                eprintln!("  --bind ADDR         RESP3 listener bind address (default: 127.0.0.1)");
+                eprintln!("  --port PORT         RESP3 listener port (default: 9001)");
+                eprintln!("  --slot NAME         Replication slot name (default: cdc)");
+                eprintln!("  --publication NAME  Publication name (default: cdc)");
+                eprintln!("  --help              Print this help message");
+                std::process::exit(0);
+            }
             other => {
                 eprintln!("error: unknown argument: {other}");
                 std::process::exit(1);
@@ -95,17 +132,36 @@ fn main() {
     install_signal_handlers();
 
     let subs: Subscribers = Arc::new(Mutex::new(Vec::new()));
+    let stats = Stats::new();
 
     let resp_subs = Arc::clone(&subs);
+    let resp_stats = Arc::clone(&stats);
+    let resp_bind = args.bind.clone();
     let resp_port = args.port;
-    std::thread::spawn(move || resp::serve(resp_port, resp_subs));
+    // resp::serve is `-> !`: it calls process::exit(1) on bind failure. Storing
+    // the handle means a future panic here surfaces on join rather than being
+    // silently discarded as it would be if the handle were immediately dropped.
+    let _resp =
+        std::thread::spawn(move || resp::serve(&resp_bind, resp_port, resp_subs, resp_stats));
 
     let mut delay_ms: u64 = 100;
     while !SHUTDOWN.load(Ordering::Acquire) {
-        match run_replication(&args, &subs) {
+        let started = Instant::now();
+        match run_replication(&args, &subs, &stats) {
             Ok(()) => break,
+            Err(CdcError::Config(e)) => {
+                eprintln!("cdc fatal config error: {e}; exiting");
+                std::process::exit(1);
+            }
             Err(e) => {
+                // Reset backoff if the connection was stable for at least 60s so
+                // a transient drop after a long healthy run doesn't inherit a
+                // stale 30s delay from an earlier flap.
+                if started.elapsed() >= Duration::from_secs(60) {
+                    delay_ms = 100;
+                }
                 eprintln!("cdc replication error: {e}; reconnecting in {delay_ms}ms");
+                stats.reconnects_total.fetch_add(1, Ordering::Relaxed);
                 sleep_interruptible(Duration::from_millis(delay_ms));
                 delay_ms = (delay_ms * 2).min(30_000);
             }
@@ -144,7 +200,7 @@ fn sleep_interruptible(total: Duration) {
     }
 }
 
-fn run_replication(args: &Args, subs: &Subscribers) -> Result<(), String> {
+fn run_replication(args: &Args, subs: &Subscribers, stats: &Arc<Stats>) -> Result<(), CdcError> {
     let mut conn: Conn = proto::connect(
         &args.socket_dir,
         args.pg_port,
@@ -154,10 +210,15 @@ fn run_replication(args: &Args, subs: &Subscribers) -> Result<(), String> {
     )?;
     proto::start_replication(&mut conn, &args.slot, &args.publication, Lsn::ZERO)?;
     conn.set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| format!("set_read_timeout: {e}"))?;
+        .map_err(|e| CdcError::Protocol(format!("set_read_timeout: {e}")))?;
 
     let mut decoder = Decoder::new();
-    let mut last_lsn = Lsn::ZERO;
+    // last_write_lsn: highest XLogData LSN received from the server.
+    // last_flush_lsn: highest LSN whose event was successfully offered to subscribers.
+    // Postgres uses flush_lsn to advance confirmed_flush_lsn and recycle WAL,
+    // so we must not advance it ahead of what has actually been delivered.
+    let mut last_write_lsn = Lsn::ZERO;
+    let mut last_flush_lsn = Lsn::ZERO;
     let mut last_status = Instant::now();
 
     loop {
@@ -167,18 +228,41 @@ fn run_replication(args: &Args, subs: &Subscribers) -> Result<(), String> {
 
         match proto::recv_wal(&mut conn) {
             Ok(WalMsg::XLogData { lsn, data }) => {
-                if lsn.0 > last_lsn.0 {
-                    last_lsn = lsn;
+                if lsn > last_write_lsn {
+                    last_write_lsn = lsn;
                 }
                 if let Some(json) = decoder.decode(lsn, &data) {
                     let msg: Arc<[u8]> = Arc::from(json.into_boxed_slice());
                     broadcast(subs, msg);
+                    stats.events_total.fetch_add(1, Ordering::Relaxed);
+                }
+                // Advance flush only after delivering the event (best-effort).
+                // If the process crashes between recv and here, the slot replays.
+                if lsn > last_flush_lsn {
+                    last_flush_lsn = lsn;
+                    if let Ok(mut g) = stats.last_flush_lsn.lock() {
+                        *g = last_flush_lsn;
+                    }
                 }
             }
-            Ok(WalMsg::Keepalive { reply_needed }) => {
+            Ok(WalMsg::Keepalive {
+                server_lsn,
+                reply_needed,
+            }) => {
+                // The server's keepalive LSN covers WAL with no DML events.
+                // Advancing flush to server_lsn here is safe: no data to deliver.
+                if server_lsn > last_write_lsn {
+                    last_write_lsn = server_lsn;
+                }
+                if server_lsn > last_flush_lsn {
+                    last_flush_lsn = server_lsn;
+                    if let Ok(mut g) = stats.last_flush_lsn.lock() {
+                        *g = last_flush_lsn;
+                    }
+                }
                 if reply_needed {
-                    proto::send_status(&mut conn, last_lsn)
-                        .map_err(|e| format!("send_status: {e}"))?;
+                    proto::send_status(&mut conn, last_write_lsn, last_flush_lsn)
+                        .map_err(CdcError::Io)?;
                     last_status = Instant::now();
                 }
             }
@@ -188,16 +272,13 @@ fn run_replication(args: &Args, subs: &Subscribers) -> Result<(), String> {
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                proto::send_status(&mut conn, last_lsn)
-                    .map_err(|e| format!("send_status (timeout path): {e}"))?;
-                last_status = Instant::now();
+                // Read timed out — fall through to the proactive status interval below.
             }
-            Err(e) => return Err(format!("recv_wal: {e}")),
+            Err(e) => return Err(CdcError::Io(e)),
         }
 
         if last_status.elapsed() >= Duration::from_secs(10) {
-            proto::send_status(&mut conn, last_lsn)
-                .map_err(|e| format!("send_status (proactive): {e}"))?;
+            proto::send_status(&mut conn, last_write_lsn, last_flush_lsn).map_err(CdcError::Io)?;
             last_status = Instant::now();
         }
     }
