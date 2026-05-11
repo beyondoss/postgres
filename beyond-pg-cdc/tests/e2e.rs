@@ -59,10 +59,17 @@ fn wait_ready(port: u16) {
     panic!("beyond-pg-cdc RESP server did not become ready on port {port}");
 }
 
-/// Connect, send WATCH, decode RESP3 push frames, and forward parsed JSON
-/// change events through a channel. Skips control payloads ("ready", "heartbeat").
+/// Connect, send WATCH, and block until the server sends the "ready" push frame
+/// (confirming the subscriber is registered). Then forward subsequent JSON change
+/// events through the returned channel. Skips "heartbeat" control payloads.
+///
+/// Blocking on "ready" before returning is essential: it guarantees the subscriber
+/// is in the broadcast list before the caller inserts rows, preventing the race
+/// where events are broadcast to an empty subscriber list and silently dropped.
 fn spawn_resp_reader(port: u16) -> std::sync::mpsc::Receiver<serde_json::Value> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
     let (tx, rx) = std::sync::mpsc::channel();
+
     std::thread::spawn(move || {
         use std::io::{BufRead, BufReader, Read};
 
@@ -77,16 +84,13 @@ fn spawn_resp_reader(port: u16) -> std::sync::mpsc::Receiver<serde_json::Value> 
             .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         let mut reader = BufReader::new(stream);
+        let mut signaled_ready = false;
 
         loop {
-            // Frame header: ">N\r\n" (push) or other typed line. Anything not
-            // a push frame is ignored — handshake replies don't appear here
-            // because we never send HELLO from this reader.
             let mut header = Vec::new();
             if reader.read_until(b'\n', &mut header).is_err() || header.is_empty() {
                 return;
             }
-            // Strip trailing \r\n.
             while matches!(header.last(), Some(b'\n' | b'\r')) {
                 header.pop();
             }
@@ -98,7 +102,7 @@ fn spawn_resp_reader(port: u16) -> std::sync::mpsc::Receiver<serde_json::Value> 
                     Some(n) => n,
                     None => return,
                 },
-                _ => continue, // not a push; ignore unexpected line
+                _ => continue,
             };
 
             let mut elems: Vec<Vec<u8>> = Vec::with_capacity(count);
@@ -128,10 +132,16 @@ fn spawn_resp_reader(port: u16) -> std::sync::mpsc::Receiver<serde_json::Value> 
                 elems.push(buf);
             }
 
-            // Expect ["change", payload]. Skip "ready" and "heartbeat" markers.
             if elems.len() == 2 && elems[0] == b"change" {
                 let payload = &elems[1];
-                if payload == b"ready" || payload == b"heartbeat" {
+                if payload == b"ready" {
+                    if !signaled_ready {
+                        signaled_ready = true;
+                        let _ = ready_tx.send(());
+                    }
+                    continue;
+                }
+                if payload == b"heartbeat" {
                     continue;
                 }
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
@@ -142,6 +152,11 @@ fn spawn_resp_reader(port: u16) -> std::sync::mpsc::Receiver<serde_json::Value> 
             }
         }
     });
+
+    // Block until the server confirms the subscriber is registered.
+    ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("timed out waiting for WATCH ready signal");
     rx
 }
 
