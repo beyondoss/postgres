@@ -29,6 +29,9 @@ pub struct MmdsConfig {
     /// HTTP base URL of the WAL sink (e.g. `http://10.0.0.5:9000`).
     /// Set via MMDS key `BEYOND_PG_WAL_SINK`. Absent or empty → `None`.
     pub wal_sink: Option<String>,
+    /// When true, a `cdc` logical replication slot and empty publication are created on boot.
+    /// Set via MMDS key `BEYOND_PG_CDC_ENABLED`. Absent or `false` → `false`.
+    pub cdc_enabled: bool,
     /// Host RAM in bytes (cgroup-aware).
     pub ram_bytes: u64,
     /// Logical CPU count (cgroup-aware).
@@ -131,6 +134,11 @@ fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_end_matches('/').to_owned());
 
+    let cdc_enabled = meta["BEYOND_PG_CDC_ENABLED"]
+        .as_str()
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     let ram_bytes = read_ram_bytes();
     let vcpus = read_vcpus();
 
@@ -141,6 +149,7 @@ fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         postgres_database,
         archive_target,
         wal_sink,
+        cdc_enabled,
         ram_bytes,
         vcpus,
     })

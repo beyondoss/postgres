@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "beyond-pg-sink"]
+members = [".", "beyond-pg-cdc", "beyond-pg-sink"]
 resolver = "2"
 
 [package]
@@ -30,3 +30,7 @@ x509-parser = "0.18"
 libc = "0.2"
 nix = { version = "0.31", features = ["signal", "process", "hostname"] }
 tokio-vsock = "0.7"
+
+[dev-dependencies]
+postgres = "0.19"
+testcontainers-modules = { version = "0.15", features = ["blocking", "postgres"] }

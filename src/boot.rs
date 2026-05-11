@@ -412,8 +412,18 @@ fn write_config_files(cfg: &MmdsConfig) -> Result<(), BootError> {
         }
     }
 
-    // pg_hba.conf — auth baseline, overwritten every boot
-    write_atomic(Path::new(PG_HBA_PATH), config::PG_HBA_CONF)?;
+    // pg_hba.conf — auth baseline, overwritten every boot. When CDC is enabled
+    // we append a local-trust rule for the replicator role so beyond-pg-cdc
+    // can connect over the unix socket without a password.
+    let hba = if cfg.cdc_enabled {
+        std::borrow::Cow::Owned(format!(
+            "{}local replication replicator trust\n",
+            config::PG_HBA_CONF
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(config::PG_HBA_CONF)
+    };
+    write_atomic(Path::new(PG_HBA_PATH), &hba)?;
 
     // pgbouncer.ini — overwritten every boot
     if let Some(parent) = Path::new(PGBOUNCER_INI_PATH).parent() {

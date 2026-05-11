@@ -91,6 +91,15 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut pgb_state = ChildState::new("pgbouncer");
     spawn_pgbouncer(&mut pgb_state, &log_tx)?;
 
+    // Spawn CDC consumer (only when enabled by image config)
+    let mut cdc_state = if cfg.cdc_enabled {
+        let mut s = ChildState::new("beyond-pg-cdc");
+        spawn_cdc(&mut s, &log_tx)?;
+        Some(s)
+    } else {
+        None
+    };
+
     // Background: forward logs to host vsock
     let log_writer_handle = tokio::spawn(log_writer_task(log_rx));
 
@@ -114,13 +123,13 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             _ = sigterm.recv() => {
                 info!("received SIGTERM, draining children");
-                drain_children(&mut pg_state, &mut pgb_state).await;
+                drain_children(&mut pg_state, &mut pgb_state, cdc_state.as_mut()).await;
                 shutdown_background_tasks(log_writer_handle, rpc_handle, memory_watcher_handle).await;
                 return Ok(());
             }
             _ = sigint.recv() => {
                 info!("received SIGINT, draining children");
-                drain_children(&mut pg_state, &mut pgb_state).await;
+                drain_children(&mut pg_state, &mut pgb_state, cdc_state.as_mut()).await;
                 shutdown_background_tasks(log_writer_handle, rpc_handle, memory_watcher_handle).await;
                 return Ok(());
             }
@@ -145,6 +154,18 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 let status = status?;
                 pgb_state.on_exit(status.code());
                 maybe_restart_pgbouncer(&mut pgb_state, &log_tx).await?;
+            }
+            status = async {
+                match cdc_state.as_mut().and_then(|s| s.child.as_mut()) {
+                    Some(ch) => ch.wait().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let status = status?;
+                if let Some(state) = cdc_state.as_mut() {
+                    state.on_exit(status.code());
+                    maybe_restart_cdc(state, &log_tx).await?;
+                }
             }
         }
     }
@@ -232,6 +253,21 @@ async fn maybe_restart_pgbouncer(
     spawn_pgbouncer(state, log_tx)
 }
 
+async fn maybe_restart_cdc(
+    state: &mut ChildState,
+    log_tx: &mpsc::Sender<LogFrame>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let delay = Duration::from_millis(state.backoff_ms());
+    warn!(
+        "{}: restarting in {}ms (count={})",
+        state.name,
+        delay.as_millis(),
+        state.restart_count
+    );
+    tokio::time::sleep(delay).await;
+    spawn_cdc(state, log_tx)
+}
+
 // ---------------------------------------------------------------------------
 // Process spawning
 // ---------------------------------------------------------------------------
@@ -296,6 +332,42 @@ fn spawn_pgbouncer(
     Ok(())
 }
 
+fn spawn_cdc(
+    state: &mut ChildState,
+    log_tx: &mpsc::Sender<LogFrame>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = Command::new("beyond-pg-cdc");
+    cmd.args([
+        "--slot",
+        "cdc",
+        "--publication",
+        "cdc",
+        "--http-port",
+        "9001",
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .stdin(std::process::Stdio::null());
+
+    unblock_signals_in_child(&mut cmd);
+
+    let mut child = cmd.spawn()?;
+    let execution_id = zero_execution_id();
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    spawn_async_reader_task(
+        ExecStream::Stdout,
+        stdout,
+        log_tx.clone(),
+        execution_id.clone(),
+    );
+    spawn_async_reader_task(ExecStream::Stderr, stderr, log_tx.clone(), execution_id);
+
+    info!("beyond-pg-cdc spawned (pid={})", child.id().unwrap_or(0));
+    state.record_start(child);
+    Ok(())
+}
+
 /// Unblock SIGTERM and SIGINT in the child process.
 /// Parent blocks them (for tokio::signal); children must receive them normally.
 #[allow(unused_variables)]
@@ -349,23 +421,32 @@ fn protect_postmaster_from_oom(cmd: &mut Command) {
 // Drain on shutdown
 // ---------------------------------------------------------------------------
 
-async fn drain_children(pg: &mut ChildState, pgb: &mut ChildState) {
-    // Send SIGTERM to both children (not kill() which is SIGKILL)
+async fn drain_children(
+    pg: &mut ChildState,
+    pgb: &mut ChildState,
+    mut cdc: Option<&mut ChildState>,
+) {
+    // Send SIGTERM to all live children (not kill() which is SIGKILL)
     sigterm_child(pg);
     sigterm_child(pgb);
+    if let Some(c) = cdc.as_deref_mut() {
+        sigterm_child(c);
+    }
 
-    // Poll for both to exit, up to DRAIN_TIMEOUT
+    let mut all: Vec<&mut ChildState> = vec![pg, pgb];
+    if let Some(c) = cdc {
+        all.push(c);
+    }
+
+    // Poll for all to exit, up to DRAIN_TIMEOUT
     let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
     loop {
-        let pg_done = pg
-            .child
-            .as_mut()
-            .is_none_or(|c| c.try_wait().ok().flatten().is_some());
-        let pgb_done = pgb
-            .child
-            .as_mut()
-            .is_none_or(|c| c.try_wait().ok().flatten().is_some());
-        if pg_done && pgb_done {
+        let all_done = all.iter_mut().all(|s| {
+            s.child
+                .as_mut()
+                .is_none_or(|c| c.try_wait().ok().flatten().is_some())
+        });
+        if all_done {
             info!("all children drained cleanly");
             break;
         }
@@ -377,7 +458,7 @@ async fn drain_children(pg: &mut ChildState, pgb: &mut ChildState) {
     }
 
     // SIGKILL any stragglers — intentional SIGKILL here
-    for state in [&mut *pg, &mut *pgb] {
+    for state in all {
         if let Some(ref mut ch) = state.child
             && ch.try_wait().ok().flatten().is_none()
         {
@@ -462,7 +543,7 @@ async fn post_start(cfg: &MmdsConfig) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
-    if cfg.wal_sink.is_some() {
+    if cfg.wal_sink.is_some() || cfg.cdc_enabled {
         pg::psql(
             "DO $$
              BEGIN
@@ -474,6 +555,35 @@ async fn post_start(cfg: &MmdsConfig) -> Result<(), Box<dyn std::error::Error>> 
         )
         .await
         .map_err(|e| format!("failed to create replicator role: {e}"))?;
+    }
+
+    if cfg.cdc_enabled {
+        warn!("CDC enabled: replication slot 'cdc' will accumulate WAL until a consumer connects");
+        pg::psql(
+            "DO $$
+             BEGIN
+               IF NOT EXISTS (
+                 SELECT FROM pg_replication_slots WHERE slot_name = 'cdc'
+               ) THEN
+                 PERFORM pg_create_logical_replication_slot('cdc', 'pgoutput');
+               END IF;
+             END
+             $$",
+        )
+        .await
+        .map_err(|e| format!("failed to create CDC replication slot: {e}"))?;
+
+        pg::psql(
+            "DO $$
+             BEGIN
+               IF NOT EXISTS (SELECT FROM pg_publication WHERE pubname = 'cdc') THEN
+                 EXECUTE 'CREATE PUBLICATION cdc';
+               END IF;
+             END
+             $$",
+        )
+        .await
+        .map_err(|e| format!("failed to create CDC publication: {e}"))?;
     }
 
     boot::run_hook_scripts("/etc/postgresql/18/hooks/post-start.d")

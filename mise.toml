@@ -11,8 +11,19 @@ description = "Run unit tests only (no Docker required)"
 run = "cargo test --workspace"
 
 [tasks."test:e2e"]
+description = "Run all end-to-end tests (requires Docker and pg_receivewal on PATH)"
+run = """
+cargo test -p beyond-pg-sink --test e2e -- --include-ignored --nocapture
+cargo test -p beyond-pg-cdc  --test e2e -- --include-ignored --nocapture
+"""
+
+[tasks."test:e2e:sink"]
 description = "Run WAL sink end-to-end test (requires Docker and pg_receivewal on PATH)"
 run = "cargo test -p beyond-pg-sink --test e2e -- --include-ignored --nocapture"
+
+[tasks."test:e2e:cdc"]
+description = "Run CDC end-to-end test (requires Docker)"
+run = "cargo test -p beyond-pg-cdc --test e2e -- --include-ignored --nocapture"
 
 [tasks."build:rs"]
 run = "cargo build"

@@ -232,11 +232,13 @@ dependencies = [
  "clap",
  "libc",
  "nix",
+ "postgres",
  "rcgen",
  "rmp-serde",
  "serde",
  "serde_json",
  "tempfile",
+ "testcontainers-modules",
  "thiserror",
  "time",
  "tokio",
@@ -244,6 +246,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x509-parser",
+]
+
+[[package]]
+name = "beyond-pg-cdc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "postgres",
+ "serde_json",
+ "testcontainers-modules",
 ]
 
 [[package]]

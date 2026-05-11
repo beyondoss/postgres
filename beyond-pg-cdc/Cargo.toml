@@ -1,0 +1,20 @@
+[package]
+name = "beyond-pg-cdc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+
+[[bin]]
+name = "beyond-pg-cdc"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+postgres = "0.19"
+serde_json = "1"
+testcontainers-modules = { version = "0.15", features = ["blocking", "postgres"] }
