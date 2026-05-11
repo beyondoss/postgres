@@ -9,7 +9,6 @@ name = "beyond-pg-cdc"
 path = "src/main.rs"
 
 [dependencies]
-serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

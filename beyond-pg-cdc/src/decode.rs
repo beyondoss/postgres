@@ -240,16 +240,12 @@ fn write_json_value(out: &mut Vec<u8>, type_oid: u32, s: &str) {
                 write_json_str(out, s);
             }
         }
-        OID_FLOAT4 | OID_FLOAT8 => {
-            match s.parse::<f64>() {
-                Ok(f) if f.is_finite() => {
-                    // Use serde_json's number formatter for correct representation.
-                    let n = serde_json::Number::from_f64(f).unwrap();
-                    out.extend_from_slice(n.to_string().as_bytes());
-                }
-                _ => write_json_str(out, s),
+        OID_FLOAT4 | OID_FLOAT8 => match s.parse::<f64>() {
+            Ok(f) if f.is_finite() => {
+                out.extend_from_slice(f.to_string().as_bytes());
             }
-        }
+            _ => write_json_str(out, s),
+        },
         // NUMERIC is exact-decimal; emit as a JSON string to preserve precision.
         // Parsing via f64 would silently corrupt values like 99.9999999999999.
         OID_NUMERIC => write_json_str(out, s),
