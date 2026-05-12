@@ -9,6 +9,7 @@ mod rpc;
 mod supervisor;
 mod tls;
 mod vsock;
+mod wal_forwarder;
 
 #[derive(clap::Parser)]
 #[command(name = "beyond-pg", about = "Beyond Postgres agent")]

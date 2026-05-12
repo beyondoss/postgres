@@ -91,6 +91,16 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut pgb_state = ChildState::new("pgbouncer");
     spawn_pgbouncer(&mut pgb_state, &log_tx)?;
 
+    // Spawn the WAL forwarder if a sink URL is configured.
+    if let Some(wal_sink) = &cfg.wal_sink {
+        let sink_url = wal_sink.clone();
+        tokio::spawn(crate::wal_forwarder::run(
+            sink_url,
+            "wal_sink".to_owned(),
+            crate::pg::PG_PORT,
+        ));
+    }
+
     // Spawn CDC consumer (only when enabled by image config)
     let mut cdc_state = if cfg.cdc_enabled {
         let mut s = ChildState::new("beyond-pg-cdc");

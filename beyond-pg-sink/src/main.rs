@@ -1,10 +1,18 @@
+#![deny(unused_must_use)]
+
+mod quic_recv;
+mod wal_recv;
+
+// Re-export send_one from the crate lib so quic_recv (a submodule) can reach
+// it as `crate::send_one` without naming beyond_pg_sink directly.
+pub(crate) use beyond_pg_sink::send_one;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 static CONN_COUNT: AtomicUsize = AtomicUsize::new(0);
 const MAX_CONNS: usize = 256;
 
@@ -13,12 +21,20 @@ extern "C" fn handle_sigterm(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Release);
 }
 
+#[derive(PartialEq)]
+enum Mode {
+    Tcp,
+    Quic,
+}
+
 struct Args {
-    connstr: String,
+    /// Required for `--mode tcp`; ignored for `--mode quic`.
+    connstr: Option<String>,
     dir: String,
     port: u16,
     slot: String,
     retention_segments: usize,
+    mode: Mode,
 }
 
 fn parse_args() -> Args {
@@ -27,6 +43,7 @@ fn parse_args() -> Args {
     let mut port: u16 = 9000;
     let mut slot = String::from("wal_sink");
     let mut retention_segments: usize = 64;
+    let mut mode = Mode::Quic;
 
     let mut args = std::env::args().skip(1);
     loop {
@@ -69,6 +86,18 @@ fn parse_args() -> Args {
                     std::process::exit(1);
                 }
             },
+            Some("--mode") => match args.next().as_deref() {
+                Some("tcp") => mode = Mode::Tcp,
+                Some("quic") => mode = Mode::Quic,
+                Some(other) => {
+                    eprintln!("error: --mode must be 'tcp' or 'quic' (got '{other}')");
+                    std::process::exit(1);
+                }
+                None => {
+                    eprintln!("error: --mode requires a value");
+                    std::process::exit(1);
+                }
+            },
             Some(other) => {
                 eprintln!("error: unknown argument: {other}");
                 std::process::exit(1);
@@ -76,13 +105,10 @@ fn parse_args() -> Args {
         }
     }
 
-    let connstr = match connstr {
-        Some(s) => s,
-        None => {
-            eprintln!("error: --connstr is required");
-            std::process::exit(1);
-        }
-    };
+    if mode == Mode::Tcp && connstr.is_none() {
+        eprintln!("error: --connstr is required for --mode tcp");
+        std::process::exit(1);
+    }
 
     if retention_segments < 8 {
         eprintln!(
@@ -97,89 +123,8 @@ fn parse_args() -> Args {
         port,
         slot,
         retention_segments,
+        mode,
     }
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let (Some(h), Some(l)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2]))
-        {
-            decoded.push(h << 4 | l);
-            i += 3;
-            continue;
-        }
-        decoded.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
-fn from_hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        _ => None,
-    }
-}
-
-/// Strips `password=…` from a libpq connection string and returns it separately
-/// so it can be passed via `PGPASSWORD` instead of appearing in process argv.
-/// Supports both URI (`postgresql://user:pass@host/db`) and keyword=value formats.
-fn extract_password(connstr: &str) -> (String, Option<String>) {
-    for prefix in ["postgresql://", "postgres://"] {
-        if let Some(rest) = connstr.strip_prefix(prefix) {
-            if let Some(at) = rest.find('@') {
-                let userinfo = &rest[..at];
-                if let Some(colon) = userinfo.find(':') {
-                    let password = percent_decode(&userinfo[colon + 1..]);
-                    let cleaned = format!("{}{}{}", prefix, &userinfo[..colon], &rest[at..]);
-                    return (cleaned, Some(password));
-                }
-            }
-            return (connstr.to_owned(), None);
-        }
-    }
-    strip_kv_password(connstr)
-}
-
-fn strip_kv_password(connstr: &str) -> (String, Option<String>) {
-    let mut out = String::with_capacity(connstr.len());
-    let mut password: Option<String> = None;
-    let mut s = connstr;
-
-    while !s.is_empty() {
-        s = s.trim_start();
-        let Some(eq) = s.find('=') else { break };
-        let key = s[..eq].trim_end();
-        s = &s[eq + 1..];
-        let (value, consumed) = parse_kv_value(s);
-        s = &s[consumed..];
-
-        if key == "password" {
-            password = Some(value);
-        } else {
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str(key);
-            out.push('=');
-            if value.contains(char::is_whitespace) || value.is_empty() {
-                out.push('\'');
-                out.push_str(&value.replace('\\', "\\\\").replace('\'', "\\'"));
-                out.push('\'');
-            } else {
-                out.push_str(&value);
-            }
-        }
-    }
-
-    (out, password)
 }
 
 fn parse_kv_value(s: &str) -> (String, usize) {
@@ -266,8 +211,8 @@ fn main() {
         }
     }
 
-    // Bind before spawning the pg_receivewal thread so that a bind failure
-    // exits cleanly without orphaning a background subprocess.
+    // Bind before spawning the receiver thread so that a bind failure exits
+    // cleanly without leaving a background thread running.
     let listener = match TcpListener::bind(("0.0.0.0", args.port)) {
         Ok(l) => l,
         Err(e) => {
@@ -276,32 +221,37 @@ fn main() {
         }
     };
 
-    let (connstr_clean, password) = extract_password(&args.connstr);
     let dir_recv = args.dir.clone();
-    let slot = args.slot.clone();
-
     let watcher_thread = start_retention_watcher(args.dir.clone(), args.retention_segments);
 
-    let recv_thread = std::thread::spawn(move || {
-        run_pg_receivewal(connstr_clean, dir_recv, slot, password);
-    });
+    let recv_thread = match args.mode {
+        Mode::Tcp => {
+            let connstr = args.connstr.as_deref().expect("validated above");
+            let recv_cfg = parse_connstr_to_receiver_config(connstr, &args.dir, &args.slot);
+            std::thread::spawn(move || {
+                run_native_receiver(recv_cfg, &dir_recv);
+            })
+        }
+        Mode::Quic => {
+            let dir_quic = std::path::PathBuf::from(dir_recv);
+            let port = args.port;
+            std::thread::spawn(move || {
+                if let Err(e) = quic_recv::run_quic_server(port, dir_quic) {
+                    eprintln!("quic: fatal: {e}");
+                    std::process::exit(1);
+                }
+            })
+        }
+    };
 
     run_http_server(listener, &args.dir, args.port);
 
-    // Signal the child so it exits cleanly, then wait for the receiver thread.
-    let pid = CHILD_PID.load(Ordering::Acquire);
-    if pid != 0 {
-        #[cfg(unix)]
-        // SAFETY: pid was stored by run_pg_receivewal after a successful spawn and is
-        // protected by the `!= 0` guard above. kill(2) with an already-exited PID
-        // returns ESRCH harmlessly; no race can produce an invalid or recycled PID
-        // because the receiver thread is still alive and will be joined below.
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
-        }
+    if recv_thread.join().is_err() {
+        eprintln!("warn: receiver thread panicked");
     }
-    let _ = recv_thread.join();
-    let _ = watcher_thread.join();
+    if watcher_thread.join().is_err() {
+        eprintln!("warn: retention watcher thread panicked");
+    }
 }
 
 fn prune_old_segments(dir: &str, retain: usize) {
@@ -399,15 +349,54 @@ fn start_retention_watcher(dir: String, retain: usize) -> std::thread::JoinHandl
 
         let mut buf = [0u8; 4096];
         loop {
-            // SAFETY: fd is a valid inotify file descriptor; buf is a mutable
-            // byte slice of sufficient size for at least one inotify_event.
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n < 0 {
+            // Poll with a 500 ms timeout so SIGTERM is noticed promptly even
+            // if it is delivered to a different thread (which would not
+            // interrupt this thread's syscall with EINTR). A bare read(2)
+            // would block indefinitely in that case, hanging process exit.
+            //
+            // SAFETY: pfd is fully initialised with all three fields; the
+            // pointer is valid for the duration of the poll(2) call.
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, 500) };
+
+            if SHUTDOWN.load(Ordering::Acquire) {
+                break;
+            }
+
+            if rc < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                eprintln!("warn: inotify poll error: {err} — falling back to 30s poll");
+                unsafe { libc::close(fd) };
+                loop {
+                    std::thread::sleep(Duration::from_secs(30));
                     if SHUTDOWN.load(Ordering::Acquire) {
-                        break;
+                        return;
                     }
+                    prune_old_segments(&dir, retain);
+                }
+            }
+
+            if rc == 0 {
+                // Timeout — loop to re-check SHUTDOWN.
+                continue;
+            }
+
+            // POLLIN: drain the inotify descriptor (events are not inspected;
+            // any IN_MOVED_TO on the WAL dir is sufficient to trigger a prune).
+            //
+            // SAFETY: fd is a valid inotify file descriptor; buf is a mutable
+            // byte slice of sufficient size for at least one inotify_event.
+            let nr = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if nr < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
                 eprintln!("warn: inotify read error: {err} — falling back to 30s poll");
@@ -449,78 +438,90 @@ fn poll_retention_watcher(
     })
 }
 
-fn run_pg_receivewal(connstr: String, dir: String, slot: String, password: Option<String>) {
-    // pg_receivewal --create-slot exits immediately after creating the slot and
-    // does not stream. Run slot creation in its own retry loop first, then enter
-    // the streaming loop below.
-    loop {
-        if SHUTDOWN.load(Ordering::Acquire) {
-            return;
+/// Parse a libpq connection string into a `ReceiverConfig`.
+/// Extracts `host`, `port`, `user` keyword-value pairs; falls back to
+/// Postgres defaults for anything not specified.
+fn parse_connstr_to_receiver_config(
+    connstr: &str,
+    dir: &str,
+    slot: &str,
+) -> wal_recv::ReceiverConfig {
+    let mut host = "127.0.0.1".to_owned();
+    let mut port: u16 = 5432;
+    let mut user = "postgres".to_owned();
+
+    // Handle URI form: postgres://user@host:port/db
+    for prefix in ["postgresql://", "postgres://"] {
+        if let Some(rest) = connstr.strip_prefix(prefix) {
+            let rest = rest.split('/').next().unwrap_or(rest); // strip /db
+            let (userinfo, hostport) = if let Some(at) = rest.rfind('@') {
+                (&rest[..at], &rest[at + 1..])
+            } else {
+                ("", rest)
+            };
+            if !userinfo.is_empty() {
+                // user or user:password
+                user = userinfo.split(':').next().unwrap_or("postgres").to_owned();
+            }
+            if let Some(bracket_end) = hostport.find(']') {
+                // IPv6 literal [::1]:port
+                host = hostport[1..bracket_end].to_owned();
+                if let Some(p) = hostport[bracket_end + 1..].strip_prefix(':') {
+                    port = p.parse().unwrap_or(5432);
+                }
+            } else if let Some(colon) = hostport.rfind(':') {
+                host = hostport[..colon].to_owned();
+                port = hostport[colon + 1..].parse().unwrap_or(5432);
+            } else if !hostport.is_empty() {
+                host = hostport.to_owned();
+            }
+            break;
         }
-        let mut cmd = std::process::Command::new("pg_receivewal");
-        cmd.args([
-            "--create-slot",
-            "--if-not-exists",
-            "--slot",
-            &slot,
-            "--dbname",
-            &connstr,
-        ]);
-        if let Some(ref pw) = password {
-            cmd.env("PGPASSWORD", pw);
-        }
-        match cmd.status() {
-            Ok(s) if s.success() => break,
-            Ok(s) => eprintln!("pg_receivewal --create-slot exited: {s}"),
-            Err(e) => eprintln!("pg_receivewal --create-slot failed to launch: {e}"),
-        }
-        if SHUTDOWN.load(Ordering::Acquire) {
-            return;
-        }
-        std::thread::sleep(Duration::from_secs(2));
     }
 
+    // Handle keyword=value form.
+    if !connstr.starts_with("postgresql://") && !connstr.starts_with("postgres://") {
+        let mut s = connstr;
+        while !s.is_empty() {
+            s = s.trim_start();
+            let Some(eq) = s.find('=') else { break };
+            let key = s[..eq].trim_end();
+            s = &s[eq + 1..];
+            let (value, consumed) = parse_kv_value(s);
+            s = &s[consumed..];
+            match key {
+                "host" => host = value,
+                "port" => port = value.parse().unwrap_or(5432),
+                "user" => user = value,
+                _ => {}
+            }
+        }
+    }
+
+    wal_recv::ReceiverConfig {
+        host,
+        port,
+        user,
+        password: None,
+        slot: slot.to_owned(),
+        dir: std::path::PathBuf::from(dir),
+        status_interval: Duration::from_secs(10),
+    }
+}
+
+/// Native Rust WAL receiver loop. Replaces the pg_receivewal subprocess.
+/// Retries with 2-second backoff on any error until SHUTDOWN is set.
+fn run_native_receiver(cfg: wal_recv::ReceiverConfig, _dir: &str) {
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
-            break;
+            return;
         }
-
-        let mut cmd = std::process::Command::new("pg_receivewal");
-        cmd.args([
-            "--synchronous",
-            "--slot",
-            &slot,
-            "--directory",
-            &dir,
-            "--dbname",
-            &connstr,
-        ]);
-        if let Some(ref pw) = password {
-            cmd.env("PGPASSWORD", pw);
+        match wal_recv::run_receiver(&cfg) {
+            Ok(()) => eprintln!("wal receiver: connection closed cleanly"),
+            Err(e) => eprintln!("wal receiver: {e}"),
         }
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("pg_receivewal failed to launch: {e}");
-                if !SHUTDOWN.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_secs(2));
-                }
-                continue;
-            }
-        };
-
-        CHILD_PID.store(child.id() as i32, Ordering::Release);
-        let status = child.wait();
-        CHILD_PID.store(0, Ordering::Release);
-
-        match status {
-            Ok(s) => eprintln!("pg_receivewal exited: {s}"),
-            Err(e) => eprintln!("pg_receivewal wait error: {e}"),
-        }
-
         if SHUTDOWN.load(Ordering::Acquire) {
-            break;
+            return;
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -567,8 +568,11 @@ fn run_http_server(listener: TcpListener, dir: &str, port: u16) {
         }
         match listener.accept() {
             Ok((stream, _)) => {
-                if CONN_COUNT.load(Ordering::Relaxed) >= MAX_CONNS {
-                    // Drop stream to close; client sees a reset.
+                // Atomically claim a slot before spawning. fetch_add returns
+                // the previous value; if it was already at the limit, undo and
+                // drop the connection (client sees a reset).
+                if CONN_COUNT.fetch_add(1, Ordering::Relaxed) >= MAX_CONNS {
+                    CONN_COUNT.fetch_sub(1, Ordering::Relaxed);
                     continue;
                 }
                 // On macOS, accepted sockets inherit O_NONBLOCK from the
@@ -576,10 +580,14 @@ fn run_http_server(listener: TcpListener, dir: &str, port: u16) {
                 // drop data when the TCP send buffer is temporarily full.
                 #[cfg(not(target_os = "linux"))]
                 if let Err(e) = stream.set_nonblocking(false) {
+                    CONN_COUNT.fetch_sub(1, Ordering::Relaxed);
                     eprintln!("warn: set_nonblocking(false) failed: {e} — dropping connection");
                     continue;
                 }
-                CONN_COUNT.fetch_add(1, Ordering::Relaxed);
+                // Bound how long a slow or stalled client can hold a handler
+                // thread. Without a timeout, 256 slow clients exhaust the
+                // pool and new connections are silently dropped.
+                stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
                 let dir = dir.to_owned();
                 std::thread::spawn(move || {
                     handle_conn(stream, &dir);
@@ -603,6 +611,9 @@ fn handle_conn(mut stream: TcpStream, dir: &str) {
     let mut filled = 0usize;
 
     // Read until we have the full request headers (\r\n\r\n) or the buffer fills.
+    // scan_from tracks how far we've already searched; each iteration only scans
+    // new bytes plus a 3-byte overlap so the delimiter can span two reads.
+    let mut scan_from = 0usize;
     loop {
         if filled >= buf.len() {
             break;
@@ -612,9 +623,14 @@ fn handle_conn(mut stream: TcpStream, dir: &str) {
             Ok(n) => filled += n,
             Err(_) => return,
         }
-        if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
+        let search_start = scan_from.saturating_sub(3);
+        if buf[search_start..filled]
+            .windows(4)
+            .any(|w| w == b"\r\n\r\n")
+        {
             break;
         }
+        scan_from = filled;
     }
 
     let request_line_end = match buf[..filled].windows(2).position(|w| w == b"\r\n") {
@@ -665,31 +681,47 @@ fn handle_conn(mut stream: TcpStream, dir: &str) {
 }
 
 fn serve_list(stream: &mut TcpStream, dir: &str) {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
+    // Collect segment names as fixed [u8; 24] arrays — avoids one heap
+    // allocation per filename that Vec<String> would incur.
+    let mut names: Vec<[u8; 24]> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let raw = e.file_name();
             match raw.to_str() {
-                Some(s) => Some(s.to_owned()),
+                Some(s) if s.len() == 24 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                    let mut arr = [0u8; 24];
+                    arr.copy_from_slice(s.as_bytes());
+                    Some(arr)
+                }
+                Some(_) => None,
                 None => {
                     eprintln!("warn: skipping non-UTF-8 filename in WAL dir: {raw:?}");
                     None
                 }
             }
         })
-        .filter(|n| n.len() == 24 && n.bytes().all(|b| b.is_ascii_hexdigit()))
         .collect();
     names.sort_unstable();
 
-    let body = names.join("\n");
+    // Build body in one allocation: N * 24 bytes + (N-1) newlines.
+    let n = names.len();
+    let body_len = if n == 0 { 0 } else { n * 25 - 1 };
+    let mut body = Vec::with_capacity(body_len);
+    for (i, name) in names.iter().enumerate() {
+        body.extend_from_slice(name);
+        if i + 1 < n {
+            body.push(b'\n');
+        }
+    }
+
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
+    let _ = stream.write_all(&body);
 }
 
 fn write_404(stream: &mut TcpStream) {
