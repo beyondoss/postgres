@@ -186,6 +186,12 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Remove any .partial files left by a previous crash.  The streaming
+    // receiver always restarts from highest_local_lsn (the end of the last
+    // *complete* segment), so partial files are never needed for recovery and
+    // would accumulate as dead disk weight across restarts.
+    cleanup_partial_segments(&args.dir);
+
     // Clear any pre-existing excess before pg_receivewal starts writing.
     prune_old_segments(&args.dir, args.retention_segments);
 
@@ -251,6 +257,22 @@ fn main() {
     }
     if watcher_thread.join().is_err() {
         eprintln!("warn: retention watcher thread panicked");
+    }
+}
+
+fn cleanup_partial_segments(dir: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if s.ends_with(".partial") {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => eprintln!("startup: removed orphaned partial segment {s}"),
+                Err(e) => eprintln!("warn: could not remove partial segment {s}: {e}"),
+            }
+        }
     }
 }
 
@@ -669,6 +691,16 @@ fn handle_conn(mut stream: TcpStream, dir: &str) {
         p if p.len() == 25
             && p.starts_with('/')
             && p[1..].bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            serve_segment(&mut stream, dir, &p[1..]);
+        }
+        // Postgres timeline history files: /{8 hex digits}.history
+        // e.g. /00000002.history — needed for restore_command to traverse
+        // timeline boundaries after a failover/promotion.
+        p if p.len() == 17
+            && p.starts_with('/')
+            && p.ends_with(".history")
+            && p[1..9].bytes().all(|b| b.is_ascii_hexdigit()) =>
         {
             serve_segment(&mut stream, dir, &p[1..]);
         }

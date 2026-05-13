@@ -277,7 +277,7 @@ fn read_cmd(r: &mut BufReader<TcpStream>) -> io::Result<Cmd> {
         b"HELLO" => Cmd::Hello,
         b"PING" => Cmd::Ping,
         b"WATCH" => {
-            let since_requested = parts.len() >= 3 && parts[1].to_ascii_uppercase() == b"SINCE";
+            let since_requested = parts.len() >= 3 && parts[1].eq_ignore_ascii_case(b"SINCE");
             Cmd::Watch { since_requested }
         }
         b"UNWATCH" => Cmd::Unwatch,

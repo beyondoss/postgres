@@ -135,6 +135,11 @@ impl WalWriter {
                 .map(|n| partial_path.with_file_name(n));
             if let Some(final_path) = final_name {
                 fs::rename(&partial_path, &final_path)?;
+                // Fsync the directory so the rename (a directory-entry update) is
+                // durable on crash.  Without this, on XFS/BTRFS the updated entry
+                // lives only in the journal and can revert on a hard power loss,
+                // leaving the segment under its old .partial name.
+                fs::File::open(&self.dir)?.sync_all()?;
             }
             self.offset = 0;
         }

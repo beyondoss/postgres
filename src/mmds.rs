@@ -32,6 +32,9 @@ pub struct MmdsConfig {
     /// When true, a `cdc` logical replication slot and empty publication are created on boot.
     /// Set via MMDS key `BEYOND_PG_CDC_ENABLED`. Absent or `false` → `false`.
     pub cdc_enabled: bool,
+    /// libpq connection string to the primary. Required when `pg_tier = Replica`.
+    /// Set via MMDS key `BEYOND_PG_PRIMARY_CONNINFO`.
+    pub primary_conninfo: Option<String>,
     /// Host RAM in bytes (cgroup-aware).
     pub ram_bytes: u64,
     /// Logical CPU count (cgroup-aware).
@@ -51,6 +54,8 @@ pub enum MmdsError {
     MissingPassword,
     #[error("POSTGRES_PASSWORD contains the reserved dollar-quote tag '$_beyond_$'")]
     InvalidPassword,
+    #[error("BEYOND_PG_PRIMARY_CONNINFO is required when BEYOND_PG_TIER=replica")]
+    MissingPrimaryConninfo,
     #[error("MMDS metadata not available after {MAX_ATTEMPTS} attempts: {0}")]
     Unavailable(String),
 }
@@ -93,7 +98,7 @@ async fn load_json() -> Result<Value, MmdsError> {
     Err(MmdsError::Unavailable(last_err))
 }
 
-fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
+pub(crate) fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
     let meta = &json["latest"]["meta-data"];
 
     let postgres_password = meta["POSTGRES_PASSWORD"]
@@ -139,6 +144,15 @@ fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
+    let primary_conninfo = meta["BEYOND_PG_PRIMARY_CONNINFO"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+
+    if pg_tier == PgTier::Replica && primary_conninfo.is_none() {
+        return Err(MmdsError::MissingPrimaryConninfo);
+    }
+
     let ram_bytes = read_ram_bytes();
     let vcpus = read_vcpus();
 
@@ -150,6 +164,7 @@ fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         archive_target,
         wal_sink,
         cdc_enabled,
+        primary_conninfo,
         ram_bytes,
         vcpus,
     })
@@ -203,4 +218,76 @@ fn read_proc_meminfo_kib(field: &str) -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_meta(extra: &[(&str, &str)]) -> serde_json::Value {
+        let mut map = serde_json::json!({
+            "POSTGRES_PASSWORD": "hunter2",
+        });
+        for (k, v) in extra {
+            map["latest"]["meta-data"][k] = serde_json::Value::String(v.to_string());
+        }
+        // Rebuild with correct nesting
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "POSTGRES_PASSWORD".into(),
+            serde_json::Value::String("hunter2".into()),
+        );
+        for (k, v) in extra {
+            meta.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+        }
+        serde_json::json!({ "latest": { "meta-data": meta } })
+    }
+
+    #[test]
+    fn replica_requires_primary_conninfo() {
+        let json = base_meta(&[("BEYOND_PG_TIER", "replica")]);
+        let err = parse(json).unwrap_err();
+        assert!(
+            matches!(err, MmdsError::MissingPrimaryConninfo),
+            "expected MissingPrimaryConninfo, got: {err}"
+        );
+    }
+
+    #[test]
+    fn replica_with_conninfo_parses() {
+        let json = base_meta(&[
+            ("BEYOND_PG_TIER", "replica"),
+            (
+                "BEYOND_PG_PRIMARY_CONNINFO",
+                "host=10.0.0.1 user=replicator",
+            ),
+        ]);
+        let cfg = parse(json).expect("should parse");
+        assert_eq!(cfg.pg_tier, PgTier::Replica);
+        assert_eq!(
+            cfg.primary_conninfo.as_deref(),
+            Some("host=10.0.0.1 user=replicator")
+        );
+    }
+
+    #[test]
+    fn single_tier_has_no_conninfo() {
+        let json = base_meta(&[]);
+        let cfg = parse(json).expect("should parse");
+        assert_eq!(cfg.pg_tier, PgTier::Single);
+        assert!(cfg.primary_conninfo.is_none());
+    }
+
+    #[test]
+    fn empty_conninfo_string_treated_as_missing() {
+        let json = base_meta(&[
+            ("BEYOND_PG_TIER", "replica"),
+            ("BEYOND_PG_PRIMARY_CONNINFO", ""),
+        ]);
+        let err = parse(json).unwrap_err();
+        assert!(
+            matches!(err, MmdsError::MissingPrimaryConninfo),
+            "empty conninfo should fail: {err}"
+        );
+    }
 }

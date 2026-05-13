@@ -26,7 +26,7 @@ use tracing::{error, info, warn};
 use crate::boot;
 use crate::config;
 use crate::log_forwarder::{LogFrame, spawn_async_reader_task, zero_execution_id};
-use crate::mmds::MmdsConfig;
+use crate::mmds::{MmdsConfig, PgTier};
 use crate::pg;
 use crate::vsock::ExecStream;
 #[cfg(target_os = "linux")]
@@ -85,14 +85,21 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("postgres is ready");
 
-    post_start(&cfg).await?;
+    // Replicas are read-only hot standbys — DDL is rejected during recovery.
+    // Extensions, roles, and slots are replicated from the primary.
+    if cfg.pg_tier != PgTier::Replica {
+        post_start(&cfg).await?;
+    }
 
-    // Spawn PgBouncer after post-start so the pgbouncer role and auth function exist
+    // Spawn PgBouncer after post-start so the pgbouncer role and auth function exist.
+    // PgBouncer is useful on replicas too for read-only connection pooling.
     let mut pgb_state = ChildState::new("pgbouncer");
     spawn_pgbouncer(&mut pgb_state, &log_tx)?;
 
-    // Spawn the WAL forwarder if a sink URL is configured.
-    if let Some(wal_sink) = &cfg.wal_sink {
+    // WAL forwarder and CDC run only on the primary.
+    if cfg.pg_tier != PgTier::Replica
+        && let Some(wal_sink) = &cfg.wal_sink
+    {
         let sink_url = wal_sink.clone();
         tokio::spawn(crate::wal_forwarder::run(
             sink_url,
@@ -101,8 +108,7 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    // Spawn CDC consumer (only when enabled by image config)
-    let mut cdc_state = if cfg.cdc_enabled {
+    let mut cdc_state = if cfg.pg_tier != PgTier::Replica && cfg.cdc_enabled {
         let mut s = ChildState::new("beyond-pg-cdc");
         spawn_cdc(&mut s, &log_tx)?;
         Some(s)

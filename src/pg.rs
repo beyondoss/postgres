@@ -19,6 +19,8 @@ pub enum PgError {
     Io(#[from] std::io::Error),
     #[error("pg command killed by signal")]
     Signal,
+    #[error("PGDATA has PG_VERSION but no standby.signal — this is a primary data dir")]
+    AlreadyPrimary,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,13 +160,88 @@ pub async fn initdb(pgdata: &str, pwfile_path: &str) -> Result<(), PgError> {
 }
 
 // ---------------------------------------------------------------------------
-// pg_basebackup (stub)
+// pg_basebackup
 // ---------------------------------------------------------------------------
 
+/// Seed a replica PGDATA from the primary via `pg_basebackup`.
+///
+/// Idempotent:
+/// - `PG_VERSION` + `standby.signal` present → already seeded, returns `Ok(())`.
+/// - `PG_VERSION` without `standby.signal` → `Err(AlreadyPrimary)` (refuse to overwrite).
+/// - Neither present → runs `pg_basebackup`.
+///
+/// Does not pass `-R`; the caller writes `04-replica.conf` and touches
+/// `standby.signal` so those files are owned by beyond-pg, not pg_basebackup.
+///
+/// `--waldir` is passed so pg_basebackup creates `pg_wal/` as a symlink to
+/// `/var/lib/postgresql/18/wal`, matching the layout that `initdb --waldir`
+/// produces and that `verify_wal_symlink()` expects.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub async fn basebackup(_target: &str) -> Result<(), PgError> {
-    Err(PgError::NonZeroExit {
-        code: -1,
-        stderr: "pg_basebackup not yet implemented".into(),
-    })
+pub async fn basebackup(conninfo: &str) -> Result<(), PgError> {
+    let pg_version = format!("{PGDATA}/PG_VERSION");
+    let standby_signal = format!("{PGDATA}/standby.signal");
+
+    if std::path::Path::new(&pg_version).exists() {
+        return if std::path::Path::new(&standby_signal).exists() {
+            tracing::info!(
+                "basebackup: already seeded (PG_VERSION + standby.signal present), skipping"
+            );
+            Ok(())
+        } else {
+            Err(PgError::AlreadyPrimary)
+        };
+    }
+
+    tracing::info!("basebackup: seeding replica PGDATA from primary");
+    let out = Command::new("pg_basebackup")
+        .args([
+            "-d",
+            conninfo,
+            "--pgdata",
+            PGDATA,
+            "--waldir",
+            "/var/lib/postgresql/18/wal",
+            "--format=plain",
+            "--wal-method=stream",
+            "--checkpoint=fast",
+            "--progress",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await?;
+
+    if out.status.success() {
+        tracing::info!("basebackup: complete");
+        return Ok(());
+    }
+    let code = out.status.code().ok_or(PgError::Signal)?;
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    tracing::warn!("basebackup failed (exit {code}): {stderr}");
+    Err(PgError::NonZeroExit { code, stderr })
+}
+
+// ---------------------------------------------------------------------------
+// pg_ctl promote
+// ---------------------------------------------------------------------------
+
+/// Promote this standby to primary via `pg_ctl promote`.
+///
+/// Called by the vsock RPC handler. The promotion decision belongs to the host
+/// (box-manager); this function only executes it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub async fn promote() -> Result<(), PgError> {
+    tracing::info!("pg_ctl: promoting standby to primary");
+    let out = Command::new("pg_ctl")
+        .args(["promote", "-D", PGDATA])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await?;
+
+    if out.status.success() {
+        tracing::info!("pg_ctl: promote complete");
+        return Ok(());
+    }
+    let code = out.status.code().ok_or(PgError::Signal)?;
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    Err(PgError::NonZeroExit { code, stderr })
 }

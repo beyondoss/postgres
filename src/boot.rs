@@ -25,14 +25,14 @@ const HOOKS_PRE_START: &str = "/etc/postgresql/18/hooks/pre-start.d";
 pub enum BootError {
     #[error("MMDS error: {0}")]
     Mmds(#[from] MmdsError),
-    #[error("Tier 2 not yet implemented (tier = {0:?})")]
-    UnsupportedTier(PgTier),
     #[error("pg_wal exists as a plain directory — operator must convert to symlink")]
     WalIsDirectory,
     #[error("pg_wal symlink points to wrong target: expected {expected}, got {actual}")]
     WalWrongTarget { expected: String, actual: String },
     #[error("initdb failed: {0}")]
     InitDb(String),
+    #[error("pg_basebackup failed: {0}")]
+    BaseBackup(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("TLS cert error: {0}")]
@@ -68,10 +68,13 @@ pub async fn run() {
 
 /// Idempotent boot-time setup. Called by `supervisor` before spawning Postgres.
 pub async fn do_boot(cfg: &MmdsConfig) -> Result<(), BootError> {
-    if cfg.pg_tier != PgTier::Single {
-        return Err(BootError::UnsupportedTier(cfg.pg_tier));
+    match cfg.pg_tier {
+        PgTier::Single | PgTier::Primary => do_boot_primary(cfg).await,
+        PgTier::Replica => do_boot_replica(cfg).await,
     }
+}
 
+async fn do_boot_primary(cfg: &MmdsConfig) -> Result<(), BootError> {
     ensure_conf_d()?;
     maybe_initdb(cfg).await?;
     verify_wal_symlink()?;
@@ -80,12 +83,66 @@ pub async fn do_boot(cfg: &MmdsConfig) -> Result<(), BootError> {
     let shared_buffers_mb = (cfg.ram_bytes / (1024 * 1024) / 4).max(128);
     apply_kernel_settings(shared_buffers_mb);
 
-    // Step 7: ensure TLS cert exists and is not near expiry.
     match crate::tls::ensure_cert(Path::new(PGDATA))? {
         crate::tls::TlsCertOutcome::Generated => info!("tls: generated new self-signed cert"),
         crate::tls::TlsCertOutcome::Renewed => {
             info!("tls: renewed self-signed cert (was near expiry)");
             // Best-effort reload; if postgres is not yet started this is a no-op.
+            if let Err(e) = pg::reload().await {
+                info!("tls: pg_ctl reload skipped (postgres not yet started): {e}");
+            }
+        }
+        crate::tls::TlsCertOutcome::UserManaged => {
+            info!("tls: skipping cert — .user-managed sentinel present")
+        }
+        crate::tls::TlsCertOutcome::StillValid => info!("tls: cert still valid"),
+    }
+
+    run_hook_scripts(HOOKS_PRE_START).await?;
+
+    Ok(())
+}
+
+async fn do_boot_replica(cfg: &MmdsConfig) -> Result<(), BootError> {
+    // primary_conninfo is guaranteed Some for Replica by mmds::parse().
+    let conninfo = cfg
+        .primary_conninfo
+        .as_deref()
+        .expect("primary_conninfo required for replica — guaranteed by mmds::parse");
+
+    ensure_conf_d()?;
+
+    // Seed PGDATA from the primary (idempotent — skips if already done).
+    pg::basebackup(conninfo)
+        .await
+        .map_err(|e| BootError::BaseBackup(e.to_string()))?;
+
+    // Touch standby.signal (idempotent — pg_basebackup does not write it since
+    // we don't pass -R; we own this file explicitly for auditability).
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(format!("{PGDATA}/standby.signal"))?;
+    info!("standby.signal: present");
+
+    verify_wal_symlink()?;
+
+    // Standard config files (tuning, memory, hba, pgbouncer, etc.)
+    write_config_files(cfg)?;
+
+    // Replica-specific config: primary_conninfo + optional restore_command.
+    let replica_conf = config::replica_conf(conninfo, cfg.wal_sink.as_deref());
+    config::write_atomic(Path::new(&config::replica_conf_path()), &replica_conf)?;
+    info!("wrote {}", config::replica_conf_path());
+
+    let shared_buffers_mb = (cfg.ram_bytes / (1024 * 1024) / 4).max(128);
+    apply_kernel_settings(shared_buffers_mb);
+
+    match crate::tls::ensure_cert(Path::new(PGDATA))? {
+        crate::tls::TlsCertOutcome::Generated => info!("tls: generated new self-signed cert"),
+        crate::tls::TlsCertOutcome::Renewed => {
+            info!("tls: renewed self-signed cert (was near expiry)");
             if let Err(e) = pg::reload().await {
                 info!("tls: pg_ctl reload skipped (postgres not yet started): {e}");
             }

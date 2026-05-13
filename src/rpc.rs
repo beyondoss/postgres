@@ -8,6 +8,7 @@
 //!   checkpoint → CHECKPOINT via psql
 //!   health     → pg_isready
 //!   reload     → pg_ctl reload
+//!   promote    → pg_ctl promote (replica → primary; host decides when)
 //!   backup     → stub (not implemented)
 //!
 //! Only available on Linux (vsock is a Linux kernel feature).
@@ -122,6 +123,10 @@ mod inner {
                 }
             }
             "reload" => match crate::pg::reload().await {
+                Ok(()) => RpcResponse::ok(),
+                Err(e) => RpcResponse::err(e.to_string()),
+            },
+            "promote" => match crate::pg::promote().await {
                 Ok(()) => RpcResponse::ok(),
                 Err(e) => RpcResponse::err(e.to_string()),
             },
