@@ -158,6 +158,8 @@ fn wal_sink_streams_from_primary() {
     let connstr = format!("host=127.0.0.1 port={pg_port} user=postgres");
     let mut cmd = std::process::Command::new(BIN);
     cmd.args([
+        "--mode",
+        "tcp",
         "--connstr",
         &connstr,
         "--dir",
@@ -548,6 +550,8 @@ fn latency_baseline() {
     let connstr = format!("host=127.0.0.1 port={pg_port} user=postgres");
     let mut cmd = std::process::Command::new(BIN);
     cmd.args([
+        "--mode",
+        "tcp",
         "--connstr",
         &connstr,
         "--dir",
@@ -1029,6 +1033,8 @@ fn latency_baseline_real() {
     let connstr = format!("host=127.0.0.1 port={pg_port} user=postgres");
     let mut tcp_cmd = std::process::Command::new(BIN);
     tcp_cmd.args([
+        "--mode",
+        "tcp",
         "--connstr",
         &connstr,
         "--dir",
