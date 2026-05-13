@@ -212,3 +212,87 @@ pub fn run_receiver(cfg: &ReceiverConfig) -> Result<(), RecvError> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("wal-writer-{tag}"));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn walwriter_creates_partial_mid_segment() {
+        let dir = tmp_dir("partial-mid");
+        let mut w = WalWriter::new(&dir, 1);
+        let data = vec![0xABu8; 1024];
+        w.write(Lsn(0), &data).unwrap();
+
+        let seg_name = segment_name(Lsn(0), 1);
+        assert!(
+            dir.join(format!("{seg_name}.partial")).exists(),
+            ".partial file should exist while segment is in progress"
+        );
+        assert!(
+            !dir.join(&seg_name).exists(),
+            "final segment should not appear before the segment boundary"
+        );
+        assert_eq!(w.write_lsn.0, 1024);
+        assert_eq!(w.flush_lsn.0, 1024);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn walwriter_renames_partial_at_segment_boundary() {
+        let dir = tmp_dir("rename-at-boundary");
+        let mut w = WalWriter::new(&dir, 1);
+        // Start 100 bytes before the end of segment 0 so the write fills it
+        // without allocating the full 16 MiB in this test.
+        let start = Lsn(WAL_SEGMENT_SIZE - 100);
+        let data = vec![0u8; 100];
+        w.write(start, &data).unwrap();
+
+        let seg_name = segment_name(start, 1);
+        assert!(
+            !dir.join(format!("{seg_name}.partial")).exists(),
+            ".partial should be renamed after the last byte of the segment"
+        );
+        assert!(
+            dir.join(&seg_name).exists(),
+            "final segment file should exist after segment completion"
+        );
+        assert_eq!(w.flush_lsn.0, WAL_SEGMENT_SIZE);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn walwriter_splits_data_across_segment_boundary() {
+        let dir = tmp_dir("split-boundary");
+        let mut w = WalWriter::new(&dir, 1);
+        // 100 bytes into segment 0, 100 bytes into segment 1.
+        let start = Lsn(WAL_SEGMENT_SIZE - 100);
+        let data = vec![0xCCu8; 200];
+        w.write(start, &data).unwrap();
+
+        let seg0_name = segment_name(start, 1);
+        assert!(
+            dir.join(&seg0_name).exists(),
+            "segment 0 should be finalized after the boundary crossing"
+        );
+        assert!(
+            !dir.join(format!("{seg0_name}.partial")).exists(),
+            "segment 0 .partial should be gone after rename"
+        );
+
+        let seg1_name = segment_name(Lsn(WAL_SEGMENT_SIZE), 1);
+        assert!(
+            dir.join(format!("{seg1_name}.partial")).exists(),
+            "segment 1 .partial should exist with the overflow bytes"
+        );
+
+        assert_eq!(w.flush_lsn.0, WAL_SEGMENT_SIZE + 100);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

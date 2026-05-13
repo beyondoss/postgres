@@ -806,7 +806,215 @@ fn serve_segment(stream: &mut TcpStream, dir: &str, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::time::Duration;
+
+    // ---------------------------------------------------------------------------
+    // HTTP handler helpers
+    // ---------------------------------------------------------------------------
+
+    /// Send `raw_request` to a fresh `handle_conn` call and return (status, body).
+    fn test_http_conn(dir: &std::path::Path, raw_request: &[u8]) -> (u16, Vec<u8>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir_str = dir.to_str().unwrap().to_owned();
+        let t = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_conn(stream, &dir_str);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(raw_request).unwrap();
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        drop(client);
+        t.join().unwrap();
+
+        let header_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("no header terminator in response");
+        let headers = std::str::from_utf8(&response[..header_end]).unwrap();
+        let status: u16 = headers
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        (status, response[header_end + 4..].to_vec())
+    }
+
+    // ---------------------------------------------------------------------------
+    // HTTP handler tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn http_list_empty_dir_returns_200_empty_body() {
+        let dir = make_dir("http-list-empty");
+        let (status, body) = test_http_conn(
+            &dir,
+            b"GET /list HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(status, 200);
+        assert!(body.is_empty(), "empty dir should produce empty /list body");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn http_list_returns_sorted_segment_names() {
+        let dir = make_dir("http-list-sorted");
+        write_segment(&dir, 1, 5);
+        write_segment(&dir, 1, 3);
+        write_segment(&dir, 1, 7);
+        let (status, body) = test_http_conn(
+            &dir,
+            b"GET /list HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(status, 200);
+        let body_str = std::str::from_utf8(&body).unwrap();
+        let names: Vec<&str> = body_str.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(names.len(), 3);
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            names, sorted,
+            "/list must return segment names in sorted order"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn http_list_excludes_partial_files() {
+        let dir = make_dir("http-list-partial");
+        write_segment(&dir, 1, 0);
+        let partial = format!("{:08X}{:08X}{:08X}.partial", 1u32, 0u32, 1u32);
+        std::fs::write(dir.join(&partial), b"in-progress").unwrap();
+        let (status, body) = test_http_conn(
+            &dir,
+            b"GET /list HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(status, 200);
+        let body_str = std::str::from_utf8(&body).unwrap();
+        let names: Vec<&str> = body_str.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(names.len(), 1, "/list must not include .partial files");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn http_get_segment_returns_bytes() {
+        let dir = make_dir("http-get-bytes");
+        let name = write_segment(&dir, 1, 0);
+        let expected = std::fs::read(dir.join(&name)).unwrap();
+        let (status, body) = test_http_conn(
+            &dir,
+            format!("GET /{name} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            body, expected,
+            "segment response must match on-disk bytes exactly"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn http_get_missing_segment_returns_404() {
+        let dir = make_dir("http-get-missing");
+        let name = format!("{:08X}{:08X}{:08X}", 1u32, 0u32, 0u32);
+        let (status, _) = test_http_conn(
+            &dir,
+            format!("GET /{name} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        );
+        assert_eq!(status, 404);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn http_get_pruned_segment_returns_404() {
+        let dir = make_dir("http-get-pruned");
+        let name = write_segment(&dir, 1, 0);
+        // Simulate the retention pruner deleting the segment before the GET.
+        std::fs::remove_file(dir.join(&name)).unwrap();
+        let (status, _) = test_http_conn(
+            &dir,
+            format!("GET /{name} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        );
+        assert_eq!(status, 404);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn http_post_returns_405() {
+        let dir = make_dir("http-post-405");
+        let (status, _) = test_http_conn(
+            &dir,
+            b"POST /list HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(status, 405);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn http_unknown_path_returns_404() {
+        let dir = make_dir("http-unknown-404");
+        let (status, _) = test_http_conn(
+            &dir,
+            b"GET /notapath HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(status, 404);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Connection string parser tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn parse_connstr_kv_basic() {
+        let cfg = parse_connstr_to_receiver_config(
+            "host=10.0.0.1 port=5433 user=repuser",
+            "/wal",
+            "myslot",
+        );
+        assert_eq!(cfg.host, "10.0.0.1");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.user, "repuser");
+        assert_eq!(cfg.slot, "myslot");
+        assert_eq!(cfg.dir, std::path::PathBuf::from("/wal"));
+    }
+
+    #[test]
+    fn parse_connstr_uri_basic() {
+        let cfg =
+            parse_connstr_to_receiver_config("postgres://repuser@10.0.0.1:5433/mydb", "/wal", "s");
+        assert_eq!(cfg.host, "10.0.0.1");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.user, "repuser");
+    }
+
+    #[test]
+    fn parse_connstr_defaults_on_empty() {
+        let cfg = parse_connstr_to_receiver_config("", "/wal", "slot");
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 5432);
+        assert_eq!(cfg.user, "postgres");
+    }
+
+    #[test]
+    fn parse_connstr_kv_quoted_value() {
+        let cfg =
+            parse_connstr_to_receiver_config("host='my.host' port=5432 user=postgres", "/wal", "s");
+        assert_eq!(cfg.host, "my.host");
+    }
 
     fn make_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("wal-sink-retention-{tag}"));

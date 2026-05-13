@@ -822,6 +822,219 @@ fn latency_baseline_quic() {
 // a glibc-free Alpine image. The test skips with a clear message if the
 // target isn't installed.
 
+/// Verify that the sink can be crash-killed and restarted while reusing the same
+/// replication slot and WAL directory.  The second run must:
+///   1. Attach to the existing slot without erroring (slot `IF NOT EXISTS`).
+///   2. Resume streaming from the last complete segment on disk via
+///      `highest_local_lsn`, ignoring any `.partial` file left by the crash.
+///   3. Acknowledge new commits so `flush_lsn >= commit_lsn`.
+///   4. Leave the segments written during the first run intact on disk.
+#[test]
+#[ignore = "requires Docker"]
+fn sink_restart_is_idempotent() {
+    let container = Postgres::default()
+        .with_tag("18")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd([
+            "-c",
+            "wal_level=replica",
+            "-c",
+            "max_wal_senders=4",
+            "-c",
+            "synchronous_standby_names=*",
+            "-c",
+            "synchronous_commit=remote_write",
+        ])
+        .start()
+        .expect("Docker not available or postgres:18 image pull failed");
+
+    let pg_port = container.get_host_port_ipv4(5432).unwrap();
+    let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
+
+    {
+        let mut setup = postgres::Client::connect(&pg_url, postgres::NoTls).unwrap();
+        setup
+            .batch_execute(
+                "DO $$ DECLARE p text; BEGIN \
+                     SELECT current_setting('hba_file') INTO p; \
+                     EXECUTE format( \
+                         $q$COPY (SELECT line FROM (VALUES \
+                             ('local all all trust'), \
+                             ('host all all all trust'), \
+                             ('host replication all all trust') \
+                         ) AS t(line)) TO %L$q$, p); \
+                 END; $$; \
+                 SELECT pg_reload_conf();",
+            )
+            .unwrap();
+    }
+
+    let sink_dir = std::env::temp_dir().join(format!("wal-sink-restart-{pg_port}"));
+    std::fs::create_dir_all(&sink_dir).unwrap();
+
+    let connstr = format!("host=127.0.0.1 port={pg_port} user=postgres");
+
+    let spawn_sink = |http_port: u16| -> std::process::Child {
+        let mut cmd = std::process::Command::new(BIN);
+        cmd.args([
+            "--mode",
+            "tcp",
+            "--connstr",
+            &connstr,
+            "--dir",
+            sink_dir.to_str().unwrap(),
+            "--port",
+            &http_port.to_string(),
+            "--slot",
+            "wal_sink_restart",
+        ]);
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.spawn().expect("failed to spawn beyond-pg-sink")
+    };
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_port1 = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    // ── First run ──────────────────────────────────────────────────────────
+    let mut proc1 = spawn_sink(http_port1);
+    wait_http_ready(http_port1);
+
+    let mut client =
+        postgres::Client::connect(&pg_url, postgres::NoTls).expect("failed to connect to Postgres");
+
+    let mut streaming = false;
+    for _ in 0..60 {
+        if client
+            .query_opt(
+                "SELECT 1 FROM pg_stat_replication WHERE application_name = 'wal_sink_restart'",
+                &[],
+            )
+            .unwrap()
+            .is_some()
+        {
+            streaming = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        streaming,
+        "first run: sink never appeared in pg_stat_replication"
+    );
+
+    client
+        .batch_execute(
+            "CREATE TABLE restart_test (id serial, v text); \
+             INSERT INTO restart_test (v) SELECT 'row-' || g FROM generate_series(1, 200) g;",
+        )
+        .unwrap();
+    client.execute("SELECT pg_switch_wal()", &[]).unwrap();
+
+    let mut first_segments: Vec<String> = Vec::new();
+    for _ in 0..60 {
+        first_segments = std::fs::read_dir(&sink_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.len() == 24 && n.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect();
+        if !first_segments.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        !first_segments.is_empty(),
+        "no complete segments after first run + pg_switch_wal"
+    );
+
+    // SIGKILL simulates a crash: the process dies instantly, possibly leaving a
+    // .partial file for the segment that was being written at the time.
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(proc1.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = proc1.kill();
+    let _ = proc1.wait();
+
+    // ── Second run ─────────────────────────────────────────────────────────
+    // Use a fresh ephemeral port so we don't race against the kernel's
+    // TIME_WAIT or socket lingering from the first process.
+    let probe2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_port2 = probe2.local_addr().unwrap().port();
+    drop(probe2);
+
+    let proc2 = spawn_sink(http_port2);
+    let _sink2 = Sink {
+        process: proc2,
+        dir: sink_dir.clone(),
+    };
+
+    wait_http_ready(http_port2);
+
+    let mut streaming2 = false;
+    for _ in 0..60 {
+        if client
+            .query_opt(
+                "SELECT 1 FROM pg_stat_replication WHERE application_name = 'wal_sink_restart'",
+                &[],
+            )
+            .unwrap()
+            .is_some()
+        {
+            streaming2 = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        streaming2,
+        "second run: sink did not reconnect after restart"
+    );
+
+    client
+        .batch_execute(
+            "INSERT INTO restart_test (v) SELECT 'restart-' || g FROM generate_series(1, 200) g;",
+        )
+        .unwrap();
+    let commit_lsn: String = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .unwrap()
+        .get(0);
+    let flushed: bool = client
+        .query_one(
+            &format!(
+                "SELECT flush_lsn >= '{commit_lsn}'::pg_lsn \
+                 FROM pg_stat_replication \
+                 WHERE application_name = 'wal_sink_restart'"
+            ),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        flushed,
+        "flush_lsn did not reach commit LSN {commit_lsn} after restart"
+    );
+
+    // Segments written during the first run must still be on disk.
+    let segments_after: Vec<String> = std::fs::read_dir(&sink_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.len() == 24 && n.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect();
+    for seg in &first_segments {
+        assert!(
+            segments_after.contains(seg),
+            "segment {seg} from first run is missing after restart"
+        );
+    }
+}
+
 /// Cross-compile a binary for the musl target and return the absolute path.
 /// Returns `None` (with a stderr message) if the target isn't available so
 /// the caller can skip the test.
