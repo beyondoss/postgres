@@ -288,7 +288,7 @@ fn scram_auth(
     // Generate a random 18-byte client nonce, base64-encoded to 24 chars.
     let mut nonce_raw = [0u8; 18];
     getrandom::getrandom(&mut nonce_raw)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("getrandom: {e}")))?;
+        .map_err(|e| io::Error::other(format!("getrandom: {e}")))?;
     let cnonce = base64_encode(&nonce_raw);
 
     // SASLprep: for ASCII-only usernames (typical for replication) this is a no-op.
@@ -526,10 +526,10 @@ pub fn create_slot_if_not_exists(
                         if pos + col_len > body.len() {
                             break;
                         }
-                        if col == 1 {
-                            if let Ok(s) = std::str::from_utf8(&body[pos..pos + col_len]) {
-                                consistent_point = s.parse().ok();
-                            }
+                        if col == 1
+                            && let Ok(s) = std::str::from_utf8(&body[pos..pos + col_len])
+                        {
+                            consistent_point = s.parse().ok();
                         }
                         pos += col_len;
                     }
@@ -588,10 +588,10 @@ pub fn identify_system(conn: &mut TcpStream) -> Result<(u32, Lsn), RecvError> {
                             if let Ok(s) = std::str::from_utf8(&body[pos..pos + col_len]) {
                                 timeline = s.parse().unwrap_or(1);
                             }
-                        } else if col == 2 {
-                            if let Ok(s) = std::str::from_utf8(&body[pos..pos + col_len]) {
-                                xlogpos = s.parse().unwrap_or(Lsn::ZERO);
-                            }
+                        } else if col == 2
+                            && let Ok(s) = std::str::from_utf8(&body[pos..pos + col_len])
+                        {
+                            xlogpos = s.parse().unwrap_or(Lsn::ZERO);
                         }
                         pos += col_len;
                     }
@@ -628,7 +628,7 @@ pub fn highest_local_lsn(dir: &std::path::Path) -> Option<Lsn> {
     // Chars [16..24] = segment number within the XLogId
     let seg_hi = u32::from_str_radix(&highest[8..16], 16).ok()?;
     let seg_lo = u32::from_str_radix(&highest[16..24], 16).ok()?;
-    let seg_start = (seg_hi as u64) << 32 | (seg_lo as u64) * WAL_SEGMENT_SIZE;
+    let seg_start = ((seg_hi as u64) << 32) | ((seg_lo as u64) * WAL_SEGMENT_SIZE);
     Some(Lsn(seg_start + WAL_SEGMENT_SIZE))
 }
 

@@ -215,6 +215,7 @@ fn forward_once(
 ///   * Send the hello preamble frame `[u32 BE 5][b'h'][u32 BE timeline]`.
 ///   * For each `(lsn, payload)` from `wal_rx`, send `[u32 BE len][payload]`.
 ///   * Parse 8-byte BE ACKs from the recv side; forward each to `ack_tx`.
+///
 /// Returns when `wal_rx` is closed or an unrecoverable error occurs.
 fn quic_pump(
     sink_addr: std::net::SocketAddr,
@@ -260,24 +261,25 @@ fn quic_pump(
     loop {
         // Try to queue the hello preamble as soon as the stream is open and
         // the pg reader has sent the timeline.
-        if stream.is_some() && !hello_queued {
-            if let Some(rx) = &timeline_rx_opt {
-                match rx.try_recv() {
-                    Ok(tl) => {
-                        // Hello frame: [u32 BE 5][b'h'][u32 BE timeline]
-                        let mut frame = Vec::with_capacity(9);
-                        frame.extend_from_slice(&5u32.to_be_bytes());
-                        frame.push(b'h');
-                        frame.extend_from_slice(&tl.to_be_bytes());
-                        // push_front so it is sent before any WAL frames.
-                        pending_writes.push_front(frame);
-                        hello_queued = true;
-                        timeline_rx_opt = None;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err("timeline channel closed before hello sent".into());
-                    }
+        if stream.is_some()
+            && !hello_queued
+            && let Some(rx) = &timeline_rx_opt
+        {
+            match rx.try_recv() {
+                Ok(tl) => {
+                    // Hello frame: [u32 BE 5][b'h'][u32 BE timeline]
+                    let mut frame = Vec::with_capacity(9);
+                    frame.extend_from_slice(&5u32.to_be_bytes());
+                    frame.push(b'h');
+                    frame.extend_from_slice(&tl.to_be_bytes());
+                    // push_front so it is sent before any WAL frames.
+                    pending_writes.push_front(frame);
+                    hello_queued = true;
+                    timeline_rx_opt = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err("timeline channel closed before hello sent".into());
                 }
             }
         }

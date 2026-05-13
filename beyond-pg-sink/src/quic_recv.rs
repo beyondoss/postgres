@@ -265,12 +265,12 @@ fn process_conn_events(
                 }
             }
             Event::Stream(StreamEvent::Readable { id }) => {
-                if st.stream == Some(id) {
-                    if let Err(e) = read_and_handle(conn, st, id) {
-                        eprintln!("quic: stream handler: {e}");
-                        st.dead = true;
-                        return;
-                    }
+                if st.stream == Some(id)
+                    && let Err(e) = read_and_handle(conn, st, id)
+                {
+                    eprintln!("quic: stream handler: {e}");
+                    st.dead = true;
+                    return;
                 }
             }
             // Writable / Finished / Stopped / Available / Opened(Uni): ignore.
