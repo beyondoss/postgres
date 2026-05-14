@@ -8,12 +8,14 @@
 //! pg_wal/ grows unbounded until disk fills. See DESIGN.md failure modes.
 //!
 //! When no archive target is configured: silent no-op (exit 0).
-//! When a target is configured but not yet implemented: loud warning (exit 0).
+//! When a target is configured: ships the segment to S3 via `aws s3 cp`.
+//! On S3 failure: exits non-zero so Postgres retries and keeps the segment.
 
 use crate::mmds::MMDS_PATH;
 
 pub fn run(path: &str, filename: &str) {
-    let data = std::fs::read_to_string(MMDS_PATH).unwrap_or_default();
+    let mmds_path = std::env::var("BEYOND_PG_MMDS_PATH").unwrap_or_else(|_| MMDS_PATH.to_owned());
+    let data = std::fs::read_to_string(&mmds_path).unwrap_or_default();
     let json: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
 
     let target = json
@@ -27,15 +29,25 @@ pub fn run(path: &str, filename: &str) {
             // This is the expected MVP state.
         }
         Some(target) => {
-            // Target is set but archiving is not yet implemented.
-            // Exit 0 is intentional — see module-level doc comment.
-            eprintln!(
-                "[beyond-pg] WARNING: archive target {target:?} is configured \
-                 but WAL archiving is not yet implemented. \
-                 Segment {filename} ({path}) was NOT archived. \
-                 Do not set BEYOND_PG_ARCHIVE_TARGET until a backup service is available."
-            );
-            // TODO: implement s3:// shipping when backup service ships
+            let dest = format!("{}/{}", target.trim_end_matches('/'), filename);
+            let result = std::process::Command::new("aws")
+                .args(["s3", "cp", path, &dest, "--no-progress"])
+                .status();
+            match result {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    eprintln!(
+                        "[beyond-pg] archive: aws s3 cp exited {s} — segment {filename} not archived"
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[beyond-pg] archive: failed to invoke aws: {e} — segment {filename} not archived"
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
     }
     // Always exit 0 (implicit return from main via this fn)

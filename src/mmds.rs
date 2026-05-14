@@ -32,6 +32,10 @@ pub struct MmdsConfig {
     /// When true, a `cdc` logical replication slot and empty publication are created on boot.
     /// Set via MMDS key `BEYOND_PG_CDC_ENABLED`. Absent or `false` → `false`.
     pub cdc_enabled: bool,
+    /// Postgres-compatible timestamp string for point-in-time recovery.
+    /// Set via MMDS key `BEYOND_PG_RECOVERY_TARGET_TIME`.
+    /// Requires `archive_target` to also be set. Triggers `recovery.signal` on boot.
+    pub recovery_target_time: Option<String>,
     /// libpq connection string to the primary. Required when `pg_tier = Replica`.
     /// Set via MMDS key `BEYOND_PG_PRIMARY_CONNINFO`.
     pub primary_conninfo: Option<String>,
@@ -139,6 +143,11 @@ pub(crate) fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_end_matches('/').to_owned());
 
+    let recovery_target_time = meta["BEYOND_PG_RECOVERY_TARGET_TIME"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+
     let cdc_enabled = meta["BEYOND_PG_CDC_ENABLED"]
         .as_str()
         .map(|s| s.eq_ignore_ascii_case("true"))
@@ -164,6 +173,7 @@ pub(crate) fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         archive_target,
         wal_sink,
         cdc_enabled,
+        recovery_target_time,
         primary_conninfo,
         ram_bytes,
         vcpus,

@@ -84,17 +84,18 @@ signal handler sets SHUTDOWN=true →
 
 ## Concepts & Terminology
 
-| Term                    | What It Controls                                                                            | NOT                                              |
-| ----------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------ |
-| WAL segment             | A 24-hex-char filename holding 16 MiB of raw WAL bytes; unit of replication                 | Parsed, indexed, or checkpointed by this process |
-| `.partial` file         | A segment currently being written; excluded from `/list` and pruning                        | A complete segment; never served via HTTP        |
-| Replication slot        | PostgreSQL mechanism keeping WAL on the primary until this sink confirms receipt            | A full streaming replica; no standby promotion   |
-| Synchronous replication | Postgres blocks commits until `flush_lsn` covers the commit record                          | Full replica; no promotion                       |
-| Timeline prefix         | First 8 hex chars of a segment name; used for independent per-timeline retention counting   | A WAL sequence number                            |
-| `write_lsn`             | Highest LSN written to OS buffer (acknowledged as "written" to Postgres)                    | Guaranteed durable; that is `flush_lsn`          |
-| `flush_lsn`             | Highest LSN synced to disk via `fdatasync`; what Postgres uses to advance the slot          | A commit ACK; Postgres still manages its own WAL |
-| Shutdown flag           | `SHUTDOWN` atomic bool; set by SIGTERM handler, polled by all threads                       | Checked inside signal handler (unsafe)           |
-| XLogData frame          | Postgres replication protocol message type `w` (0x77); carries raw WAL bytes + LSN metadata | A logical replication message                    |
+| Term                    | What It Controls                                                                                                                                      | NOT                                              |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| WAL segment             | A 24-hex-char filename holding 16 MiB of raw WAL bytes; unit of replication                                                                           | Parsed, indexed, or checkpointed by this process |
+| `.partial` file         | A segment currently being written; excluded from `/list` and pruning                                                                                  | A complete segment; never served via HTTP        |
+| Replication slot        | PostgreSQL mechanism keeping WAL on the primary until this sink confirms receipt                                                                      | A full streaming replica; no standby promotion   |
+| Synchronous replication | Postgres blocks commits until `flush_lsn` covers the commit record                                                                                    | Full replica; no promotion                       |
+| Timeline prefix         | First 8 hex chars of a segment name; used for independent per-timeline retention counting                                                             | A WAL sequence number                            |
+| Timeline history file   | `{8-hex}.history` file written by Postgres on promotion; records timeline switches; served by HTTP but not listed in `/list` or counted for retention | A WAL segment                                    |
+| `write_lsn`             | Highest LSN written to OS buffer (acknowledged as "written" to Postgres)                                                                              | Guaranteed durable; that is `flush_lsn`          |
+| `flush_lsn`             | Highest LSN synced to disk via `fdatasync`; what Postgres uses to advance the slot                                                                    | A commit ACK; Postgres still manages its own WAL |
+| Shutdown flag           | `SHUTDOWN` atomic bool; set by SIGTERM handler, polled by all threads                                                                                 | Checked inside signal handler (unsafe)           |
+| XLogData frame          | Postgres replication protocol message type `w` (0x77); carries raw WAL bytes + LSN metadata                                                           | A logical replication message                    |
 
 ## Core Mechanism
 
@@ -195,6 +196,7 @@ Routes:
 
 - `GET /list` — reads WAL dir, filters to 24-hex-char names (no `.partial`), returns sorted newline-separated list
 - `GET /{24-hex-chars}` — validates name is exactly 24 hex chars (prevents path traversal), opens file, streams bytes
+- `GET /{8-hex}.history` — serves Postgres timeline history files (e.g. `00000002.history`); required by `restore_command` to traverse timeline boundaries after failover/promotion
 - Otherwise → 404 or 405
 
 Segment delivery uses `sendfile(2)` on Linux (zero-copy); userspace 64 KiB copy loop elsewhere. `EPIPE`/`ECONNRESET` silently discarded.

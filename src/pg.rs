@@ -6,6 +6,26 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tracing::{debug, warn};
 
+/// Set uid/gid to the postgres OS user on Linux.
+/// pg_hba.conf uses peer auth for Unix socket connections; all psql calls must
+/// run as the postgres OS user so peer auth matches the "postgres" database user.
+/// No-op on non-Linux (macOS dev uses host postgres which handles auth itself).
+fn drop_to_postgres_user(
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] cmd: &mut Command,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        let name = std::ffi::CString::new("postgres").expect("CString");
+        // SAFETY: getpwnam is not thread-safe but this is called before any
+        // concurrent thread could call it.  Pointer is valid until next call.
+        let pw = unsafe { libc::getpwnam(name.as_ptr()) };
+        if !pw.is_null() {
+            let (uid, gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
+            cmd.uid(uid).gid(gid);
+        }
+    }
+}
+
 pub const PGDATA: &str = "/var/lib/postgresql/18/main";
 pub const PG_SOCKET_DIR: &str = "/var/run/postgresql";
 pub const PG_PORT: u16 = 5433; // Postgres direct; PgBouncer is 5432 (separate process)
@@ -79,6 +99,11 @@ pub async fn psql_env(sql: &str, env: &[(&str, &str)]) -> Result<(), PgError> {
     for (k, v) in env {
         cmd.env(k, v);
     }
+
+    // pg_hba.conf uses peer auth for Unix socket connections.  The supervisor
+    // runs as root (PID 1); we must drop to the postgres OS user so peer auth
+    // matches the database user "postgres".
+    drop_to_postgres_user(&mut cmd);
 
     let out = cmd.output().await?;
     if out.status.success() {

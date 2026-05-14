@@ -129,6 +129,19 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
+    // Unblock SIGTERM/SIGINT now that tokio's sigaction handlers are installed.
+    // The block was held during startup to prevent SIG_DFL from killing the
+    // process before tokio was ready to receive signals.  Any signal that
+    // arrived while blocked becomes pending and is delivered to the handler now.
+    #[cfg(target_os = "linux")]
+    {
+        use nix::sys::signal::{SigSet, SigmaskHow, Signal, sigprocmask};
+        let mut set = SigSet::empty();
+        set.add(Signal::SIGTERM);
+        set.add(Signal::SIGINT);
+        sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&set), None)?;
+    }
+
     info!("supervisor running");
 
     // Main supervision loop
@@ -300,7 +313,11 @@ fn spawn_postgres(
         .stdin(std::process::Stdio::null());
 
     unblock_signals_in_child(&mut cmd);
+    // protect_postmaster_from_oom writes /proc/self/oom_score_adj=-1000 which
+    // requires CAP_SYS_RESOURCE (held while still root). Must run before uid drop.
     protect_postmaster_from_oom(&mut cmd);
+    // postgres refuses to execute as root — drop to the postgres OS user.
+    drop_to_postgres_user(&mut cmd)?;
 
     let mut child = cmd.spawn()?;
     let execution_id = zero_execution_id();
@@ -330,6 +347,8 @@ fn spawn_pgbouncer(
         .stdin(std::process::Stdio::null());
 
     unblock_signals_in_child(&mut cmd);
+    // pgbouncer refuses to run as root; drop to postgres OS user.
+    drop_to_postgres_user(&mut cmd)?;
 
     let mut child = cmd.spawn()?;
     let execution_id = zero_execution_id();
@@ -431,6 +450,30 @@ fn protect_postmaster_from_oom(cmd: &mut Command) {
             Ok(())
         });
     }
+}
+
+/// Drop the postgres child process to the `postgres` OS user (uid/gid).
+/// postgres(1) refuses to execute as root; the supervisor runs as root (PID 1).
+/// uid/gid are resolved once via getpwnam; the lookup is not async-signal-safe
+/// so it runs in the parent before fork, not in a pre_exec hook.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn drop_to_postgres_user(
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] cmd: &mut Command,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    {
+        let name = std::ffi::CString::new("postgres")?;
+        // SAFETY: getpwnam is not thread-safe, but this is called before we
+        // spawn any threads that could call it concurrently.  The returned
+        // pointer is valid until the next getpwnam call in this thread.
+        let pw = unsafe { libc::getpwnam(name.as_ptr()) };
+        if pw.is_null() {
+            return Err("postgres OS user not found".into());
+        }
+        let (uid, gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
+        cmd.uid(uid).gid(gid);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -560,46 +603,20 @@ async fn post_start(cfg: &MmdsConfig) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     if cfg.wal_sink.is_some() || cfg.cdc_enabled {
-        pg::psql(
-            "DO $$
-             BEGIN
-               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'replicator') THEN
-                 CREATE ROLE replicator LOGIN REPLICATION PASSWORD NULL;
-               END IF;
-             END
-             $$",
-        )
-        .await
-        .map_err(|e| format!("failed to create replicator role: {e}"))?;
+        pg::psql(crate::sql::REPLICATOR_ROLE_SQL)
+            .await
+            .map_err(|e| format!("failed to create replicator role: {e}"))?;
     }
 
     if cfg.cdc_enabled {
         warn!("CDC enabled: replication slot 'cdc' will accumulate WAL until a consumer connects");
-        pg::psql(
-            "DO $$
-             BEGIN
-               IF NOT EXISTS (
-                 SELECT FROM pg_replication_slots WHERE slot_name = 'cdc'
-               ) THEN
-                 PERFORM pg_create_logical_replication_slot('cdc', 'pgoutput');
-               END IF;
-             END
-             $$",
-        )
-        .await
-        .map_err(|e| format!("failed to create CDC replication slot: {e}"))?;
+        pg::psql(crate::sql::CDC_SLOT_SQL)
+            .await
+            .map_err(|e| format!("failed to create CDC replication slot: {e}"))?;
 
-        pg::psql(
-            "DO $$
-             BEGIN
-               IF NOT EXISTS (SELECT FROM pg_publication WHERE pubname = 'cdc') THEN
-                 EXECUTE 'CREATE PUBLICATION cdc';
-               END IF;
-             END
-             $$",
-        )
-        .await
-        .map_err(|e| format!("failed to create CDC publication: {e}"))?;
+        pg::psql(crate::sql::CDC_PUBLICATION_SQL)
+            .await
+            .map_err(|e| format!("failed to create CDC publication: {e}"))?;
     }
 
     boot::run_hook_scripts("/etc/postgresql/18/hooks/post-start.d")

@@ -274,7 +274,8 @@ mod linux {
     }
 
     fn http_roundtrip(request: &[u8]) -> std::io::Result<Vec<u8>> {
-        let mut stream = TcpStream::connect(MMDS_ADDR)?;
+        let addr: std::net::SocketAddr = MMDS_ADDR.parse().unwrap();
+        let mut stream = TcpStream::connect_timeout(&addr, HTTP_TIMEOUT)?;
         stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
         stream.set_read_timeout(Some(HTTP_TIMEOUT))?;
         stream.write_all(request)?;

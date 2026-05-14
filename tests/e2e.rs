@@ -35,8 +35,6 @@ struct TestNetwork {
 
 impl TestNetwork {
     fn create() -> Self {
-        // Include both PID and a per-process counter so parallel tests in the
-        // same binary don't collide on the network name.
         static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let name = format!("beyond-pg-replica-test-{}-{n}", std::process::id());
@@ -52,7 +50,6 @@ impl TestNetwork {
         Self { name }
     }
 
-    /// Attach an already-running container to this network.
     fn connect(&self, container_id: &str) {
         let out = std::process::Command::new("docker")
             .args(["network", "connect", &self.name, container_id])
@@ -65,11 +62,6 @@ impl TestNetwork {
         );
     }
 
-    /// Resolve the container's IP on this network, retrying until Docker
-    /// propagates the network attachment (typically < 500 ms).
-    ///
-    /// Uses `index` in the Go template because the network name may contain
-    /// hyphens, which are arithmetic operators in Go template dot-path notation.
     fn container_ip(&self, container_id: &str) -> String {
         let template = format!(
             r#"{{{{(index .NetworkSettings.Networks "{}").IPAddress}}}}"#,
@@ -117,12 +109,13 @@ struct ReplicaPostgres {
 impl ReplicaPostgres {
     /// Seed a replica from `primary_ip:5432` (container-internal address) and
     /// start it. `host_port` is the port mapped on the test-host loopback.
+    ///
+    /// Uses `config::replica_conf()` — the production function — to write the
+    /// replica config. If `replica_conf()` output changes, this test catches it.
     fn start(network: &TestNetwork, primary_ip: &str) -> Self {
-        // Tempdir on the host, bind-mounted into the containers.
         let pgdata = tempfile::tempdir().expect("tempdir for replica PGDATA");
         let pgdata_str = pgdata.path().to_str().unwrap();
 
-        // chmod 777 so the postgres user inside the container (uid 999) can write.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -131,7 +124,6 @@ impl ReplicaPostgres {
         }
 
         // 1. pg_basebackup inside a postgres:18 container on the same network.
-        //    Connects to the primary at its internal IP, port 5432 (no mapping needed).
         let connstr = format!("host={primary_ip} port=5432 user=postgres");
         let out = std::process::Command::new("docker")
             .args([
@@ -158,16 +150,22 @@ impl ReplicaPostgres {
             String::from_utf8_lossy(&out.stderr)
         );
 
-        // 2. Write standby.signal and recovery config as root inside a container.
-        //    In production, do_boot_replica() writes these; here we replicate
-        //    exactly the same parameters that config::replica_conf() generates.
-        let script = format!(
-            "touch /pgdata/standby.signal && \
-             echo \"primary_conninfo = 'host={primary_ip} port=5432 user=postgres'\" \
-               >> /pgdata/postgresql.auto.conf && \
-             echo \"recovery_target_timeline = 'latest'\" \
-               >> /pgdata/postgresql.auto.conf"
-        );
+        // 2. Write the replica config using the production function.
+        //    config::replica_conf() generates exactly what `do_boot_replica` writes
+        //    in production. If the function's output changes, this test uses the new
+        //    config — not a stale hand-written copy.
+        let conninfo = format!("host={primary_ip} port=5432 user=postgres");
+        let replica_conf = beyond_pg::config::replica_conf(&conninfo, None);
+
+        // Write conf.d/04-replica.conf from the host (pgdata dir is 777 so host can create).
+        std::fs::create_dir_all(pgdata.path().join("conf.d")).expect("create conf.d");
+        std::fs::write(pgdata.path().join("conf.d/04-replica.conf"), &replica_conf)
+            .expect("write 04-replica.conf");
+
+        // postgresql.auto.conf is owned by the postgres user inside the container,
+        // so write to it via a root container. Also touch standby.signal.
+        let script = "touch /pgdata/standby.signal && \
+                      echo \"include_dir = 'conf.d'\" >> /pgdata/postgresql.auto.conf";
         let out = std::process::Command::new("docker")
             .args([
                 "run",
@@ -179,7 +177,7 @@ impl ReplicaPostgres {
                 "postgres:18",
                 "bash",
                 "-c",
-                &script,
+                script,
             ])
             .output()
             .expect("docker run setup script");
@@ -194,8 +192,7 @@ impl ReplicaPostgres {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
 
-        // 4. Start the replica: run as root, chown PGDATA, then exec as postgres.
-        //    Bypasses the Docker entrypoint to avoid re-initdb interference.
+        // 4. Start the replica.
         let start_out = std::process::Command::new("docker")
             .args([
                 "run",
@@ -210,9 +207,6 @@ impl ReplicaPostgres {
                 "postgres:18",
                 "bash",
                 "-c",
-                // chmod 700: postgres refuses to start on a world-readable data dir.
-                // chown: files were written by pg_basebackup (postgres user) and our
-                //        setup script (root); normalize ownership before dropping privs.
                 "chmod 700 /pgdata && chown -R postgres:postgres /pgdata && exec gosu postgres postgres -D /pgdata",
             ])
             .output()
@@ -279,7 +273,8 @@ fn wait_for_replication(client: &mut postgres::Client, table: &str, expected_cou
 /// Exercises:
 ///   - pg_basebackup (what `pg::basebackup()` wraps in production)
 ///   - standby.signal
-///   - primary_conninfo + recovery_target_timeline (what `config::replica_conf()` generates)
+///   - `config::replica_conf()` — the production function — generates config that
+///     Postgres 18 actually accepts for streaming replication
 ///   - hot_standby read-only enforcement
 #[test]
 #[ignore = "requires Docker"]
@@ -308,11 +303,9 @@ fn replica_streams_from_primary() {
 
     allow_all_replication(&mut primary_client);
 
-    // Connect primary to our test network so containers can reach it directly.
     network.connect(primary.id());
     let primary_ip = network.container_ip(primary.id());
 
-    // Write rows before basebackup so the replica inherits them.
     primary_client
         .batch_execute(
             "CREATE TABLE replica_test (id serial, v text); \
@@ -329,10 +322,8 @@ fn replica_streams_from_primary() {
     let mut replica_client =
         postgres::Client::connect(&replica_url, postgres::NoTls).expect("connect to replica");
 
-    // Rows present before basebackup must be on the replica.
     wait_for_replication(&mut replica_client, "replica_test", 100);
 
-    // Write more rows after the replica started streaming.
     primary_client
         .batch_execute(
             "INSERT INTO replica_test (v) \
@@ -340,18 +331,14 @@ fn replica_streams_from_primary() {
         )
         .expect("insert after replica started streaming");
 
-    // Replica must replicate the new rows.
     wait_for_replication(&mut replica_client, "replica_test", 200);
 
-    // Replica must report itself as a standby.
     let is_standby: bool = replica_client
         .query_one("SELECT pg_is_in_recovery()", &[])
         .unwrap()
         .get(0);
     assert!(is_standby, "replica should be in recovery (hot standby)");
 
-    // Replica must reject writes — it is read-only while in recovery.
-    // Postgres error code 25006 (read_only_sql_transaction); message contains "recovery".
     let write_err = replica_client
         .batch_execute("INSERT INTO replica_test (v) VALUES ('should-fail')")
         .expect_err("replica accepted a write — should be read-only during recovery");
@@ -420,11 +407,8 @@ fn replica_promote() {
     let mut replica_client =
         postgres::Client::connect(&replica_url, postgres::NoTls).expect("connect to replica");
 
-    // Confirm replication is live before promoting.
     wait_for_replication(&mut replica_client, "promote_test", 50);
 
-    // Promote via the SQL function — same effect as `pg_ctl promote` (which is
-    // what `pg::promote()` calls in production). wait=true blocks until done.
     let promoted: bool = replica_client
         .query_one("SELECT pg_promote(wait => true, wait_seconds => 15)", &[])
         .expect("pg_promote() failed")
@@ -434,7 +418,6 @@ fn replica_promote() {
         "pg_promote() returned false — promotion did not complete"
     );
 
-    // Replica must now report itself as primary.
     let still_standby: bool = replica_client
         .query_one("SELECT pg_is_in_recovery()", &[])
         .unwrap()
@@ -444,7 +427,6 @@ fn replica_promote() {
         "pg_is_in_recovery() still true after promote"
     );
 
-    // Replica must now accept writes.
     replica_client
         .batch_execute("INSERT INTO promote_test (v) VALUES ('post-promote')")
         .expect("write to promoted replica failed");
@@ -459,6 +441,378 @@ fn replica_promote() {
     assert_eq!(count, 1, "post-promote write not found");
 
     drop(replica);
+    drop(primary);
+    drop(network);
+}
+
+// ---------------------------------------------------------------------------
+// PITR helpers
+// ---------------------------------------------------------------------------
+
+/// A Postgres primary with archive_mode=on, writing completed WAL segments to
+/// a host-accessible directory via `cp`. PGDATA and the archive directory are
+/// both bind-mounted from host tempdirs so the test can copy them directly.
+struct PitrPrimary {
+    container_id: String,
+    pub port: u16,
+    pub pgdata: tempfile::TempDir,
+    pub archive: tempfile::TempDir,
+}
+
+impl PitrPrimary {
+    fn start(network: &TestNetwork) -> Self {
+        let pgdata = tempfile::tempdir().expect("pgdata tempdir");
+        let archive = tempfile::tempdir().expect("archive tempdir");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [pgdata.path(), archive.path()] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
+                    .expect("chmod pitr dirs");
+            }
+        }
+
+        let pgdata_str = pgdata.path().to_str().unwrap();
+        let archive_str = archive.path().to_str().unwrap();
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let script = "\
+            chmod 700 /pgdata && chown postgres:postgres /pgdata /archive && \
+            gosu postgres initdb -D /pgdata \
+              --auth-host=trust --auth-local=trust --no-instructions && \
+            exec gosu postgres postgres -D /pgdata \
+              -c archive_mode=on \
+              -c 'archive_command=cp %p /archive/%f' \
+              -c wal_level=replica \
+              -c max_wal_senders=5 \
+              -c listen_addresses='*'";
+
+        let out = std::process::Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                &format!("--network={}", network.name),
+                "--user",
+                "root",
+                "-v",
+                &format!("{pgdata_str}:/pgdata"),
+                "-v",
+                &format!("{archive_str}:/archive"),
+                "-p",
+                &format!("{port}:5432"),
+                "postgres:18",
+                "bash",
+                "-c",
+                script,
+            ])
+            .output()
+            .expect("docker run pitr primary");
+
+        assert!(
+            out.status.success(),
+            "pitr primary start: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let container_id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+
+        let url = format!("host=127.0.0.1 port={port} user=postgres dbname=postgres");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if Instant::now() > deadline {
+                panic!("pitr primary not ready on port {port} within 30s");
+            }
+            if postgres::Client::connect(&url, postgres::NoTls).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        Self {
+            container_id,
+            port,
+            pgdata,
+            archive,
+        }
+    }
+
+    /// Copy PGDATA to a new tempdir via a one-shot container running as root.
+    fn fork_pgdata_into(&self, fork_dir: &tempfile::TempDir) {
+        let fork_str = fork_dir.path().to_str().unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(fork_dir.path(), std::fs::Permissions::from_mode(0o777))
+                .expect("chmod fork dir");
+        }
+
+        let out = std::process::Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--user",
+                "root",
+                "-v",
+                &format!("{}:/fork", fork_str),
+                "-v",
+                &format!("{}:/pgdata:ro", self.pgdata.path().to_str().unwrap()),
+                "postgres:18",
+                "bash",
+                "-c",
+                "cp -a /pgdata/. /fork/",
+            ])
+            .output()
+            .expect("docker cp pgdata to fork");
+
+        assert!(
+            out.status.success(),
+            "fork copy: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+impl Drop for PitrPrimary {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &self.container_id])
+            .output();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PITR integration test
+// ---------------------------------------------------------------------------
+
+/// PITR: write rows in three batches; fork PGDATA after batch 1 (simulating a
+/// GlideFS volume snapshot); archive WAL for batches 2 and 3; recover the fork
+/// to a point between batches 2 and 3.
+///
+/// Validates:
+///   - `config::pitr_conf()` — the production function — generates a
+///     `restore_command` / `recovery_target_time` config that Postgres 18
+///     accepts and correctly executes for point-in-time recovery.
+///   - `recovery.signal` triggers point-in-time recovery and promotes.
+///   - Batches 1+2 present; batch 3 absent after recovery.
+///
+/// The archive uses `cp` as the archive_command (no S3 needed). The
+/// restore_command comes verbatim from `config::pitr_conf()`:
+///   `aws s3 cp /archive/%f %p --no-progress`
+/// A fake `aws` binary installed in the recovery container translates this to
+/// `cp /archive/%f %p` — so we test the exact command string production uses.
+#[test]
+#[ignore = "requires Docker"]
+fn pitr_recovery() {
+    let network = TestNetwork::create();
+    let primary = PitrPrimary::start(&network);
+
+    let primary_url = format!(
+        "host=127.0.0.1 port={} user=postgres dbname=postgres",
+        primary.port
+    );
+    let mut client =
+        postgres::Client::connect(&primary_url, postgres::NoTls).expect("connect to pitr primary");
+
+    // Batch 1: 50 rows — will be in the base snapshot.
+    client
+        .batch_execute(
+            "CREATE TABLE events (id serial, batch int, ts timestamptz DEFAULT now()); \
+             INSERT INTO events (batch) SELECT 1 FROM generate_series(1, 50);",
+        )
+        .expect("batch 1");
+
+    client.batch_execute("CHECKPOINT").expect("checkpoint");
+    client
+        .batch_execute("SELECT pg_switch_wal()")
+        .expect("switch wal after batch 1");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Fork PGDATA — simulates a GlideFS volume snapshot.
+    let fork_dir = tempfile::tempdir().expect("fork pgdata tempdir");
+    primary.fork_pgdata_into(&fork_dir);
+
+    // Batch 2: will be replayed during PITR recovery.
+    client
+        .batch_execute("INSERT INTO events (batch) SELECT 2 FROM generate_series(1, 50);")
+        .expect("batch 2");
+    client
+        .batch_execute("SELECT pg_switch_wal()")
+        .expect("switch wal after batch 2");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Recovery target: strictly after batch 2, before batch 3.
+    let target_time: String = client
+        .query_one(
+            "SELECT to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS TZ')",
+            &[],
+        )
+        .expect("get target time")
+        .get(0);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Batch 3: must NOT appear after recovery.
+    client
+        .batch_execute("INSERT INTO events (batch) SELECT 3 FROM generate_series(1, 50);")
+        .expect("batch 3");
+    client
+        .batch_execute("SELECT pg_switch_wal()")
+        .expect("switch wal after batch 3");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let total: i64 = client
+        .query_one("SELECT count(*) FROM events", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        total, 150,
+        "primary should have 150 rows before recovery test"
+    );
+
+    // -----------------------------------------------------------------------
+    // Prepare the fork for PITR recovery using the production config function.
+    //
+    // config::pitr_conf("/archive", Some(&target_time)) generates:
+    //   restore_command = 'aws s3 cp /archive/%f %p --no-progress'
+    //   recovery_target_time = '<target_time>'
+    //   recovery_target_action = promote
+    //   recovery_target_inclusive = true
+    //
+    // The recovery container installs a fake `aws` that translates
+    // `aws s3 cp SRC DST ...` → `cp SRC DST`, so we exercise the exact
+    // restore_command string that production uses.
+    // -----------------------------------------------------------------------
+
+    // Add include_dir to postgresql.auto.conf (always-included; container
+    // owns the file so we need a root container to append to it).
+    let setup_script = "echo \"include_dir = 'conf.d'\" >> /pgdata/postgresql.auto.conf";
+    let fork_str = fork_dir.path().to_str().unwrap();
+    let out = std::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--user",
+            "root",
+            "-v",
+            &format!("{fork_str}:/pgdata"),
+            "postgres:18",
+            "bash",
+            "-c",
+            setup_script,
+        ])
+        .output()
+        .expect("docker run fork setup");
+    assert!(
+        out.status.success(),
+        "fork setup: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Write conf.d/05-pitr.conf using the production function.
+    let conf_d = fork_dir.path().join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let pitr_conf = beyond_pg::config::pitr_conf("/archive", Some(&target_time));
+    std::fs::write(conf_d.join("05-pitr.conf"), &pitr_conf).expect("write 05-pitr.conf");
+
+    // recovery.signal triggers PITR mode instead of normal startup.
+    std::fs::write(fork_dir.path().join("recovery.signal"), "").expect("write recovery.signal");
+
+    // -----------------------------------------------------------------------
+    // Start recovery container on the fork.
+    // Install fake `aws` before starting postgres: translates
+    // `aws s3 cp SRC DST --no-progress` → `cp SRC DST`.
+    // -----------------------------------------------------------------------
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let recovery_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let archive_str = primary.archive.path().to_str().unwrap();
+
+    let start = std::process::Command::new("docker")
+        .args([
+            "run",
+            "-d",
+            &format!("--network={}", network.name),
+            "--user",
+            "root",
+            "-v",
+            &format!("{fork_str}:/pgdata"),
+            "-v",
+            &format!("{archive_str}:/archive"),
+            "-p",
+            &format!("{recovery_port}:5432"),
+            "postgres:18",
+            "bash",
+            "-c",
+            // Fake `aws` maps `aws s3 cp SRC DST --no-progress` → `cp SRC DST`.
+            // This lets us use the exact restore_command that config::pitr_conf()
+            // generates without needing real AWS credentials.
+            "printf '%s\\n%s\\n' '#!/bin/sh' 'exec cp \"$3\" \"$4\"' > /usr/local/bin/aws && \
+             chmod +x /usr/local/bin/aws && \
+             chmod 700 /pgdata && chown -R postgres:postgres /pgdata && \
+             exec gosu postgres postgres -D /pgdata",
+        ])
+        .output()
+        .expect("docker run recovery");
+
+    assert!(
+        start.status.success(),
+        "recovery container start: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let recovery_id = String::from_utf8_lossy(&start.stdout).trim().to_owned();
+
+    // Wait for Postgres to promote and accept connections.
+    let recovery_url = format!("host=127.0.0.1 port={recovery_port} user=postgres dbname=postgres");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut recovered = loop {
+        if Instant::now() > deadline {
+            panic!("recovery instance not ready on port {recovery_port} within 60s");
+        }
+        if let Ok(c) = postgres::Client::connect(&recovery_url, postgres::NoTls) {
+            break c;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+
+    // -----------------------------------------------------------------------
+    // Verify recovery stopped at the right point.
+    // -----------------------------------------------------------------------
+
+    let count: i64 = recovered
+        .query_one("SELECT count(*) FROM events", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        count, 100,
+        "expected 100 rows after PITR (batches 1+2), got {count}"
+    );
+
+    let batch3: i64 = recovered
+        .query_one("SELECT count(*) FROM events WHERE batch = 3", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        batch3, 0,
+        "batch 3 rows should not be present after PITR recovery"
+    );
+
+    let in_recovery: bool = recovered
+        .query_one("SELECT pg_is_in_recovery()", &[])
+        .unwrap()
+        .get(0);
+    assert!(
+        !in_recovery,
+        "instance should be promoted (not in recovery) after PITR"
+    );
+
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "-f", &recovery_id])
+        .output();
     drop(primary);
     drop(network);
 }
@@ -488,8 +842,13 @@ fn basebackup_idempotency_predicates() {
     assert!(!pgdata.join("standby.signal").exists());
 }
 
-/// Runs the CDC setup SQL from `post_start` against a real Postgres instance and
-/// verifies the slot and publication are created correctly and idempotently.
+/// Runs the CDC setup SQL from `supervisor::post_start` against a real Postgres
+/// instance and verifies the slot and publication are created correctly and
+/// idempotently.
+///
+/// Uses `beyond_pg::sql::CDC_SLOT_SQL` and `beyond_pg::sql::CDC_PUBLICATION_SQL`
+/// — the exact constants that `supervisor.rs` executes. If the production SQL
+/// changes, this test automatically uses the new SQL.
 #[test]
 #[ignore = "requires Docker"]
 fn cdc_slot_and_publication_created() {
@@ -513,42 +872,18 @@ fn cdc_slot_and_publication_created() {
     let mut client =
         postgres::Client::connect(&url, postgres::NoTls).expect("failed to connect to Postgres");
 
-    // replicator role — same SQL as supervisor post_start
+    // Use the exact SQL constants from sql.rs — the same ones supervisor.rs runs.
     client
-        .batch_execute(
-            "DO $$
-             BEGIN
-               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'replicator') THEN
-                 CREATE ROLE replicator LOGIN REPLICATION PASSWORD NULL;
-               END IF;
-             END
-             $$",
-        )
+        .batch_execute(beyond_pg::sql::REPLICATOR_ROLE_SQL)
         .expect("failed to create replicator role");
 
-    // CDC slot + publication — same SQL as supervisor post_start
-    let setup_cdc = "
-        DO $$
-        BEGIN
-          IF NOT EXISTS (
-            SELECT FROM pg_replication_slots WHERE slot_name = 'cdc'
-          ) THEN
-            PERFORM pg_create_logical_replication_slot('cdc', 'pgoutput');
-          END IF;
-        END
-        $$;
-        DO $$
-        BEGIN
-          IF NOT EXISTS (SELECT FROM pg_publication WHERE pubname = 'cdc') THEN
-            EXECUTE 'CREATE PUBLICATION cdc';
-          END IF;
-        END
-        $$;
-    ";
+    client
+        .batch_execute(beyond_pg::sql::CDC_SLOT_SQL)
+        .expect("failed to create CDC slot");
 
     client
-        .batch_execute(setup_cdc)
-        .expect("failed to set up CDC");
+        .batch_execute(beyond_pg::sql::CDC_PUBLICATION_SQL)
+        .expect("failed to create CDC publication");
 
     // Verify slot
     let row = client
@@ -572,12 +907,15 @@ fn cdc_slot_and_publication_created() {
         "publication should not cover all tables"
     );
 
-    // Idempotence: running the same SQL again must not error
+    // Idempotence: running the same SQL again must not error.
     client
-        .batch_execute(setup_cdc)
-        .expect("CDC setup not idempotent");
+        .batch_execute(beyond_pg::sql::CDC_SLOT_SQL)
+        .expect("CDC slot SQL not idempotent");
+    client
+        .batch_execute(beyond_pg::sql::CDC_PUBLICATION_SQL)
+        .expect("CDC publication SQL not idempotent");
 
-    // Exactly one slot, one publication after two runs
+    // Exactly one slot, one publication after two runs.
     let slot_count: i64 = client
         .query_one(
             "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'cdc'",
@@ -596,6 +934,5 @@ fn cdc_slot_and_publication_created() {
         .get(0);
     assert_eq!(pub_count, 1, "duplicate publications created");
 
-    // Suppress unused-variable warning from the container not being explicitly dropped
     drop(container);
 }

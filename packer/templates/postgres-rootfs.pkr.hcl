@@ -91,12 +91,11 @@ build {
 
   sources = ["source.docker.ubuntu"]
 
-  # Stage the Rust source tree for in-container build (script 06 builds it).
-  # Building inside the container ensures the binary links against the same
-  # glibc it will run on — no cross-compilation toolchain required on the host.
+  # Stage pre-built musl static binaries. Built by `mise run build:image`
+  # via cross-compilation before Packer runs — no Rust toolchain needed in the image.
   provisioner "file" {
-    source      = "${path.root}/../staging/beyond-pg-src/"
-    destination = "/tmp/beyond-pg-src"
+    source      = "${path.root}/../staging/beyond-pg-bin/"
+    destination = "/tmp/beyond-pg-bin"
   }
 
   # Config file templates — rootfs copies for operator inspection.

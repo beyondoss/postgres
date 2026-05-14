@@ -1,6 +1,6 @@
 [tools]
 dprint = "latest"
-rust = { version = "1.92", components = "rustfmt,clippy", targets = "aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu" }
+rust = { version = "1.92", components = "rustfmt,clippy", targets = "aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu,aarch64-unknown-linux-musl,x86_64-unknown-linux-musl" }
 cargo-binstall = "latest"
 "cargo:cross" = "latest"
 postgres = "18"
@@ -17,6 +17,14 @@ cargo test -p beyond-pg-sink --test e2e -- --include-ignored --nocapture
 cargo test -p beyond-pg-cdc  --test e2e -- --include-ignored --nocapture
 """
 
+[tasks."test:boot"]
+description = "Run beyond-pg boot end-to-end tests (requires Docker + musl target)"
+run = "cargo test --test boot -- --include-ignored --nocapture"
+
+[tasks."test:supervisor"]
+description = "Run supervisor lifecycle tests (requires Docker + musl target + beyond-pg-test image)"
+run = "cargo test --test supervisor -- --include-ignored --nocapture"
+
 [tasks."test:e2e:sink"]
 description = "Run WAL sink end-to-end test (requires Docker and pg_receivewal on PATH)"
 run = "cargo test -p beyond-pg-sink --test e2e -- --include-ignored --nocapture"
@@ -31,11 +39,25 @@ run = "cargo build"
 [tasks."build:rs:release"]
 run = "cargo build --release"
 
-[tasks."build:sink"]
-description = "Cross-compile beyond-pg-sink for Linux amd64 + arm64 (requires Docker for cross)"
+[tasks."build:beyond-pg"]
+description = "Cross-compile beyond-pg for Linux amd64 + arm64 as musl static binaries"
 run = '''
-cross build --release -p beyond-pg-sink --target x86_64-unknown-linux-gnu
-cross build --release -p beyond-pg-sink --target aarch64-unknown-linux-gnu
+cross build --release -p beyond-pg --target x86_64-unknown-linux-musl
+cross build --release -p beyond-pg --target aarch64-unknown-linux-musl
+'''
+
+[tasks."build:sink"]
+description = "Cross-compile beyond-pg-sink for Linux amd64 + arm64 as musl static binaries"
+run = '''
+cross build --release -p beyond-pg-sink --target x86_64-unknown-linux-musl
+cross build --release -p beyond-pg-sink --target aarch64-unknown-linux-musl
+'''
+
+[tasks."build:test-image"]
+description = "Build Docker test image with pgbouncer + pg_cron + stub extensions for supervisor tests"
+run = '''
+docker build -f docker/test/Dockerfile -t beyond-pg-test:latest docker/test
+echo "==> Test image built: beyond-pg-test:latest"
 '''
 
 [tasks."check:rs"]
@@ -82,13 +104,19 @@ HYPOPG_VER=$(_toml "['pgdg']['hypopg']")
 PG_REPACK_VER=$(_toml "['pgdg']['pg_repack']")
 PG_SEARCH_VER=$(_toml "['paradedb']['pg_search']")
 
-# Stage Rust source for in-container build.
-# beyond-init is NOT staged here — box-manager injects it into the GlideFS
-# fork at snapshot-creation time via the chroot mechanism in beyond/boxes.
-mkdir -p packer/staging
-rsync -a --delete --exclude=target \
-  src Cargo.toml Cargo.lock rust-toolchain.toml beyond-pg-sink \
-  packer/staging/beyond-pg-src/
+# Cross-compile musl static binaries for the target arch.
+case "${ARCH}" in
+  arm64) MUSL_TARGET="aarch64-unknown-linux-musl" ;;
+  *)     MUSL_TARGET="x86_64-unknown-linux-musl" ;;
+esac
+echo "==> Building musl static binaries for ${MUSL_TARGET}..."
+cross build --release -p beyond-pg      --target "${MUSL_TARGET}"
+cross build --release -p beyond-pg-sink --target "${MUSL_TARGET}"
+
+# Stage pre-built binaries for Packer to install.
+mkdir -p packer/staging/beyond-pg-bin
+cp "target/${MUSL_TARGET}/release/beyond-pg"      packer/staging/beyond-pg-bin/
+cp "target/${MUSL_TARGET}/release/beyond-pg-sink" packer/staging/beyond-pg-bin/
 
 IMAGE_VERSION=$(git rev-parse --short HEAD)
 
@@ -98,8 +126,10 @@ packer build \
   -var "target_arch=${ARCH}" \
   -var "output_dir=${OUTPUT_DIR}" \
   -var "build_tiers=${BUILD_TIERS}" \
-  -var "auth_ext_version=${AUTH_VER}" \
-  -var "queue_ext_version=${QUEUE_VER}" \
+  -var "auth_ext_git=${AUTH_GIT}" \
+  -var "auth_ext_tag=${AUTH_TAG}" \
+  -var "queue_ext_git=${QUEUE_GIT}" \
+  -var "queue_ext_tag=${QUEUE_TAG}" \
   -var "pgvector_version=${PGVECTOR_VER}" \
   -var "pgvectorscale_version=${PGVECTORSCALE_VER}" \
   -var "postgis_version=${POSTGIS_VER}" \

@@ -75,11 +75,14 @@ pub async fn do_boot(cfg: &MmdsConfig) -> Result<(), BootError> {
 }
 
 async fn do_boot_primary(cfg: &MmdsConfig) -> Result<(), BootError> {
-    ensure_conf_d()?;
     maybe_initdb(cfg).await?;
+    // ensure_conf_d after initdb: maybe_initdb may remove and recreate PGDATA
+    // (partial-init recovery path), destroying any conf.d created beforehand.
+    ensure_conf_d()?;
     verify_wal_symlink()?;
     fetch_wal_gap(cfg).await?;
     write_config_files(cfg)?;
+    write_pitr_config(cfg)?;
     let shared_buffers_mb = (cfg.ram_bytes / (1024 * 1024) / 4).max(128);
     apply_kernel_settings(shared_buffers_mb);
 
@@ -110,9 +113,9 @@ async fn do_boot_replica(cfg: &MmdsConfig) -> Result<(), BootError> {
         .as_deref()
         .expect("primary_conninfo required for replica — guaranteed by mmds::parse");
 
-    ensure_conf_d()?;
-
     // Seed PGDATA from the primary (idempotent — skips if already done).
+    // ensure_conf_d must come AFTER basebackup: pg_basebackup refuses a non-empty
+    // target directory, and create_dir_all(PGDATA/conf.d) would make it non-empty.
     pg::basebackup(conninfo)
         .await
         .map_err(|e| BootError::BaseBackup(e.to_string()))?;
@@ -126,6 +129,10 @@ async fn do_boot_replica(cfg: &MmdsConfig) -> Result<(), BootError> {
         .open(format!("{PGDATA}/standby.signal"))?;
     info!("standby.signal: present");
 
+    // conf.d must exist before write_config_files; safe to create now that
+    // pg_basebackup has populated PGDATA (creating it beforehand would cause
+    // pg_basebackup to refuse the non-empty target directory).
+    ensure_conf_d()?;
     verify_wal_symlink()?;
 
     // Standard config files (tuning, memory, hba, pgbouncer, etc.)
@@ -258,6 +265,194 @@ fn verify_wal_symlink() -> Result<(), BootError> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// PITR config and recovery.signal
+// ---------------------------------------------------------------------------
+
+fn write_pitr_config(cfg: &MmdsConfig) -> Result<(), BootError> {
+    write_pitr_config_into(cfg, Path::new(PGDATA))
+}
+
+fn write_pitr_config_into(cfg: &MmdsConfig, pgdata: &Path) -> Result<(), BootError> {
+    let pitr_path = pgdata.join("conf.d/05-pitr.conf");
+    let recovery_signal = pgdata.join("recovery.signal");
+
+    if let Some(target) = &cfg.archive_target {
+        let conf = config::pitr_conf(target, cfg.recovery_target_time.as_deref());
+        config::write_atomic(&pitr_path, &conf)?;
+        info!("wrote {}", pitr_path.display());
+    } else {
+        match std::fs::remove_file(&pitr_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(BootError::Io(e)),
+        }
+    }
+
+    // recovery.signal tells Postgres to enter recovery mode and replay archived
+    // WAL up to recovery_target_time, then promote. Only written when both an
+    // archive target and a recovery target time are present — a target time
+    // without an archive to read from is a misconfiguration.
+    let pitr_mode = cfg.recovery_target_time.is_some() && cfg.archive_target.is_some();
+    if pitr_mode {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&recovery_signal)?;
+        info!(
+            "recovery.signal: created for PITR recovery to {:?}",
+            cfg.recovery_target_time
+        );
+    } else {
+        match std::fs::remove_file(&recovery_signal) {
+            Ok(()) => info!("recovery.signal: removed (not in PITR mode)"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(BootError::Io(e)),
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mmds::{MmdsConfig, PgTier};
+
+    fn test_cfg(archive_target: Option<&str>, recovery_target_time: Option<&str>) -> MmdsConfig {
+        MmdsConfig {
+            pg_tier: PgTier::Single,
+            ephemeral: false,
+            postgres_password: "test".into(),
+            postgres_database: "postgres".into(),
+            archive_target: archive_target.map(str::to_owned),
+            wal_sink: None,
+            cdc_enabled: false,
+            recovery_target_time: recovery_target_time.map(str::to_owned),
+            primary_conninfo: None,
+            ram_bytes: 4 * 1024 * 1024 * 1024,
+            vcpus: 2,
+        }
+    }
+
+    #[test]
+    fn pitr_config_written_when_archive_target_set() {
+        let pgdata = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pgdata.path().join("conf.d")).unwrap();
+
+        let cfg = test_cfg(Some("s3://bucket/prefix"), None);
+        write_pitr_config_into(&cfg, pgdata.path()).unwrap();
+
+        let pitr = pgdata.path().join("conf.d/05-pitr.conf");
+        assert!(pitr.exists(), "05-pitr.conf should be written");
+
+        let content = std::fs::read_to_string(&pitr).unwrap();
+        assert!(
+            content
+                .contains("restore_command = 'aws s3 cp s3://bucket/prefix/%f %p --no-progress'"),
+            "restore_command wrong: {content}"
+        );
+        assert!(
+            !content.contains("recovery_target_time"),
+            "recovery_target_time should be absent: {content}"
+        );
+
+        // recovery.signal must NOT be created — no target time set.
+        assert!(
+            !pgdata.path().join("recovery.signal").exists(),
+            "recovery.signal should not exist without recovery_target_time"
+        );
+    }
+
+    #[test]
+    fn pitr_config_and_signal_written_in_pitr_mode() {
+        let pgdata = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pgdata.path().join("conf.d")).unwrap();
+
+        let cfg = test_cfg(Some("s3://bucket/prefix"), Some("2026-05-14 03:00:00"));
+        write_pitr_config_into(&cfg, pgdata.path()).unwrap();
+
+        let pitr = pgdata.path().join("conf.d/05-pitr.conf");
+        let content = std::fs::read_to_string(&pitr).unwrap();
+        assert!(
+            content.contains("recovery_target_time = '2026-05-14 03:00:00'"),
+            "{content}"
+        );
+        assert!(
+            content.contains("recovery_target_action = promote"),
+            "{content}"
+        );
+        assert!(
+            content.contains("recovery_target_inclusive = true"),
+            "{content}"
+        );
+
+        assert!(
+            pgdata.path().join("recovery.signal").exists(),
+            "recovery.signal must exist in PITR mode"
+        );
+    }
+
+    #[test]
+    fn pitr_config_removed_when_archive_target_cleared() {
+        let pgdata = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pgdata.path().join("conf.d")).unwrap();
+
+        // First boot: archive target set.
+        let cfg = test_cfg(Some("s3://bucket/prefix"), Some("2026-05-14 03:00:00"));
+        write_pitr_config_into(&cfg, pgdata.path()).unwrap();
+        assert!(pgdata.path().join("conf.d/05-pitr.conf").exists());
+        assert!(pgdata.path().join("recovery.signal").exists());
+
+        // Second boot: archive target cleared (e.g. recovery completed, MMDS updated).
+        let cfg = test_cfg(None, None);
+        write_pitr_config_into(&cfg, pgdata.path()).unwrap();
+        assert!(
+            !pgdata.path().join("conf.d/05-pitr.conf").exists(),
+            "05-pitr.conf should be removed when archive_target cleared"
+        );
+        assert!(
+            !pgdata.path().join("recovery.signal").exists(),
+            "recovery.signal should be removed when not in PITR mode"
+        );
+    }
+
+    #[test]
+    fn pitr_signal_not_written_without_archive_target() {
+        let pgdata = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pgdata.path().join("conf.d")).unwrap();
+
+        // recovery_target_time set but no archive_target — misconfiguration guard.
+        let cfg = test_cfg(None, Some("2026-05-14 03:00:00"));
+        write_pitr_config_into(&cfg, pgdata.path()).unwrap();
+
+        assert!(
+            !pgdata.path().join("recovery.signal").exists(),
+            "recovery.signal must not be created without archive_target"
+        );
+    }
+
+    #[test]
+    fn write_pitr_config_is_idempotent() {
+        let pgdata = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pgdata.path().join("conf.d")).unwrap();
+
+        let cfg = test_cfg(Some("s3://bucket/prefix"), Some("2026-05-14 03:00:00"));
+
+        write_pitr_config_into(&cfg, pgdata.path()).unwrap();
+        write_pitr_config_into(&cfg, pgdata.path()).unwrap();
+        write_pitr_config_into(&cfg, pgdata.path()).unwrap();
+
+        // After three calls the files exist exactly once with correct content.
+        let pitr = pgdata.path().join("conf.d/05-pitr.conf");
+        assert!(pitr.exists());
+        assert!(pgdata.path().join("recovery.signal").exists());
+        let content = std::fs::read_to_string(&pitr).unwrap();
+        assert!(content.contains("recovery_target_time = '2026-05-14 03:00:00'"));
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ mod log_forwarder;
 mod mmds;
 mod pg;
 mod rpc;
+mod sql;
 mod supervisor;
 mod tls;
 mod vsock;
