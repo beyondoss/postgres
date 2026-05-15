@@ -5068,34 +5068,13 @@ fn sink_slot_offline_catch_up() {
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    // ── 10. verify segment containing lsn_after_writes is present ────────────
-    let after_segment: String = client
-        .query_one(
-            &format!("SELECT pg_walfile_name('{lsn_after_writes}'::pg_lsn)"),
-            &[],
-        )
-        .unwrap()
-        .get(0);
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if sink_dir.join(&after_segment).exists() {
-            break;
-        }
-        if Instant::now() > deadline {
-            let ls: Vec<String> = std::fs::read_dir(&sink_dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
-            panic!(
-                "segment {after_segment} never appeared in sink_dir within 30s\nsink_dir: {ls:?}"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-
-    // ── 11. one more pg_switch_wal to fully exercise post-restart path ───────
+    // ── 10. pg_switch_wal post-restart, then wait for the just-sealed segment ─
+    // lsn_after_writes is at the start of the NEW segment created by the
+    // pre-restart pg_switch_wal — that segment is mostly empty.  Trigger a
+    // second pg_switch_wal so the segment containing lsn_after_writes gets
+    // sealed, then poll for it.  This exercises the post-restart sealing path
+    // end-to-end (the sink advances past the restart point and renames .partial
+    // → final on its own).
     let pre_switch_segment: String = client
         .query_one("SELECT pg_walfile_name(pg_current_wal_lsn())", &[])
         .unwrap()
@@ -5108,8 +5087,13 @@ fn sink_slot_offline_catch_up() {
             break;
         }
         if Instant::now() > deadline {
+            let ls: Vec<String> = std::fs::read_dir(&sink_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
             panic!(
-                "post-restart segment {pre_switch_segment} never sealed within 30s"
+                "post-restart segment {pre_switch_segment} never sealed within 30s\nsink_dir: {ls:?}"
             );
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -5237,7 +5221,9 @@ fn sink_keeps_up_with_pgbench() {
         String::from_utf8_lossy(&init_out.stderr)
     );
 
-    // ── 5. drive pgbench for 15s ─────────────────────────────────────────────
+    // ── 5. drive pgbench for 30s ─────────────────────────────────────────────
+    // 30s at -c 4 -j 4 -s 1 against synchronous_commit=remote_write reliably
+    // archives 3+ complete 16 MiB WAL segments on GHA runners.
     let run_out = std::process::Command::new("docker")
         .args([
             "exec",
@@ -5250,7 +5236,7 @@ fn sink_keeps_up_with_pgbench() {
             "-j",
             "4",
             "-T",
-            "15",
+            "30",
             "postgres",
         ])
         .output()
@@ -5336,7 +5322,7 @@ fn sink_keeps_up_with_pgbench() {
         .collect();
     assert!(
         complete_segs.len() >= 3,
-        "expected >= 3 complete WAL segments archived after 15s of pgbench, got {} ({:?})",
+        "expected >= 3 complete WAL segments archived after 30s of pgbench, got {} ({:?})",
         complete_segs.len(),
         complete_segs
     );
