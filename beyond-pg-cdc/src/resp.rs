@@ -536,10 +536,12 @@ mod tests {
                 Ok(0) => break,
                 Ok(n) => {
                     acc.extend_from_slice(&tmp[..n]);
+                    // Wait for the full last value including its trailing CRLF
+                    // so those 2 bytes don't bleed into the next read_exact.
                     if acc
                         .windows(b"beyond-pg-cdc".len())
                         .any(|w| w == b"beyond-pg-cdc")
-                        && acc.windows(b"0.1.0".len()).any(|w| w == b"0.1.0")
+                        && acc.windows(b"0.1.0\r\n".len()).any(|w| w == b"0.1.0\r\n")
                     {
                         break;
                     }
