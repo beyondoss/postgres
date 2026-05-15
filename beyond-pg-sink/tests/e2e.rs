@@ -1746,6 +1746,12 @@ fn replica_recovers_via_archive() {
         .output()
         .expect("network connect primary");
     assert!(out.status.success());
+    // docker network connect reconfigures iptables on the host, which can
+    // briefly reset established TCP connections. Sleep and reconnect so
+    // primary_client is fresh before we start polling pg_stat_replication.
+    std::thread::sleep(Duration::from_millis(500));
+    let mut primary_client =
+        postgres::Client::connect(&pg_url, postgres::NoTls).expect("reconnect primary_client");
 
     // Resolve primary's container-internal IP (for pg_basebackup container).
     let template = format!(
@@ -2440,6 +2446,11 @@ fn sink_crash_mid_write() {
         .output()
         .expect("network connect");
     assert!(out.status.success());
+    // docker network connect reconfigures iptables on the host, which can
+    // briefly reset established TCP connections. Sleep and reconnect.
+    std::thread::sleep(Duration::from_millis(500));
+    let mut primary_client =
+        postgres::Client::connect(&pg_url, postgres::NoTls).expect("reconnect primary_client");
 
     let primary_ip = {
         let tpl = format!(
@@ -2864,6 +2875,11 @@ fn wal_gap_stalls_replica() {
         .output()
         .expect("network connect");
     assert!(out.status.success());
+    // docker network connect reconfigures iptables on the host, which can
+    // briefly reset established TCP connections. Sleep and reconnect.
+    std::thread::sleep(Duration::from_millis(500));
+    let mut primary_client =
+        postgres::Client::connect(&pg_url, postgres::NoTls).expect("reconnect primary_client");
 
     let primary_ip = {
         let tpl = format!(
@@ -3315,6 +3331,11 @@ fn timeline_boundary_survives_failover() {
         .output()
         .expect("network connect");
     assert!(out.status.success());
+    // docker network connect reconfigures iptables on the host, which can
+    // briefly reset established TCP connections. Sleep and reconnect.
+    std::thread::sleep(Duration::from_millis(500));
+    let mut t1_client =
+        postgres::Client::connect(&pg_url, postgres::NoTls).expect("reconnect t1_client");
     let primary_ip = container_ip(primary.id(), &net_name);
 
     // ── 2. sink on host ───────────────────────────────────────────────────────
