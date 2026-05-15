@@ -3469,20 +3469,49 @@ fn timeline_boundary_survives_failover() {
     }
 
     // ── 9. copy .history file to sink dir ─────────────────────────────────────
-    // After promotion Postgres writes a timeline history file to pg_wal/ so
-    // standbies can locate the T1→T2 branch point.  The sink HTTP server now
-    // serves it (see the /00000002.history match arm in main.rs).  We copy it
-    // from the bind-mounted PGDATA rather than installing an archive_command.
-    let history_src = pgdata1.join("pg_wal").join("00000002.history");
+    // After promotion Postgres writes a timeline history file to pg_wal/. The
+    // pgdata is owned by uid 999 mode 0700 (set by the replica's startup
+    // script), so the host can't read it directly — use docker exec cat to
+    // extract the file content, then write to sink_dir on the host.
     let history_dst = sink_dir.join("00000002.history");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if history_src.exists() {
-            std::fs::copy(&history_src, &history_dst).expect("copy .history to sink_dir");
+        let out = std::process::Command::new("docker")
+            .args([
+                "exec",
+                "-u",
+                "root",
+                &r1_id,
+                "cat",
+                "/pgdata/pg_wal/00000002.history",
+            ])
+            .output();
+        if let Ok(o) = out
+            && o.status.success()
+            && !o.stdout.is_empty()
+        {
+            std::fs::write(&history_dst, &o.stdout).expect("write .history to sink_dir");
+            // Make it world-readable so the bind-mounted sink_dir is searchable
+            // by uid 999 in r2's container.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &history_dst,
+                    std::fs::Permissions::from_mode(0o644),
+                );
+            }
             break;
         }
         if Instant::now() > deadline {
-            panic!("00000002.history not written within 10s");
+            // Dump what's in pg_wal for diagnosis.
+            let ls = std::process::Command::new("docker")
+                .args(["exec", "-u", "root", &r1_id, "ls", "-la", "/pgdata/pg_wal"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            panic!("00000002.history not written within 10s\npg_wal contents:\n{ls}");
         }
         std::thread::sleep(Duration::from_millis(200));
     }
