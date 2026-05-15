@@ -5068,18 +5068,20 @@ fn sink_slot_offline_catch_up() {
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    // ── 10. pg_switch_wal post-restart, then wait for the just-sealed segment ─
-    // lsn_after_writes is at the start of the NEW segment created by the
-    // pre-restart pg_switch_wal — that segment is mostly empty.  Trigger a
-    // second pg_switch_wal so the segment containing lsn_after_writes gets
-    // sealed, then poll for it.  This exercises the post-restart sealing path
-    // end-to-end (the sink advances past the restart point and renames .partial
-    // → final on its own).
+    // ── 10. pg_switch_wal + an INSERT, then wait for the sealed segment ──────
+    // lsn_after_writes is at the start of a near-empty segment (created by the
+    // pre-restart pg_switch_wal).  We pg_switch_wal again to mark its end with
+    // XLOG_SWITCH, then INSERT one row so primary writes a real record into
+    // the NEXT segment.  Without that INSERT, the sink's writer never advances
+    // past the empty segment's boundary, so the .partial is never renamed.
     let pre_switch_segment: String = client
         .query_one("SELECT pg_walfile_name(pg_current_wal_lsn())", &[])
         .unwrap()
         .get(0);
     client.execute("SELECT pg_switch_wal()", &[]).unwrap();
+    client
+        .batch_execute("INSERT INTO slot_offline (v) VALUES ('post-restart-tick')")
+        .expect("post-switch INSERT to drive segment seal");
 
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
