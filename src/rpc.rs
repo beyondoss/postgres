@@ -8,7 +8,7 @@
 //!   checkpoint → CHECKPOINT via psql
 //!   health     → pg_isready
 //!   reload     → pg_ctl reload
-//!   promote    → pg_ctl promote (replica → primary; host decides when)
+//!   promote    → pg_ctl promote -w (blocks until standby exits recovery; ok:true = primary)
 //!   backup     → stub (not implemented)
 //!
 //! Only available on Linux (vsock is a Linux kernel feature).
@@ -22,7 +22,9 @@ mod inner {
     use crate::vsock::RPC_PORT;
 
     const MAX_RPC_BODY: usize = 1024 * 1024; // 1 MiB — guards against host sending a huge length
-    const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    // promote blocks for up to 55 s waiting for standby→primary transition; all
+    // other commands complete in well under 1 s.
+    const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
     #[derive(serde::Deserialize)]
     struct RpcRequest {

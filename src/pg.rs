@@ -251,19 +251,23 @@ pub async fn basebackup(conninfo: &str) -> Result<(), PgError> {
 
 /// Promote this standby to primary via `pg_ctl promote`.
 ///
-/// Called by the vsock RPC handler. The promotion decision belongs to the host
-/// (box-manager); this function only executes it.
+/// Blocks until Postgres has exited recovery mode (`-w`), up to 55 seconds.
+/// Returns `Ok(())` only after promotion is complete — callers can rely on
+/// `ok: true` from the RPC meaning the node is now a writable primary.
+///
+/// The 55 s internal limit matches the 60 s RPC_TIMEOUT in rpc.rs; promotion
+/// under normal conditions completes in under 1 second.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub async fn promote() -> Result<(), PgError> {
     tracing::info!("pg_ctl: promoting standby to primary");
     let out = Command::new("pg_ctl")
-        .args(["promote", "-D", PGDATA])
+        .args(["promote", "-w", "-t", "55", "-D", PGDATA])
         .stderr(std::process::Stdio::piped())
         .output()
         .await?;
 
     if out.status.success() {
-        tracing::info!("pg_ctl: promote complete");
+        tracing::info!("pg_ctl: promotion complete — node is now primary");
         return Ok(());
     }
     let code = out.status.code().ok_or(PgError::Signal)?;

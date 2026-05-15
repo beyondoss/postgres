@@ -4,6 +4,7 @@ FROM postgres:18
 # pgbouncer from standard Debian apt.
 # postgresql-server-dev-18 + gcc to compile stub extensions.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
     pgbouncer \
     postgresql-18-cron \
     postgresql-server-dev-18 \

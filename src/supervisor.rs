@@ -85,6 +85,32 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("postgres is ready");
 
+    // WAL forwarder must start BEFORE post_start.
+    //
+    // `03-wal-sink.conf` sets `synchronous_commit = remote_write` and
+    // `synchronous_standby_names = 'wal_sink'`.  Every commit in post_start
+    // blocks until the 'wal_sink' streaming standby ACKs the WAL.  The
+    // wal_forwarder connects to postgres with application_name='wal_sink',
+    // making it that standby.  Spawning it after post_start causes a deadlock.
+    //
+    // The handle is retained so we can abort the task on shutdown.  Aborting
+    // the task drops ack_tx, which unblocks the pg_reader_thread
+    // (spawn_blocking).  Without the explicit abort, the tokio current_thread
+    // runtime deadlocks on drop: it drains the blocking pool before dropping
+    // tasks, so ack_tx is never dropped and blocking_recv() blocks forever.
+    let mut wal_forwarder_handle: Option<tokio::task::JoinHandle<()>> = None;
+    if cfg.pg_tier != PgTier::Replica
+        && let Some(wal_sink) = &cfg.wal_sink
+    {
+        let sink_url = wal_sink.clone();
+        wal_forwarder_handle = Some(tokio::spawn(crate::wal_forwarder::run(
+            sink_url,
+            "wal_sink".to_owned(),
+            crate::pg::PG_PORT,
+        )));
+        wait_for_sync_standby("wal_sink", std::time::Duration::from_secs(30)).await;
+    }
+
     // Replicas are read-only hot standbys — DDL is rejected during recovery.
     // Extensions, roles, and slots are replicated from the primary.
     if cfg.pg_tier != PgTier::Replica {
@@ -95,18 +121,6 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // PgBouncer is useful on replicas too for read-only connection pooling.
     let mut pgb_state = ChildState::new("pgbouncer");
     spawn_pgbouncer(&mut pgb_state, &log_tx)?;
-
-    // WAL forwarder and CDC run only on the primary.
-    if cfg.pg_tier != PgTier::Replica
-        && let Some(wal_sink) = &cfg.wal_sink
-    {
-        let sink_url = wal_sink.clone();
-        tokio::spawn(crate::wal_forwarder::run(
-            sink_url,
-            "wal_sink".to_owned(),
-            crate::pg::PG_PORT,
-        ));
-    }
 
     let mut cdc_state = if cfg.pg_tier != PgTier::Replica && cfg.cdc_enabled {
         let mut s = ChildState::new("beyond-pg-cdc");
@@ -152,12 +166,14 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             _ = sigterm.recv() => {
                 info!("received SIGTERM, draining children");
+                abort_wal_forwarder(&mut wal_forwarder_handle).await;
                 drain_children(&mut pg_state, &mut pgb_state, cdc_state.as_mut()).await;
                 shutdown_background_tasks(log_writer_handle, rpc_handle, memory_watcher_handle).await;
                 return Ok(());
             }
             _ = sigint.recv() => {
                 info!("received SIGINT, draining children");
+                abort_wal_forwarder(&mut wal_forwarder_handle).await;
                 drain_children(&mut pg_state, &mut pgb_state, cdc_state.as_mut()).await;
                 shutdown_background_tasks(log_writer_handle, rpc_handle, memory_watcher_handle).await;
                 return Ok(());
@@ -576,6 +592,66 @@ async fn shutdown_background_tasks(
 }
 
 // ---------------------------------------------------------------------------
+// WAL forwarder shutdown
+// ---------------------------------------------------------------------------
+
+/// Abort the wal_forwarder task and wait for it to be dropped.
+///
+/// This must run before `drain_children` because the tokio current_thread
+/// runtime drains the blocking pool before dropping tasks.  The
+/// pg_reader_thread (spawn_blocking) waits on `ack_rx.blocking_recv()`.
+/// `ack_tx` lives in the wal_forwarder task's stack frame and is only
+/// dropped when the task is cancelled.  Without an explicit abort here, the
+/// runtime's drop deadlocks: blocking pool waits for pg_reader_thread;
+/// pg_reader_thread waits for ack_tx; ack_tx never drops because tasks are
+/// dropped after the blocking pool.
+///
+/// Aborting also closes the TCP connection to postgres's walsender, letting
+/// postgres exit its smart shutdown within DRAIN_TIMEOUT instead of waiting
+/// for wal_sender_timeout (60 s default).
+async fn abort_wal_forwarder(handle: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(h) = handle.take() {
+        h.abort();
+        let _ = h.await; // JoinError::Cancelled is expected and ignored
+        info!("wal forwarder task aborted");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sync-standby readiness
+// ---------------------------------------------------------------------------
+
+/// Poll `pg_stat_replication` until `application_name` appears as a sync
+/// standby or `timeout` elapses.  Called after spawning the wal_forwarder so
+/// post_start's commits are not blocked by a missing sync standby.
+async fn wait_for_sync_standby(name: &str, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    // Use a DO block so psql exits non-zero when no matching row exists.
+    // A plain SELECT exits 0 even when it returns 0 rows, so is_ok() would
+    // always succeed and we would never actually wait.
+    let sql = format!(
+        "DO $$ BEGIN \
+           IF NOT EXISTS (SELECT 1 FROM pg_stat_replication \
+                          WHERE application_name = '{name}' \
+                          AND sync_state IN ('sync','quorum')) \
+           THEN RAISE EXCEPTION '{name} not yet a sync standby'; \
+           END IF; \
+         END $$"
+    );
+    loop {
+        if pg::psql(&sql).await.is_ok() {
+            info!("sync standby '{name}' is ready");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!("timeout waiting for sync standby '{name}'; proceeding anyway");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Post-start setup
 // ---------------------------------------------------------------------------
 
@@ -711,13 +787,57 @@ async fn memory_watcher_task(vcpus: u32, initial_ram_bytes: u64) {
 
 fn read_memtotal_bytes() -> Option<u64> {
     let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_memtotal_kib(&content).map(|kib| kib * 1024)
+}
+
+fn parse_memtotal_kib(content: &str) -> Option<u64> {
     for line in content.lines() {
         if line.starts_with("MemTotal:") {
             let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-            return Some(kib * 1024);
+            return Some(kib);
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_memtotal_standard_format() {
+        let input = "MemTotal:       16384000 kB\nMemFree:        8192000 kB\n";
+        assert_eq!(parse_memtotal_kib(input), Some(16_384_000));
+    }
+
+    #[test]
+    fn parse_memtotal_missing_returns_none() {
+        let input = "MemFree:  1000 kB\nSwapTotal:  0 kB\n";
+        assert_eq!(parse_memtotal_kib(input), None);
+    }
+
+    #[test]
+    fn parse_memtotal_empty_returns_none() {
+        assert_eq!(parse_memtotal_kib(""), None);
+    }
+
+    #[test]
+    fn memory_watcher_threshold_5pct() {
+        // The watcher skips updates when delta * 20 <= last (i.e., delta ≤ 5%).
+        let last = 4_096_000_000u64; // ~4 GB
+
+        // 4% change — skip
+        let delta = last * 4 / 100;
+        assert!(delta * 20 <= last, "4% should be below threshold (skip)");
+
+        // 5% change — still skip (condition is ≤)
+        let delta = last / 20;
+        assert!(delta * 20 <= last, "5% should be at threshold (skip)");
+
+        // 6% change — trigger update
+        let delta = last * 6 / 100;
+        assert!(delta * 20 > last, "6% should exceed threshold (update)");
+    }
 }
 
 // ---------------------------------------------------------------------------

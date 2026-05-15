@@ -881,6 +881,565 @@ impl Drop for DockerNetwork {
     }
 }
 
+/// Python stub that replaces `aws` in containers.
+///
+/// Handles `aws s3 cp SRC DST [--no-progress]` and maps the S3 bucket
+/// `s3://beyond-test/wal/` to the local container path `/archive/`.
+const AWS_STUB_PY: &str = r#"#!/usr/bin/env python3
+import sys, os, shutil
+src, dst = sys.argv[3], sys.argv[4]
+PREFIX, LOCAL = "s3://beyond-test/wal/", "/archive/"
+fn = lambda p: LOCAL + p[len(PREFIX):] if p.startswith(PREFIX) else p
+s, d = fn(src), fn(dst)
+ddir = os.path.dirname(d)
+if ddir: os.makedirs(ddir, exist_ok=True)
+shutil.copy2(s, d)
+"#;
+
+/// Full PITR cycle: archive WAL from a live Postgres, then recover to a
+/// point-in-time using `recovery.signal` + `restore_command`.
+///
+/// Steps:
+///   1. Boot with `BEYOND_PG_ARCHIVE_TARGET` (no recovery target) — configures
+///      `archive_command` and `restore_command` but does not enter recovery.
+///   2. Start Postgres.  Insert rows into `before_pitr`.  Record timestamp T1.
+///      Insert rows into `after_pitr`.  Force WAL switch to flush archive.
+///   3. Stop Postgres.
+///   4. Boot again with `BEYOND_PG_ARCHIVE_TARGET` + `BEYOND_PG_RECOVERY_TARGET_TIME=T1`.
+///      Verifies `recovery.signal` is created and `05-pitr.conf` has the right content.
+///   5. Start Postgres in recovery mode.  Wait for it to replay to T1 and promote
+///      (`pg_is_in_recovery()` returns false).
+///   6. Assert `before_pitr` has 10 rows and `after_pitr` does not exist — proving
+///      Postgres recovered exactly to T1 and no further.
+#[test]
+#[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
+fn boot_pitr_recovery() {
+    let _guard = DOCKER.lock().unwrap();
+    let Some((binary, platform)) = build_linux_beyond_pg() else {
+        return;
+    };
+    let env = BootEnv::new();
+
+    // Create the archive directory (bind-mounted at /archive in containers).
+    let archive_dir = tempfile::tempdir().expect("archive tempdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(archive_dir.path(), std::fs::Permissions::from_mode(0o777))
+            .expect("chmod archive dir");
+    }
+
+    // Write the stub aws script and make it executable.
+    let aws_stub = tempfile::NamedTempFile::new().expect("aws stub");
+    std::fs::write(aws_stub.path(), AWS_STUB_PY).expect("write aws stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(aws_stub.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod aws stub");
+    }
+
+    let archive = archive_dir.path().display().to_string();
+    let aws = aws_stub.path().display().to_string();
+    let bin = binary.display().to_string();
+    let pg_lib = env.pg_lib.path().display().to_string();
+    let etc_pg = env.etc_pg.path().display().to_string();
+
+    let extra = &[
+        "-v",
+        &format!("{aws}:/usr/local/bin/aws"),
+        "-v",
+        &format!("{archive}:/archive"),
+    ];
+
+    // ---------------------------------------------------------------------------
+    // Phase 1: boot with archive target only (no recovery target).
+    // ---------------------------------------------------------------------------
+    let boot1_mmds = mmds(&[("BEYOND_PG_ARCHIVE_TARGET", "s3://beyond-test/wal")]);
+    let boot1 = env.run_boot_ex(&binary, platform, &boot1_mmds, extra, "postgres:18");
+    eprintln!("boot1 stderr: {}", String::from_utf8_lossy(&boot1.stderr));
+    assert!(
+        boot1.status.success(),
+        "phase 1 boot failed: {}",
+        boot1.status
+    );
+    // No recovery.signal — archive target alone doesn't trigger recovery.
+    assert!(
+        !env.pgdata().join("recovery.signal").exists(),
+        "recovery.signal should not exist with archive target but no recovery time"
+    );
+
+    // Write the MMDS to a persistent file so the postgres container's
+    // `beyond-pg archive` subprocess can read it.
+    let mmds_file = tempfile::NamedTempFile::new().expect("mmds file");
+    std::fs::write(mmds_file.path(), &boot1_mmds).expect("write mmds");
+    let mmds_path = mmds_file.path().display().to_string();
+
+    // ---------------------------------------------------------------------------
+    // Phase 1 Postgres: insert data, archive WAL, capture T1.
+    //
+    // The bash script:
+    //   - overrides huge_pages and shared_preload_libraries for unprivileged Docker
+    //   - starts Postgres, waits for readiness
+    //   - inserts 10 rows into `before_pitr`
+    //   - sleeps 2 s to ensure T1 is strictly between the two inserts
+    //   - records T1 = current timestamp
+    //   - inserts 10 rows into `after_pitr`
+    //   - forces a WAL switch so the archiver flushes both segments
+    //   - sleeps to allow archive_command to complete
+    //   - prints "RECOVERY_TARGET:<T1>" so the test can extract T1
+    // ---------------------------------------------------------------------------
+    let phase1_cmd = concat!(
+        "printf '%s\\n' 'huge_pages = try' \"shared_preload_libraries = ''\" ",
+        "  >> /var/lib/postgresql/18/main/postgresql.auto.conf && ",
+        "chown -R postgres:postgres /var/lib/postgresql/18/ && ",
+        "mkdir -p /var/run/postgresql && chown postgres:postgres /var/run/postgresql && ",
+        "gosu postgres postgres -D /var/lib/postgresql/18/main -p 5433 & ",
+        "PG_PID=$! && ",
+        "for i in $(seq 30); do pg_isready -h /var/run/postgresql -p 5433 -q && break; sleep 1; done && ",
+        "gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -c ",
+        "  'CREATE TABLE before_pitr (n int); INSERT INTO before_pitr SELECT generate_series(1,10)' && ",
+        "sleep 2 && ",
+        "T1=$(gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -tAc ",
+        "  \"SELECT to_char(now(), 'YYYY-MM-DD HH24:MI:SS')\") && ",
+        "sleep 1 && ",
+        "gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -c ",
+        "  'CREATE TABLE after_pitr (n int); INSERT INTO after_pitr SELECT generate_series(1,10)' && ",
+        "gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -c 'SELECT pg_switch_wal()' && ",
+        // Wait for archive_command to complete (runs asynchronously in Postgres).
+        "sleep 5 && ",
+        "echo \"RECOVERY_TARGET:$T1\" && ",
+        "kill $PG_PID && wait $PG_PID 2>/dev/null; true",
+    );
+
+    let phase1_out = std::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--platform",
+            platform,
+            "--user",
+            "root",
+            "-v",
+            &format!("{bin}:/usr/local/bin/beyond-pg"),
+            "-v",
+            &format!("{aws}:/usr/local/bin/aws"),
+            "-v",
+            &format!("{pg_lib}:/var/lib/postgresql/18"),
+            "-v",
+            &format!("{etc_pg}:/etc/postgresql/18/main"),
+            "-v",
+            &format!("{archive}:/archive"),
+            "-v",
+            &format!("{mmds_path}:/run/mmds/metadata.json"),
+            "postgres:18",
+            "bash",
+            "-c",
+            phase1_cmd,
+        ])
+        .output()
+        .expect("docker run phase 1 postgres");
+
+    eprintln!(
+        "phase1 pg stdout: {}",
+        String::from_utf8_lossy(&phase1_out.stdout)
+    );
+    eprintln!(
+        "phase1 pg stderr: {}",
+        String::from_utf8_lossy(&phase1_out.stderr)
+    );
+    assert!(
+        phase1_out.status.success(),
+        "phase 1 postgres failed: {}",
+        phase1_out.status
+    );
+
+    // Extract the recovery target time from stdout.
+    let phase1_stdout = String::from_utf8_lossy(&phase1_out.stdout);
+    let t1 = phase1_stdout
+        .lines()
+        .find(|l| l.starts_with("RECOVERY_TARGET:"))
+        .and_then(|l| l.strip_prefix("RECOVERY_TARGET:"))
+        .map(str::trim)
+        .expect("RECOVERY_TARGET not found in phase 1 output")
+        .to_owned();
+    eprintln!("recovery target T1 = {t1}");
+
+    // Verify at least one WAL segment was archived.
+    let archived: Vec<_> = std::fs::read_dir(archive_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        !archived.is_empty(),
+        "no WAL segments were archived — archive_command or stub aws may have failed"
+    );
+
+    // Delete archived segments from local pg_wal/ so recovery is forced to use
+    // restore_command (the aws stub). Only remove segments that exist in the archive
+    // — the segment started after pg_switch_wal() (containing the shutdown checkpoint)
+    // is not yet archived and must remain for recovery to find the starting checkpoint.
+    {
+        let wal_dir = env.pg_lib.path().join("wal");
+        let archived_names: std::collections::HashSet<_> =
+            archived.iter().map(|e| e.file_name()).collect();
+        for entry in std::fs::read_dir(&wal_dir).unwrap().filter_map(|e| e.ok()) {
+            if archived_names.contains(&entry.file_name()) {
+                std::fs::remove_file(entry.path()).ok();
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase 2: boot in PITR mode with recovery target T1.
+    // ---------------------------------------------------------------------------
+    let boot2_mmds = mmds(&[
+        ("BEYOND_PG_ARCHIVE_TARGET", "s3://beyond-test/wal"),
+        ("BEYOND_PG_RECOVERY_TARGET_TIME", &t1),
+    ]);
+    // Update the MMDS file so `beyond-pg archive` reads the same target.
+    std::fs::write(mmds_file.path(), &boot2_mmds).expect("write boot2 mmds");
+
+    let boot2 = env.run_boot_ex(&binary, platform, &boot2_mmds, extra, "postgres:18");
+    eprintln!("boot2 stderr: {}", String::from_utf8_lossy(&boot2.stderr));
+    assert!(
+        boot2.status.success(),
+        "phase 2 boot failed: {}",
+        boot2.status
+    );
+    assert!(
+        env.pgdata().join("recovery.signal").exists(),
+        "recovery.signal must exist for PITR recovery"
+    );
+    let pitr_conf = std::fs::read_to_string(env.pgdata().join("conf.d/05-pitr.conf")).unwrap();
+    assert!(
+        pitr_conf.contains(&format!("recovery_target_time = '{t1}'")),
+        "05-pitr.conf has wrong recovery_target_time: {pitr_conf}"
+    );
+
+    // ---------------------------------------------------------------------------
+    // Phase 2 Postgres: start in recovery mode, wait for promotion, assert data.
+    //
+    // Recovery replays archived WAL up to T1, then promotes.
+    // After promotion pg_is_in_recovery() returns false.
+    // ---------------------------------------------------------------------------
+    let phase2_cmd = concat!(
+        "printf '%s\\n' 'huge_pages = try' \"shared_preload_libraries = ''\" ",
+        "  >> /var/lib/postgresql/18/main/postgresql.auto.conf && ",
+        "chown -R postgres:postgres /var/lib/postgresql/18/ && ",
+        "mkdir -p /var/run/postgresql && chown postgres:postgres /var/run/postgresql && ",
+        "gosu postgres postgres -D /var/lib/postgresql/18/main -p 5433 & ",
+        "PG_PID=$! && ",
+        // Poll until promoted (pg_is_in_recovery() = false).
+        "for i in $(seq 60); do ",
+        "  pg_isready -h /var/run/postgresql -p 5433 -q || { sleep 2; continue; }; ",
+        "  REC=$(gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -tAc ",
+        "    'SELECT pg_is_in_recovery()' 2>/dev/null); ",
+        "  [ \"$REC\" = \"f\" ] && break; ",
+        "  sleep 2; ",
+        "done && ",
+        // Verify data.
+        "BEFORE=$(gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -tAc ",
+        "  'SELECT count(*) FROM before_pitr') && ",
+        "AFTER_EXISTS=$(gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -tAc ",
+        "  \"SELECT EXISTS(SELECT FROM information_schema.tables WHERE table_name='after_pitr')\") && ",
+        "echo \"BEFORE_COUNT:$BEFORE\" && ",
+        "echo \"AFTER_EXISTS:$AFTER_EXISTS\" && ",
+        "kill $PG_PID && wait $PG_PID 2>/dev/null; ",
+        // Exit 0 only if recovery succeeded: before=10, after doesn't exist.
+        "[ \"$(echo $BEFORE | tr -d ' ')\" = \"10\" ] && [ \"$(echo $AFTER_EXISTS | tr -d ' ')\" = \"f\" ]",
+    );
+
+    let phase2_out = std::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--platform",
+            platform,
+            "--user",
+            "root",
+            "-v",
+            &format!("{bin}:/usr/local/bin/beyond-pg"),
+            "-v",
+            &format!("{aws}:/usr/local/bin/aws"),
+            "-v",
+            &format!("{pg_lib}:/var/lib/postgresql/18"),
+            "-v",
+            &format!("{etc_pg}:/etc/postgresql/18/main"),
+            "-v",
+            &format!("{archive}:/archive"),
+            "-v",
+            &format!("{mmds_path}:/run/mmds/metadata.json"),
+            "postgres:18",
+            "bash",
+            "-c",
+            phase2_cmd,
+        ])
+        .output()
+        .expect("docker run phase 2 postgres");
+
+    eprintln!(
+        "phase2 pg stdout: {}",
+        String::from_utf8_lossy(&phase2_out.stdout)
+    );
+    eprintln!(
+        "phase2 pg stderr: {}",
+        String::from_utf8_lossy(&phase2_out.stderr)
+    );
+    assert!(
+        phase2_out.status.success(),
+        "PITR recovery failed — postgres did not recover to T1={t1}: {}\nstdout: {}",
+        phase2_out.status,
+        String::from_utf8_lossy(&phase2_out.stdout),
+    );
+}
+
+/// Replica `restore_command = 'curl ...'` actually fetches WAL from an HTTP server.
+///
+/// Tests the full curl restore_command chain end-to-end:
+///   1. Boot as primary; start Postgres, insert test data, archive WAL via `cp`.
+///   2. Add `standby.signal`, delete WAL files (forces restore_command use).
+///   3. Boot as replica with `BEYOND_PG_WAL_SINK=http://127.0.0.1:9997` — beyond-pg
+///      writes `04-replica.conf` containing `restore_command = 'curl ... 127.0.0.1:9997/%f ...'`.
+///   4. In a single container: start Python HTTP server on 9997 serving the archive,
+///      start Postgres in recovery mode, wait for WAL application, promote, verify data.
+///
+/// Proves that the `restore_command` generated by `config::replica_conf()` is not
+/// only syntactically correct but that Postgres can actually use it to recover WAL.
+#[test]
+#[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
+fn boot_replica_restore_command_curl() {
+    let _guard = DOCKER.lock().unwrap();
+    let Some((binary, platform)) = build_linux_beyond_pg() else {
+        return;
+    };
+    let env = BootEnv::new();
+
+    let archive_dir = tempfile::tempdir().expect("archive tmpdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(archive_dir.path(), std::fs::Permissions::from_mode(0o777))
+            .expect("chmod archive dir");
+    }
+
+    let archive = archive_dir.path().display().to_string();
+    let bin = binary.display().to_string();
+    let pg_lib = env.pg_lib.path().display().to_string();
+    let etc_pg = env.etc_pg.path().display().to_string();
+
+    // -------------------------------------------------------------------------
+    // Phase 1: beyond-pg boot (primary mode, no WAL sink configured)
+    // -------------------------------------------------------------------------
+    let boot1 = env.run_boot(&binary, platform, &mmds(&[]));
+    eprintln!("boot1 stderr: {}", String::from_utf8_lossy(&boot1.stderr));
+    assert!(
+        boot1.status.success(),
+        "phase 1 boot failed: {}",
+        boot1.status
+    );
+
+    // -------------------------------------------------------------------------
+    // Phase 1 Postgres: configure archiving, insert data, force WAL archive, stop.
+    //
+    // archive_command writes segments to /archive (bind-mounted from host).
+    // pg_switch_wal() flushes the current segment to the archive.
+    // -------------------------------------------------------------------------
+    let phase1_cmd = concat!(
+        "printf '%s\\n' 'huge_pages = try' 'archive_mode = on' ",
+        "  \"archive_command = 'cp %p /archive/%f'\" ",
+        "  \"shared_preload_libraries = ''\" ",
+        "  >> /var/lib/postgresql/18/main/postgresql.auto.conf && ",
+        "chown -R postgres:postgres /var/lib/postgresql/18/ && ",
+        "mkdir -p /var/run/postgresql && chown postgres:postgres /var/run/postgresql && ",
+        "gosu postgres postgres -D /var/lib/postgresql/18/main -p 5433 & ",
+        "PG_PID=$! && ",
+        "for i in $(seq 30); do pg_isready -h /var/run/postgresql -p 5433 -q && break; sleep 1; done && ",
+        "gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -c ",
+        "  'CREATE TABLE curl_test (n int); INSERT INTO curl_test SELECT generate_series(1,10)' && ",
+        "gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -c 'SELECT pg_switch_wal()' && ",
+        "sleep 4 && ",
+        "kill $PG_PID && wait $PG_PID 2>/dev/null; true",
+    );
+    let phase1_out = std::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--platform",
+            platform,
+            "--user",
+            "root",
+            "-v",
+            &format!("{bin}:/usr/local/bin/beyond-pg"),
+            "-v",
+            &format!("{pg_lib}:/var/lib/postgresql/18"),
+            "-v",
+            &format!("{etc_pg}:/etc/postgresql/18/main"),
+            "-v",
+            &format!("{archive}:/archive"),
+            "postgres:18",
+            "bash",
+            "-c",
+            phase1_cmd,
+        ])
+        .output()
+        .expect("docker run phase 1 postgres");
+    eprintln!(
+        "phase1 stderr: {}",
+        String::from_utf8_lossy(&phase1_out.stderr)
+    );
+    assert!(
+        phase1_out.status.success(),
+        "phase 1 postgres failed: {}\nstderr: {}",
+        phase1_out.status,
+        String::from_utf8_lossy(&phase1_out.stderr),
+    );
+
+    let archived: Vec<_> = std::fs::read_dir(archive_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().len() == 24)
+        .collect();
+    assert!(
+        !archived.is_empty(),
+        "no 24-char WAL segments in archive — archive_command may have failed"
+    );
+
+    // -------------------------------------------------------------------------
+    // Setup: add standby.signal to PGDATA. Delete only the archived WAL segments
+    // from pg_wal/ — this forces restore_command (curl) to fetch them, while
+    // preserving the segment started after pg_switch_wal() that holds the
+    // shutdown checkpoint (not yet in archive, required for recovery to start).
+    // -------------------------------------------------------------------------
+    std::fs::write(env.pgdata().join("standby.signal"), b"").unwrap();
+    {
+        let wal_dir = env.pg_lib.path().join("wal");
+        let archived_names: std::collections::HashSet<_> =
+            archived.iter().map(|e| e.file_name()).collect();
+        for entry in std::fs::read_dir(&wal_dir).unwrap().filter_map(|e| e.ok()) {
+            if archived_names.contains(&entry.file_name()) {
+                std::fs::remove_file(entry.path()).ok();
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 2: beyond-pg boot (replica mode, WAL sink = http://127.0.0.1:9997).
+    //
+    // beyond-pg sees PG_VERSION + standby.signal → skips pg_basebackup.
+    // Writes 04-replica.conf with restore_command = 'curl -f -s http://127.0.0.1:9997/%f -o %p'.
+    // -------------------------------------------------------------------------
+    let boot2 = env.run_boot(
+        &binary,
+        platform,
+        &mmds(&[
+            ("BEYOND_PG_TIER", "replica"),
+            (
+                "BEYOND_PG_PRIMARY_CONNINFO",
+                "host=127.0.0.1 port=9999 user=replicator connect_timeout=1",
+            ),
+            ("BEYOND_PG_WAL_SINK", "http://127.0.0.1:9997"),
+        ]),
+    );
+    eprintln!("boot2 stderr: {}", String::from_utf8_lossy(&boot2.stderr));
+    assert!(
+        boot2.status.success(),
+        "phase 2 boot failed: {}",
+        boot2.status
+    );
+
+    let replica_conf_path = env.pgdata().join("conf.d/04-replica.conf");
+    assert!(
+        replica_conf_path.exists(),
+        "04-replica.conf not written by replica boot"
+    );
+    let replica_conf = std::fs::read_to_string(&replica_conf_path).unwrap();
+    assert!(
+        replica_conf.contains("restore_command = 'curl -f -s http://127.0.0.1:9997/%f -o %p'"),
+        "curl restore_command not found in 04-replica.conf: {replica_conf}"
+    );
+
+    // -------------------------------------------------------------------------
+    // Phase 2 Postgres: Python HTTP server + replica Postgres + promote + verify.
+    //
+    // Python HTTP server on port 9997 serves /archive (the archived WAL).
+    // Postgres starts in standby mode; primary_conninfo points at nothing (fails fast).
+    // restore_command = 'curl ...' fetches WAL segments from the Python server.
+    // After 10 s of recovery, pg_ctl promote promotes the standby.
+    // -------------------------------------------------------------------------
+    let phase2_cmd = concat!(
+        // Install curl if missing (postgres:18 base may not include it)
+        "which curl 2>/dev/null || (apt-get update -qq && apt-get install -y curl -qq) && ",
+        // Start Python HTTP server serving the WAL archive
+        "python3 -m http.server 9997 --directory /archive & ",
+        "sleep 1 && ",
+        // Postgres-specific test overrides
+        "printf '%s\\n' 'huge_pages = try' \"shared_preload_libraries = ''\" ",
+        "  >> /var/lib/postgresql/18/main/postgresql.auto.conf && ",
+        "chown -R postgres:postgres /var/lib/postgresql/18/ && ",
+        "mkdir -p /var/run/postgresql && chown postgres:postgres /var/run/postgresql && ",
+        // Start Postgres in standby/recovery mode
+        "gosu postgres postgres -D /var/lib/postgresql/18/main -p 5433 & ",
+        "PG_PID=$! && ",
+        // Wait for Postgres to start (standby mode still accepts pg_isready)
+        "for i in $(seq 60); do pg_isready -h /var/run/postgresql -p 5433 -q && break; sleep 1; done && ",
+        // Wait for WAL application via curl restore_command
+        "sleep 10 && ",
+        // Promote to primary (-w waits for promotion to complete)
+        "gosu postgres pg_ctl promote -D /var/lib/postgresql/18/main -w -t 30 && ",
+        // Confirm pg_is_in_recovery() = false
+        "for i in $(seq 30); do ",
+        "  REC=$(gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -tAc ",
+        "    'SELECT pg_is_in_recovery()' 2>/dev/null); ",
+        "  [ \"$REC\" = \"f\" ] && break; sleep 1; ",
+        "done && ",
+        // Verify test data was recovered via curl restore_command
+        "COUNT=$(gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -tAc ",
+        "  'SELECT count(*) FROM curl_test' | tr -d ' ') && ",
+        "echo \"curl_test count: $COUNT\" && ",
+        "kill $PG_PID && wait $PG_PID 2>/dev/null; true && ",
+        "[ \"$COUNT\" = \"10\" ]",
+    );
+    let phase2_out = std::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--platform",
+            platform,
+            "--user",
+            "root",
+            "-v",
+            &format!("{bin}:/usr/local/bin/beyond-pg"),
+            "-v",
+            &format!("{pg_lib}:/var/lib/postgresql/18"),
+            "-v",
+            &format!("{etc_pg}:/etc/postgresql/18/main"),
+            "-v",
+            &format!("{archive}:/archive"),
+            "postgres:18",
+            "bash",
+            "-c",
+            phase2_cmd,
+        ])
+        .output()
+        .expect("docker run phase 2 postgres");
+    eprintln!(
+        "phase2 stdout: {}",
+        String::from_utf8_lossy(&phase2_out.stdout)
+    );
+    eprintln!(
+        "phase2 stderr: {}",
+        String::from_utf8_lossy(&phase2_out.stderr)
+    );
+    assert!(
+        phase2_out.status.success(),
+        "curl restore_command recovery failed: {}\nstdout: {}\nstderr: {}",
+        phase2_out.status,
+        String::from_utf8_lossy(&phase2_out.stdout),
+        String::from_utf8_lossy(&phase2_out.stderr),
+    );
+}
+
 /// `pg::basebackup()` actually runs pg_basebackup against a live primary.
 ///
 /// Steps:

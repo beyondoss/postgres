@@ -213,6 +213,13 @@ fn pg_reader_thread(
                     send_status(&mut conn, write_lsn, flush_lsn)?;
                     last_status = std::time::Instant::now();
                 }
+                // Exit if the async pump loop has been dropped (task cancelled or
+                // supervisor shut down).  Without this check the blocking thread loops
+                // on keepalives indefinitely, preventing the tokio runtime from
+                // completing its shutdown and causing a SIGKILL instead of a clean exit.
+                if wal_tx.is_closed() {
+                    return Ok(());
+                }
             }
             Err(RecvError::Io(e))
                 if e.kind() == std::io::ErrorKind::TimedOut
@@ -220,6 +227,9 @@ fn pg_reader_thread(
             {
                 send_status(&mut conn, write_lsn, flush_lsn)?;
                 last_status = std::time::Instant::now();
+                if wal_tx.is_closed() {
+                    return Ok(());
+                }
             }
             Err(e) => return Err(e),
         }

@@ -132,6 +132,10 @@ mod linux {
 
     fn read_cmdline_ipv6() -> Option<(String, u8, String)> {
         let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+        parse_cmdline_ipv6(&cmdline)
+    }
+
+    fn parse_cmdline_ipv6(cmdline: &str) -> Option<(String, u8, String)> {
         let param = cmdline
             .split_whitespace()
             .find(|s| s.starts_with("ipv6="))?
@@ -150,6 +154,10 @@ mod linux {
 
     fn read_cmdline_ipv6_ext() -> Option<String> {
         let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+        parse_cmdline_ipv6_ext(&cmdline)
+    }
+
+    fn parse_cmdline_ipv6_ext(cmdline: &str) -> Option<String> {
         let param = cmdline
             .split_whitespace()
             .find(|s| s.starts_with("ipv6_ext="))?
@@ -164,6 +172,10 @@ mod linux {
 
     fn read_cmdline_gateway() -> Option<String> {
         let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+        parse_cmdline_gateway(&cmdline)
+    }
+
+    fn parse_cmdline_gateway(cmdline: &str) -> Option<String> {
         let ip_param = cmdline
             .split_whitespace()
             .find(|s| s.starts_with("ip="))?
@@ -354,5 +366,95 @@ mod linux {
             }
         }
         None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parse_cmdline_ipv6_full_param() {
+            let cmdline = "console=ttyS0 ipv6=2001:db8::1/64@2001:db8::fe00 quiet";
+            let (addr, prefix, gw) = parse_cmdline_ipv6(cmdline).unwrap();
+            assert_eq!(addr, "2001:db8::1");
+            assert_eq!(prefix, 64u8);
+            assert_eq!(gw, "2001:db8::fe00");
+        }
+
+        #[test]
+        fn parse_cmdline_ipv6_absent_returns_none() {
+            assert!(parse_cmdline_ipv6("console=ttyS0 quiet").is_none());
+        }
+
+        #[test]
+        fn parse_cmdline_ipv6_empty_gateway_returns_none() {
+            assert!(parse_cmdline_ipv6("ipv6=2001:db8::1/64@").is_none());
+        }
+
+        #[test]
+        fn parse_cmdline_ipv6_ext_present() {
+            let cmdline = "console=ttyS0 ipv6_ext=2001:db8::42/128 quiet";
+            assert_eq!(
+                parse_cmdline_ipv6_ext(cmdline),
+                Some("2001:db8::42".to_string())
+            );
+        }
+
+        #[test]
+        fn parse_cmdline_ipv6_ext_absent_returns_none() {
+            assert!(parse_cmdline_ipv6_ext("console=ttyS0").is_none());
+        }
+
+        #[test]
+        fn parse_cmdline_gateway_present() {
+            // ip=client:server:gateway:netmask:hostname:iface:autoconf
+            let cmdline = "console=ttyS0 ip=10.0.0.2::10.0.0.1:255.255.255.0:vm:eth0:off";
+            assert_eq!(parse_cmdline_gateway(cmdline), Some("10.0.0.1".to_string()));
+        }
+
+        #[test]
+        fn parse_cmdline_gateway_absent_returns_none() {
+            assert!(parse_cmdline_gateway("console=ttyS0").is_none());
+        }
+
+        #[test]
+        fn parse_cmdline_gateway_empty_field_returns_none() {
+            let cmdline = "ip=10.0.0.2:::255.255.255.0:vm:eth0:off";
+            assert!(parse_cmdline_gateway(cmdline).is_none());
+        }
+
+        #[test]
+        fn http_status_200() {
+            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+            assert_eq!(http_status(resp), Some(200));
+        }
+
+        #[test]
+        fn http_status_404() {
+            let resp = b"HTTP/1.1 404 Not Found\r\n\r\n";
+            assert_eq!(http_status(resp), Some(404));
+        }
+
+        #[test]
+        fn http_status_malformed_returns_none() {
+            assert_eq!(http_status(b"not http"), None);
+        }
+
+        #[test]
+        fn http_body_extracts_content() {
+            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+            assert_eq!(http_body(resp), Some("hello"));
+        }
+
+        #[test]
+        fn http_body_empty_body_returns_some_empty() {
+            let resp = b"HTTP/1.1 200 OK\r\n\r\n";
+            assert_eq!(http_body(resp), Some(""));
+        }
+
+        #[test]
+        fn http_body_no_separator_returns_none() {
+            assert_eq!(http_body(b"HTTP/1.1 200 OK"), None);
+        }
     }
 }

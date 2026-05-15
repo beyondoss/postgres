@@ -339,6 +339,30 @@ mod tests {
     }
 
     #[test]
+    fn hugepages_nr_calculation() {
+        // nr_hugepages = shared_buffers_mb / 2 + 32
+        // shared_buffers_mb = (ram_bytes / (1024*1024) / 4).max(128)
+
+        // 4 GB → shared_buffers = 1024 MB → nr = 544
+        let ram = 4u64 * 1024 * 1024 * 1024;
+        let sb = (ram / (1024 * 1024) / 4).max(128);
+        assert_eq!(sb, 1024);
+        assert_eq!(sb / 2 + 32, 544);
+
+        // 512 MB → clamped to 128 MB → nr = 96
+        let ram = 512u64 * 1024 * 1024;
+        let sb = (ram / (1024 * 1024) / 4).max(128);
+        assert_eq!(sb, 128);
+        assert_eq!(sb / 2 + 32, 96);
+
+        // 16 GB → shared_buffers = 4096 MB → nr = 2080
+        let ram = 16u64 * 1024 * 1024 * 1024;
+        let sb = (ram / (1024 * 1024) / 4).max(128);
+        assert_eq!(sb, 4096);
+        assert_eq!(sb / 2 + 32, 2080);
+    }
+
+    #[test]
     fn pitr_config_written_when_archive_target_set() {
         let pgdata = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(pgdata.path().join("conf.d")).unwrap();
@@ -433,6 +457,82 @@ mod tests {
             !pgdata.path().join("recovery.signal").exists(),
             "recovery.signal must not be created without archive_target"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // run_hook_scripts unit tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn hook_missing_dir_returns_ok() {
+        let result = run_hook_scripts("/nonexistent/beyond-pg-hook-test-dir").await;
+        assert!(result.is_ok(), "missing dir should not error: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn hook_scripts_run_in_lexicographic_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let order_file = tempfile::NamedTempFile::new().unwrap();
+        let order_path = order_file.path().display().to_string();
+
+        for (name, letter) in [("20-z.sh", "z"), ("10-a.sh", "a"), ("15-m.sh", "m")] {
+            let script = format!("#!/bin/sh\necho {} >> {order_path}\n", letter);
+            let path = dir.path().join(name);
+            std::fs::write(&path, &script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        run_hook_scripts(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let output = std::fs::read_to_string(order_file.path()).unwrap();
+        let letters: Vec<&str> = output.lines().collect();
+        assert_eq!(
+            letters,
+            ["a", "m", "z"],
+            "scripts not run in lexicographic order: {letters:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_non_executable_files_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+
+        // Non-executable script that would fail if run.
+        let fail_path = dir.path().join("01-would-fail.sh");
+        std::fs::write(&fail_path, "#!/bin/sh\nexit 1\n").unwrap();
+        // Explicitly leave permissions at the default (non-executable).
+
+        // Executable script that creates the marker — should run.
+        let ok_path = dir.path().join("02-ok.sh");
+        std::fs::write(&ok_path, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        std::fs::set_permissions(&ok_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        run_hook_scripts(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "02-ok.sh should have run and created the marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_nonzero_exit_returns_hook_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("01-fail.sh");
+        std::fs::write(&path, "#!/bin/sh\nexit 42\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = run_hook_scripts(dir.path().to_str().unwrap()).await;
+        match result {
+            Err(BootError::HookFailed { code, .. }) => {
+                assert_eq!(code, 42, "expected exit code 42, got {code}");
+            }
+            other => panic!("expected HookFailed, got {other:?}"),
+        }
     }
 
     #[test]
