@@ -1914,6 +1914,16 @@ fn replica_recovers_via_archive() {
     let replica_port = probe.local_addr().unwrap().port();
     drop(probe);
 
+    let chmod_out = std::process::Command::new("chmod")
+        .args(["-R", "a+rX", &sink_dir_str])
+        .output()
+        .expect("chmod sink_dir");
+    assert!(
+        chmod_out.status.success(),
+        "chmod sink_dir: {}",
+        String::from_utf8_lossy(&chmod_out.stderr)
+    );
+
     let start_out = std::process::Command::new("docker")
         .args([
             "run",
@@ -2604,6 +2614,16 @@ fn sink_crash_mid_write() {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let replica_port = probe.local_addr().unwrap().port();
     drop(probe);
+
+    let chmod_out = std::process::Command::new("chmod")
+        .args(["-R", "a+rX", &sink_dir_str])
+        .output()
+        .expect("chmod sink_dir");
+    assert!(
+        chmod_out.status.success(),
+        "chmod sink_dir: {}",
+        String::from_utf8_lossy(&chmod_out.stderr)
+    );
 
     let start_out = std::process::Command::new("docker")
         .args([
@@ -3310,6 +3330,16 @@ fn timeline_boundary_survives_failover() {
     let r1_port = probe.local_addr().unwrap().port();
     drop(probe);
 
+    let chmod_out = std::process::Command::new("chmod")
+        .args(["-R", "a+rX", &sink_dir_str])
+        .output()
+        .expect("chmod sink_dir");
+    assert!(
+        chmod_out.status.success(),
+        "chmod sink_dir: {}",
+        String::from_utf8_lossy(&chmod_out.stderr)
+    );
+
     let r1_start = std::process::Command::new("docker")
         .args([
             "run",
@@ -3546,6 +3576,16 @@ fn timeline_boundary_survives_failover() {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let r2_port = probe.local_addr().unwrap().port();
     drop(probe);
+
+    let chmod_out = std::process::Command::new("chmod")
+        .args(["-R", "a+rX", &sink_dir_str])
+        .output()
+        .expect("chmod sink_dir");
+    assert!(
+        chmod_out.status.success(),
+        "chmod sink_dir: {}",
+        String::from_utf8_lossy(&chmod_out.stderr)
+    );
 
     let r2_start = std::process::Command::new("docker")
         .args([
