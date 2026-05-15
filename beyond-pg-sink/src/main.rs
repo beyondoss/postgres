@@ -471,8 +471,9 @@ fn parse_connstr_to_receiver_config(
     let mut host = "127.0.0.1".to_owned();
     let mut port: u16 = 5432;
     let mut user = "postgres".to_owned();
+    let mut password: Option<String> = None;
 
-    // Handle URI form: postgres://user@host:port/db
+    // Handle URI form: postgres://user[:password]@host:port/db
     for prefix in ["postgresql://", "postgres://"] {
         if let Some(rest) = connstr.strip_prefix(prefix) {
             let rest = rest.split('/').next().unwrap_or(rest); // strip /db
@@ -482,8 +483,12 @@ fn parse_connstr_to_receiver_config(
                 ("", rest)
             };
             if !userinfo.is_empty() {
-                // user or user:password
-                user = userinfo.split(':').next().unwrap_or("postgres").to_owned();
+                if let Some(colon) = userinfo.find(':') {
+                    user = userinfo[..colon].to_owned();
+                    password = Some(userinfo[colon + 1..].to_owned());
+                } else {
+                    user = userinfo.to_owned();
+                }
             }
             if let Some(bracket_end) = hostport.find(']') {
                 // IPv6 literal [::1]:port
@@ -515,6 +520,7 @@ fn parse_connstr_to_receiver_config(
                 "host" => host = value,
                 "port" => port = value.parse().unwrap_or(5432),
                 "user" => user = value,
+                "password" => password = Some(value),
                 _ => {}
             }
         }
@@ -524,7 +530,7 @@ fn parse_connstr_to_receiver_config(
         host,
         port,
         user,
-        password: None,
+        password,
         slot: slot.to_owned(),
         dir: std::path::PathBuf::from(dir),
         status_interval: Duration::from_secs(10),
