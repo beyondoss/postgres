@@ -1737,18 +1737,16 @@ fn replica_recovers_via_archive() {
 
     let pg_port = primary.get_host_port_ipv4(5432).unwrap();
     let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
-    let mut primary_client =
-        postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect to primary");
-    allow_replication(&mut primary_client);
 
+    // Connect the container to the test network before opening any postgres
+    // connection. This avoids the iptables disruption that docker network
+    // connect causes on already-established TCP connections.
     let out = std::process::Command::new("docker")
         .args(["network", "connect", &net_name, primary.id()])
         .output()
         .expect("network connect primary");
     assert!(out.status.success());
-    // docker network connect reconfigures iptables on the host, which can
-    // briefly reset established TCP connections and leave the port
-    // temporarily unreachable. Retry until the port is back (≤10s).
+
     let mut primary_client = {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1757,10 +1755,11 @@ fn replica_recovers_via_archive() {
                 Err(_) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                Err(e) => panic!("reconnect primary_client: {e}"),
+                Err(e) => panic!("connect primary_client: {e}"),
             }
         }
     };
+    allow_replication(&mut primary_client);
 
     // Resolve primary's container-internal IP (for pg_basebackup container).
     let template = format!(
@@ -2447,17 +2446,13 @@ fn sink_crash_mid_write() {
         .expect("docker not available or postgres:18 pull failed");
     let pg_port = primary.get_host_port_ipv4(5432).unwrap();
     let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
-    let mut primary_client = postgres::Client::connect(&pg_url, postgres::NoTls).unwrap();
-    allow_replication(&mut primary_client);
 
     let out = std::process::Command::new("docker")
         .args(["network", "connect", &net_name, primary.id()])
         .output()
         .expect("network connect");
     assert!(out.status.success());
-    // docker network connect reconfigures iptables on the host, which can
-    // briefly reset established TCP connections and leave the port
-    // temporarily unreachable. Retry until the port is back (≤10s).
+
     let mut primary_client = {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -2466,10 +2461,11 @@ fn sink_crash_mid_write() {
                 Err(_) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                Err(e) => panic!("reconnect primary_client: {e}"),
+                Err(e) => panic!("connect primary_client: {e}"),
             }
         }
     };
+    allow_replication(&mut primary_client);
 
     let primary_ip = {
         let tpl = format!(
@@ -2886,17 +2882,13 @@ fn wal_gap_stalls_replica() {
         .expect("docker not available or postgres:18 pull failed");
     let pg_port = primary.get_host_port_ipv4(5432).unwrap();
     let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
-    let mut primary_client = postgres::Client::connect(&pg_url, postgres::NoTls).unwrap();
-    allow_replication(&mut primary_client);
 
     let out = std::process::Command::new("docker")
         .args(["network", "connect", &net_name, primary.id()])
         .output()
         .expect("network connect");
     assert!(out.status.success());
-    // docker network connect reconfigures iptables on the host, which can
-    // briefly reset established TCP connections and leave the port
-    // temporarily unreachable. Retry until the port is back (≤10s).
+
     let mut primary_client = {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -2905,10 +2897,11 @@ fn wal_gap_stalls_replica() {
                 Err(_) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                Err(e) => panic!("reconnect primary_client: {e}"),
+                Err(e) => panic!("connect primary_client: {e}"),
             }
         }
     };
+    allow_replication(&mut primary_client);
 
     let primary_ip = {
         let tpl = format!(
@@ -3352,17 +3345,13 @@ fn timeline_boundary_survives_failover() {
         .expect("docker not available or postgres:18 pull failed");
     let pg_port = primary.get_host_port_ipv4(5432).unwrap();
     let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
-    let mut t1_client = postgres::Client::connect(&pg_url, postgres::NoTls).unwrap();
-    allow_replication(&mut t1_client);
 
     let out = std::process::Command::new("docker")
         .args(["network", "connect", &net_name, primary.id()])
         .output()
         .expect("network connect");
     assert!(out.status.success());
-    // docker network connect reconfigures iptables on the host, which can
-    // briefly reset established TCP connections and leave the port
-    // temporarily unreachable. Retry until the port is back (≤10s).
+
     let mut t1_client = {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -3371,10 +3360,11 @@ fn timeline_boundary_survives_failover() {
                 Err(_) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                Err(e) => panic!("reconnect t1_client: {e}"),
+                Err(e) => panic!("connect t1_client: {e}"),
             }
         }
     };
+    allow_replication(&mut t1_client);
     let primary_ip = container_ip(primary.id(), &net_name);
 
     // ── 2. sink on host ───────────────────────────────────────────────────────
