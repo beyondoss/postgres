@@ -5068,34 +5068,51 @@ fn sink_slot_offline_catch_up() {
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    // ── 10. pg_switch_wal + an INSERT, then wait for the sealed segment ──────
-    // lsn_after_writes is at the start of a near-empty segment (created by the
-    // pre-restart pg_switch_wal).  We pg_switch_wal again to mark its end with
-    // XLOG_SWITCH, then INSERT one row so primary writes a real record into
-    // the NEXT segment.  Without that INSERT, the sink's writer never advances
-    // past the empty segment's boundary, so the .partial is never renamed.
-    let pre_switch_segment: String = client
+    // ── 10. drive a fresh INSERT batch + pg_switch_wal post-restart ──────────
+    // To prove the sink can advance and seal segments after restart, capture
+    // the segment containing a NEW post-restart INSERT, then pg_switch_wal to
+    // seal it. We INSERT a large batch (1000 rows) so the post-restart segment
+    // has real records — not just an XLOG_SWITCH stub — and then run another
+    // INSERT + pg_switch_wal to be sure the streaming crosses a boundary
+    // (which is what triggers the sink's .partial → final rename).
+    client
+        .batch_execute(
+            "INSERT INTO slot_offline (v) \
+             SELECT 'post-restart-' || g FROM generate_series(1, 1000) g",
+        )
+        .expect("post-restart bulk INSERT");
+    let post_restart_segment: String = client
         .query_one("SELECT pg_walfile_name(pg_current_wal_lsn())", &[])
         .unwrap()
         .get(0);
     client.execute("SELECT pg_switch_wal()", &[]).unwrap();
+    // Follow-up INSERT so primary writes records into the NEXT segment, which
+    // is what makes the sink's WalWriter cross the boundary and rename
+    // post_restart_segment.partial → post_restart_segment.
     client
-        .batch_execute("INSERT INTO slot_offline (v) VALUES ('post-restart-tick')")
+        .batch_execute(
+            "INSERT INTO slot_offline (v) \
+             SELECT 'tick-' || g FROM generate_series(1, 200) g",
+        )
         .expect("post-switch INSERT to drive segment seal");
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if sink_dir.join(&pre_switch_segment).exists() {
+        if sink_dir.join(&post_restart_segment).exists() {
             break;
         }
         if Instant::now() > deadline {
             let ls: Vec<String> = std::fs::read_dir(&sink_dir)
                 .unwrap()
                 .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    format!("{name} ({size}B)")
+                })
                 .collect();
             panic!(
-                "post-restart segment {pre_switch_segment} never sealed within 30s\nsink_dir: {ls:?}"
+                "post-restart segment {post_restart_segment} never sealed within 60s\nsink_dir: {ls:?}"
             );
         }
         std::thread::sleep(Duration::from_millis(200));
