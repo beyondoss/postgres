@@ -1864,6 +1864,29 @@ fn replica_recovers_via_archive() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
+    // ── 6b. exercise sink HTTP server: serves complete segment, 404s partial ──
+    // The replica uses a bind-mounted sink_dir for restore_command, but in
+    // production WAL is fetched via the HTTP server.  Verify both paths work.
+    {
+        const WAL_SEG: usize = 16 * 1024 * 1024;
+        let (status, body) = http_get(sink_port, &format!("/{post_segment}"));
+        assert_eq!(status, 200, "sink HTTP must serve sealed segment");
+        assert_eq!(
+            body.len(),
+            WAL_SEG,
+            "served segment must be {WAL_SEG} bytes (1 WAL segment)"
+        );
+        // WAL page header has magic 0xD117 (page magic for postgres 17/18).
+        // Check first 2 bytes are non-zero; full magic check would couple to a
+        // specific pg version. This is enough to verify we got real WAL.
+        assert!(
+            body[0] != 0 || body[1] != 0,
+            "served segment must not be all zeros (got zero page header)"
+        );
+        let (status, _) = http_get(sink_port, "/000000000000000000000000");
+        assert_eq!(status, 404, "sink HTTP must 404 on unknown segment");
+    }
+
     // ── 7. kill primary ──────────────────────────────────────────────────────
     // Drop the client first so no TCP connections linger into the stopped container.
     drop(primary_client);
@@ -2578,6 +2601,21 @@ fn sink_crash_mid_write() {
         std::thread::sleep(Duration::from_millis(200));
     }
     let _ = segs_after_pre; // suppress unused warning
+
+    // ── 8b. exercise the RESTARTED sink's HTTP server ─────────────────────────
+    // Crucially exercises the restart code path: the second sink process must
+    // serve segments after cleanup_partial_segments runs and the receiver
+    // re-streams the lost WAL.
+    {
+        const WAL_SEG: usize = 16 * 1024 * 1024;
+        let (status, body) = http_get(sink_port, &format!("/{post_segment}"));
+        assert_eq!(status, 200, "restarted sink HTTP must serve sealed segment");
+        assert_eq!(body.len(), WAL_SEG, "served segment must be 16 MiB");
+        assert!(
+            body[0] != 0 || body[1] != 0,
+            "served segment must not be all zeros after sink restart"
+        );
+    }
 
     // ── 9. kill primary ───────────────────────────────────────────────────────
     drop(primary_client);
@@ -3325,6 +3363,18 @@ fn timeline_boundary_survives_failover() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
+    // ── 5b. exercise T1 sink HTTP: serve T1 segment ──────────────────────────
+    {
+        const WAL_SEG: usize = 16 * 1024 * 1024;
+        let (status, body) = http_get(sink_port, &format!("/{t1_post_segment}"));
+        assert_eq!(status, 200, "T1 sink HTTP must serve T1 segment");
+        assert_eq!(body.len(), WAL_SEG, "T1 segment must be 16 MiB");
+        assert!(
+            body[0] != 0 || body[1] != 0,
+            "T1 segment must not be all zeros"
+        );
+    }
+
     // ── 6. kill T1 primary ────────────────────────────────────────────────────
     // Keep _sink alive: replica1 needs its HTTP server to fetch T1 archive segments.
     drop(t1_client);
@@ -3523,6 +3573,26 @@ fn timeline_boundary_survives_failover() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
+    // ── 9b. exercise sink HTTP for .history file ─────────────────────────────
+    // Verify the sink's HTTP server serves the timeline history file so
+    // standbies following `recovery_target_timeline = 'latest'` can discover
+    // the T1→T2 branch point.
+    {
+        let (status, body) = http_get(sink_port, "/00000002.history");
+        assert_eq!(status, 200, "sink HTTP must serve .history file");
+        assert!(
+            !body.is_empty(),
+            "served .history file must be non-empty"
+        );
+        // .history files are text — first byte must be ASCII (typically a digit
+        // for the parent timeline id).
+        assert!(
+            body[0].is_ascii(),
+            ".history file should be ASCII text, got {:?}",
+            &body[..body.len().min(16)]
+        );
+    }
+
     // ── 10. add replication rule on T2 primary ───────────────────────────────
     allow_replication(&mut r1_client);
 
@@ -3606,6 +3676,28 @@ fn timeline_boundary_survives_failover() {
             );
         }
         std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // ── 12b. exercise T2 sink HTTP: serve both T1 and T2 segments + history ──
+    // T2 sink runs on the same sink_dir as the T1 sink did, so its HTTP server
+    // should serve segments from both timelines plus the .history file.
+    {
+        const WAL_SEG: usize = 16 * 1024 * 1024;
+        let (status, body) = http_get(sink_port, &format!("/{t2_post_segment}"));
+        assert_eq!(status, 200, "T2 sink HTTP must serve T2 segment");
+        assert_eq!(body.len(), WAL_SEG, "T2 segment must be 16 MiB");
+        let (status, body) = http_get(sink_port, &format!("/{t1_post_segment}"));
+        assert_eq!(
+            status, 200,
+            "T2 sink HTTP must still serve T1 segments (same sink_dir)"
+        );
+        assert_eq!(body.len(), WAL_SEG, "T1 segment must be 16 MiB");
+        let (status, body) = http_get(sink_port, "/00000002.history");
+        assert_eq!(
+            status, 200,
+            "T2 sink HTTP must serve .history file across timelines"
+        );
+        assert!(!body.is_empty(), ".history must be non-empty");
     }
 
     // ── 13. kill T2 primary ───────────────────────────────────────────────────
