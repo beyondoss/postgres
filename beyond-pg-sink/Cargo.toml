@@ -32,4 +32,5 @@ libc = "0.2"
 
 [dev-dependencies]
 postgres = "0.19"
+tempfile = "3"
 testcontainers-modules = { version = "0.15", features = ["blocking", "postgres"] }

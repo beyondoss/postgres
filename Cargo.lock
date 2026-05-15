@@ -295,6 +295,7 @@ dependencies = [
  "quinn-proto",
  "rcgen",
  "rustls",
+ "tempfile",
  "testcontainers-modules",
  "wal-proto",
 ]
