@@ -200,9 +200,18 @@ fn set_permissions_and_ownership(cert_path: &Path, key_path: &Path) -> Result<()
 
 /// `chown postgres:postgres` on the cert files. The `postgres` OS user must
 /// exist; its absence means a misbuilt image.
+///
+/// Silently skips when not running as root — chown requires CAP_CHOWN and
+/// beyond-pg always runs as root in production containers, but tests and
+/// local dev do not.
 #[cfg(target_os = "linux")]
 fn chown_postgres(cert_path: &Path, key_path: &Path) -> Result<(), TlsError> {
     use std::ffi::CString;
+
+    // SAFETY: geteuid() is always safe to call.
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
 
     let username = CString::new("postgres").expect("static string is valid");
     // SAFETY: getpwnam is thread-safe when called before any threads are
