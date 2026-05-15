@@ -1719,8 +1719,8 @@ fn replica_recovers_via_archive() {
     allow_replication(&mut primary_client);
 
     // ── 2. start sink on host ───────────────────────────────────────────────
-    // Sink binds to 0.0.0.0; replica container uses --network=host so it
-    // reaches the sink at 127.0.0.1.
+    // Sink writes WAL segments to sink_dir on the host; the replica container
+    // bind-mounts sink_dir at /mnt/sink (read-only) for restore_command.
     let sink_dir = std::env::temp_dir().join(format!("wal-sink-archive-{pg_port}"));
     std::fs::create_dir_all(&sink_dir).unwrap();
     let sink_dir_str = sink_dir.to_str().unwrap().to_owned();
@@ -1802,13 +1802,13 @@ fn replica_recovers_via_archive() {
         .args([
             "run",
             "--rm",
-            "--network=host",
+            "--add-host=host.docker.internal:host-gateway",
             "-v",
             &format!("{pgdata_str}:/pgdata"),
             "postgres:18",
             "pg_basebackup",
             "-d",
-            &format!("host=127.0.0.1 port={pg_port} user=postgres"),
+            &format!("host=host.docker.internal port={pg_port} user=postgres"),
             "--pgdata",
             "/pgdata",
             "--format=plain",
@@ -1822,32 +1822,6 @@ fn replica_recovers_via_archive() {
         "pg_basebackup: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-
-    // ── 5. write fetch_wal.pl to PGDATA ─────────────────────────────────────
-    // postgres:18 has neither curl nor wget, but Perl + Socket is available.
-    // We write the script to the host-side PGDATA directory (bind-mounted into
-    // the replica container) so Docker has no internet dependency.
-    //
-    // The script opens a raw TCP connection to the sink HTTP server via bash's
-    // /dev/tcp equivalent in Perl (Socket module). Postgres calls it as:
-    //   perl /pgdata/fetch_wal.pl <segment-name> <dest-path>
-    // $| enables autoflush on the *currently selected* filehandle.  We must
-    // select(S) first or the HTTP request sits in Perl's stdio buffer while the
-    // server waits for \r\n\r\n — deadlock.  select(STDOUT) restores the default.
-    let perl_script = format!(
-        "use IO::Socket::INET;\n\
-         ($s,$d)=@ARGV;\n\
-         $sock=IO::Socket::INET->new(PeerAddr=>q(127.0.0.1),PeerPort=>{sink_port},\
-         Proto=>q(tcp),Timeout=>10) or exit 1;\n\
-         $sock->autoflush(1);\n\
-         print $sock \"GET /$s HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n\";\n\
-         $l=<$sock>;exit 1 unless $l=~/200/;\n\
-         while(<$sock>){{last if/^\\r\\n$/}}\n\
-         open(O,\">\",$d)or exit 1;\n\
-         while(read($sock,$b,65536)){{print O $b}}\n\
-         close O;\n"
-    );
-    std::fs::write(pgdata.join("fetch_wal.pl"), perl_script).expect("write fetch_wal.pl to PGDATA");
 
     // ── 6. write rows AFTER basebackup — archive-only recovery needed ───────
 
@@ -1907,10 +1881,10 @@ fn replica_recovers_via_archive() {
     // ── 8. write recovery config: restore_command only, no primary_conninfo ─
     // Run as root so we can write standby.signal and append to postgresql.auto.conf
     // (which is owned by uid 999/postgres from the basebackup).
-    // The replica runs with --network=host so it can reach the sink at
-    // 127.0.0.1 directly (works on both macOS Docker Desktop and Linux runners).
+    // The replica bind-mounts the sink dir at /mnt/sink (read-only), so
+    // restore_command is a simple cp from the local filesystem.
     let setup_script = "touch /pgdata/standby.signal && \
-         echo \"restore_command = 'perl /pgdata/fetch_wal.pl %f %p'\" \
+         echo \"restore_command = 'cp /mnt/sink/%f %p'\" \
            >> /pgdata/postgresql.auto.conf && \
          echo \"recovery_target_timeline = 'latest'\" \
            >> /pgdata/postgresql.auto.conf";
@@ -1944,18 +1918,19 @@ fn replica_recovers_via_archive() {
         .args([
             "run",
             "-d",
-            "--network=host",
             "--user",
             "root",
             "-v",
             &format!("{pgdata_str}:/pgdata"),
+            "-v",
+            &format!("{sink_dir_str}:/mnt/sink:ro"),
+            "-p",
+            &format!("{replica_port}:5432"),
             "postgres:18",
             "bash",
             "-c",
-            &format!(
-                "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
-                 && exec gosu postgres postgres -D /pgdata -c port={replica_port}"
-            ),
+            "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
+             && exec gosu postgres postgres -D /pgdata",
         ])
         .output()
         .expect("docker run archive replica");
@@ -2486,13 +2461,13 @@ fn sink_crash_mid_write() {
         .args([
             "run",
             "--rm",
-            "--network=host",
+            "--add-host=host.docker.internal:host-gateway",
             "-v",
             &format!("{pgdata_str}:/pgdata"),
             "postgres:18",
             "pg_basebackup",
             "-d",
-            &format!("host=127.0.0.1 port={pg_port} user=postgres"),
+            &format!("host=host.docker.internal port={pg_port} user=postgres"),
             "--pgdata",
             "/pgdata",
             "--format=plain",
@@ -2599,23 +2574,8 @@ fn sink_crash_mid_write() {
     drop(primary);
 
     // ── 10. write recovery config ─────────────────────────────────────────────
-    let perl_script = format!(
-        "use IO::Socket::INET;\n\
-         ($s,$d)=@ARGV;\n\
-         $sock=IO::Socket::INET->new(PeerAddr=>q(127.0.0.1),PeerPort=>{sink_port},\
-         Proto=>q(tcp),Timeout=>10) or exit 1;\n\
-         $sock->autoflush(1);\n\
-         print $sock \"GET /$s HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\n\\r\\n\";\n\
-         $l=<$sock>;exit 1 unless $l=~/200/;\n\
-         while(<$sock>){{last if/^\\r\\n$/}}\n\
-         open(O,\">\",$d)or exit 1;\n\
-         while(read($sock,$b,65536)){{print O $b}}\n\
-         close O;\n"
-    );
-    std::fs::write(pgdata.join("fetch_wal.pl"), &perl_script).unwrap();
-
     let setup_script = "touch /pgdata/standby.signal && \
-         echo \"restore_command = 'perl /pgdata/fetch_wal.pl %f %p'\" \
+         echo \"restore_command = 'cp /mnt/sink/%f %p'\" \
            >> /pgdata/postgresql.auto.conf && \
          echo \"recovery_target_timeline = 'latest'\" \
            >> /pgdata/postgresql.auto.conf";
@@ -2649,18 +2609,19 @@ fn sink_crash_mid_write() {
         .args([
             "run",
             "-d",
-            "--network=host",
             "--user",
             "root",
             "-v",
             &format!("{pgdata_str}:/pgdata"),
+            "-v",
+            &format!("{sink_dir_str}:/mnt/sink:ro"),
+            "-p",
+            &format!("{replica_port}:5432"),
             "postgres:18",
             "bash",
             "-c",
-            &format!(
-                "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
-                 && exec gosu postgres postgres -D /pgdata -c port={replica_port}"
-            ),
+            "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
+             && exec gosu postgres postgres -D /pgdata",
         ])
         .output()
         .expect("docker run replica");
@@ -3120,23 +3081,9 @@ fn timeline_boundary_survives_failover() {
     }
 
     fn write_recovery_cfg(pgdata: &std::path::Path, sink_port: u16) {
-        let perl = format!(
-            "use IO::Socket::INET;\n\
-             ($s,$d)=@ARGV;\n\
-             $sock=IO::Socket::INET->new(PeerAddr=>q(127.0.0.1),PeerPort=>{sink_port},\
-             Proto=>q(tcp),Timeout=>10) or exit 1;\n\
-             $sock->autoflush(1);\n\
-             print $sock \"GET /$s HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\n\\r\\n\";\n\
-             $l=<$sock>;exit 1 unless $l=~/200/;\n\
-             while(<$sock>){{last if/^\\r\\n$/}}\n\
-             open(O,\">\",$d)or exit 1;\n\
-             while(read($sock,$b,65536)){{print O $b}}\n\
-             close O;\n"
-        );
-        std::fs::write(pgdata.join("fetch_wal.pl"), &perl).unwrap();
-
+        let _ = sink_port;
         let script = "touch /pgdata/standby.signal && \
-             echo \"restore_command = 'perl /pgdata/fetch_wal.pl %f %p'\" \
+             echo \"restore_command = 'cp /mnt/sink/%f %p'\" \
                >> /pgdata/postgresql.auto.conf && \
              echo \"recovery_target_timeline = 'latest'\" \
                >> /pgdata/postgresql.auto.conf";
@@ -3277,13 +3224,13 @@ fn timeline_boundary_survives_failover() {
         .args([
             "run",
             "--rm",
-            "--network=host",
+            "--add-host=host.docker.internal:host-gateway",
             "-v",
             &format!("{pgdata1_str}:/pgdata"),
             "postgres:18",
             "pg_basebackup",
             "-d",
-            &format!("host=127.0.0.1 port={pg_port} user=postgres"),
+            &format!("host=host.docker.internal port={pg_port} user=postgres"),
             "--pgdata",
             "/pgdata",
             "--format=plain",
@@ -3367,18 +3314,19 @@ fn timeline_boundary_survives_failover() {
         .args([
             "run",
             "-d",
-            "--network=host",
             "--user",
             "root",
             "-v",
             &format!("{pgdata1_str}:/pgdata"),
+            "-v",
+            &format!("{sink_dir_str}:/mnt/sink:ro"),
+            "-p",
+            &format!("{r1_port}:5432"),
             "postgres:18",
             "bash",
             "-c",
-            &format!(
-                "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
-                 && exec gosu postgres postgres -D /pgdata -c port={r1_port}"
-            ),
+            "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
+             && exec gosu postgres postgres -D /pgdata",
         ])
         .output()
         .expect("docker run replica1");
@@ -3603,18 +3551,19 @@ fn timeline_boundary_survives_failover() {
         .args([
             "run",
             "-d",
-            "--network=host",
             "--user",
             "root",
             "-v",
             &format!("{pgdata2_str}:/pgdata"),
+            "-v",
+            &format!("{sink_dir_str}:/mnt/sink:ro"),
+            "-p",
+            &format!("{r2_port}:5432"),
             "postgres:18",
             "bash",
             "-c",
-            &format!(
-                "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
-                 && exec gosu postgres postgres -D /pgdata -c port={r2_port}"
-            ),
+            "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
+             && exec gosu postgres postgres -D /pgdata",
         ])
         .output()
         .expect("docker run replica2");
