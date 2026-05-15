@@ -1719,7 +1719,8 @@ fn replica_recovers_via_archive() {
     allow_replication(&mut primary_client);
 
     // ── 2. start sink on host ───────────────────────────────────────────────
-    // Sink binds to 0.0.0.0, so containers reach it at host.docker.internal.
+    // Sink binds to 0.0.0.0; replica container uses --network=host so it
+    // reaches the sink at 127.0.0.1.
     let sink_dir = std::env::temp_dir().join(format!("wal-sink-archive-{pg_port}"));
     std::fs::create_dir_all(&sink_dir).unwrap();
     let sink_dir_str = sink_dir.to_str().unwrap().to_owned();
@@ -1801,13 +1802,13 @@ fn replica_recovers_via_archive() {
         .args([
             "run",
             "--rm",
-            "--add-host=host.docker.internal:host-gateway",
+            "--network=host",
             "-v",
             &format!("{pgdata_str}:/pgdata"),
             "postgres:18",
             "pg_basebackup",
             "-d",
-            &format!("host=host.docker.internal port={pg_port} user=postgres"),
+            &format!("host=127.0.0.1 port={pg_port} user=postgres"),
             "--pgdata",
             "/pgdata",
             "--format=plain",
@@ -1836,10 +1837,10 @@ fn replica_recovers_via_archive() {
     let perl_script = format!(
         "use IO::Socket::INET;\n\
          ($s,$d)=@ARGV;\n\
-         $sock=IO::Socket::INET->new(PeerAddr=>q(host.docker.internal),PeerPort=>{sink_port},\
+         $sock=IO::Socket::INET->new(PeerAddr=>q(127.0.0.1),PeerPort=>{sink_port},\
          Proto=>q(tcp),Timeout=>10) or exit 1;\n\
          $sock->autoflush(1);\n\
-         print $sock \"GET /$s HTTP/1.0\\r\\nHost: host.docker.internal\\r\\nConnection: close\\r\\n\\r\\n\";\n\
+         print $sock \"GET /$s HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n\";\n\
          $l=<$sock>;exit 1 unless $l=~/200/;\n\
          while(<$sock>){{last if/^\\r\\n$/}}\n\
          open(O,\">\",$d)or exit 1;\n\
@@ -1906,8 +1907,8 @@ fn replica_recovers_via_archive() {
     // ── 8. write recovery config: restore_command only, no primary_conninfo ─
     // Run as root so we can write standby.signal and append to postgresql.auto.conf
     // (which is owned by uid 999/postgres from the basebackup).
-    // host.docker.internal is injected by Docker Desktop on macOS automatically
-    // and by --add-host=host.docker.internal:host-gateway on Linux Docker.
+    // The replica runs with --network=host so it can reach the sink at
+    // 127.0.0.1 directly (works on both macOS Docker Desktop and Linux runners).
     let setup_script = "touch /pgdata/standby.signal && \
          echo \"restore_command = 'perl /pgdata/fetch_wal.pl %f %p'\" \
            >> /pgdata/postgresql.auto.conf && \
@@ -1943,22 +1944,18 @@ fn replica_recovers_via_archive() {
         .args([
             "run",
             "-d",
-            // host-gateway maps host.docker.internal to the Docker host IP.
-            // On macOS Docker Desktop, host.docker.internal is already injected
-            // via DNS so this is redundant but harmless. On Linux Docker, this
-            // is the canonical way to expose it.
-            "--add-host=host.docker.internal:host-gateway",
+            "--network=host",
             "--user",
             "root",
             "-v",
             &format!("{pgdata_str}:/pgdata"),
-            "-p",
-            &format!("{replica_port}:5432"),
             "postgres:18",
             "bash",
             "-c",
-            "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
-             && exec gosu postgres postgres -D /pgdata",
+            &format!(
+                "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
+                 && exec gosu postgres postgres -D /pgdata -c port={replica_port}"
+            ),
         ])
         .output()
         .expect("docker run archive replica");
@@ -2004,7 +2001,43 @@ fn replica_recovers_via_archive() {
     // ── 10. assert all 100 rows visible via archive recovery ────────────────
     // Both pre- (inherited from basebackup) and post-basebackup rows must be
     // present. The post rows require a successful restore_command fetch.
-    wait_for_rows(&mut replica_client, "archive_test", 100);
+    {
+        let _ = wait_for_rows; // suppress unused warning
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let n: i64 = replica_client
+                .query_one("SELECT count(*) FROM archive_test", &[])
+                .map(|r| r.get(0))
+                .unwrap_or(0);
+            if n >= 100 {
+                break;
+            }
+            if Instant::now() > deadline {
+                let recovery: bool = replica_client
+                    .query_one("SELECT pg_is_in_recovery()", &[])
+                    .map(|r| r.get(0))
+                    .unwrap_or(false);
+                let logs = std::process::Command::new("docker")
+                    .args(["logs", "--tail", "40", &_replica.0])
+                    .output()
+                    .ok()
+                    .map(|o| {
+                        format!(
+                            "stdout: {}\nstderr: {}",
+                            String::from_utf8_lossy(&o.stdout),
+                            String::from_utf8_lossy(&o.stderr)
+                        )
+                    })
+                    .unwrap_or_else(|| "(docker logs failed)".to_owned());
+                panic!(
+                    "replica did not see 100 rows in archive_test within 90s\n\
+                     current count={n}, in_recovery={recovery}\n\
+                     --- replica logs (tail 40) ---\n{logs}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 
     // Replica must still be in hot standby (no primary to promote it).
     let is_recovery: bool = replica_client
@@ -2453,13 +2486,13 @@ fn sink_crash_mid_write() {
         .args([
             "run",
             "--rm",
-            "--add-host=host.docker.internal:host-gateway",
+            "--network=host",
             "-v",
             &format!("{pgdata_str}:/pgdata"),
             "postgres:18",
             "pg_basebackup",
             "-d",
-            &format!("host=host.docker.internal port={pg_port} user=postgres"),
+            &format!("host=127.0.0.1 port={pg_port} user=postgres"),
             "--pgdata",
             "/pgdata",
             "--format=plain",
@@ -2569,10 +2602,10 @@ fn sink_crash_mid_write() {
     let perl_script = format!(
         "use IO::Socket::INET;\n\
          ($s,$d)=@ARGV;\n\
-         $sock=IO::Socket::INET->new(PeerAddr=>q(host.docker.internal),PeerPort=>{sink_port},\
+         $sock=IO::Socket::INET->new(PeerAddr=>q(127.0.0.1),PeerPort=>{sink_port},\
          Proto=>q(tcp),Timeout=>10) or exit 1;\n\
          $sock->autoflush(1);\n\
-         print $sock \"GET /$s HTTP/1.0\\r\\nHost: host.docker.internal\\r\\n\\r\\n\";\n\
+         print $sock \"GET /$s HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\n\\r\\n\";\n\
          $l=<$sock>;exit 1 unless $l=~/200/;\n\
          while(<$sock>){{last if/^\\r\\n$/}}\n\
          open(O,\">\",$d)or exit 1;\n\
@@ -2616,18 +2649,18 @@ fn sink_crash_mid_write() {
         .args([
             "run",
             "-d",
-            "--add-host=host.docker.internal:host-gateway",
+            "--network=host",
             "--user",
             "root",
             "-v",
             &format!("{pgdata_str}:/pgdata"),
-            "-p",
-            &format!("{replica_port}:5432"),
             "postgres:18",
             "bash",
             "-c",
-            "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
-             && exec gosu postgres postgres -D /pgdata",
+            &format!(
+                "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
+                 && exec gosu postgres postgres -D /pgdata -c port={replica_port}"
+            ),
         ])
         .output()
         .expect("docker run replica");
@@ -2664,7 +2697,43 @@ fn sink_crash_mid_write() {
     };
 
     // ── 12. assert all 100 rows recovered ─────────────────────────────────────
-    wait_for_rows(&mut replica_client, "crash_test", 100);
+    {
+        let _ = wait_for_rows; // suppress unused warning
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let count: i64 = replica_client
+                .query_one("SELECT count(*) FROM crash_test", &[])
+                .map(|r| r.get(0))
+                .unwrap_or(0);
+            if count >= 100 {
+                break;
+            }
+            if Instant::now() > deadline {
+                let recovery: bool = replica_client
+                    .query_one("SELECT pg_is_in_recovery()", &[])
+                    .map(|r| r.get(0))
+                    .unwrap_or(false);
+                let logs = std::process::Command::new("docker")
+                    .args(["logs", "--tail", "40", &replica_id])
+                    .output()
+                    .ok()
+                    .map(|o| {
+                        format!(
+                            "stdout: {}\nstderr: {}",
+                            String::from_utf8_lossy(&o.stdout),
+                            String::from_utf8_lossy(&o.stderr)
+                        )
+                    })
+                    .unwrap_or_else(|| "(docker logs failed)".to_owned());
+                panic!(
+                    "replica did not see 100 rows in crash_test within 90s\n\
+                     current count={count}, in_recovery={recovery}\n\
+                     --- replica logs (tail 40) ---\n{logs}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 
     let is_recovery: bool = replica_client
         .query_one("SELECT pg_is_in_recovery()", &[])
@@ -3054,10 +3123,10 @@ fn timeline_boundary_survives_failover() {
         let perl = format!(
             "use IO::Socket::INET;\n\
              ($s,$d)=@ARGV;\n\
-             $sock=IO::Socket::INET->new(PeerAddr=>q(host.docker.internal),PeerPort=>{sink_port},\
+             $sock=IO::Socket::INET->new(PeerAddr=>q(127.0.0.1),PeerPort=>{sink_port},\
              Proto=>q(tcp),Timeout=>10) or exit 1;\n\
              $sock->autoflush(1);\n\
-             print $sock \"GET /$s HTTP/1.0\\r\\nHost: host.docker.internal\\r\\n\\r\\n\";\n\
+             print $sock \"GET /$s HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\n\\r\\n\";\n\
              $l=<$sock>;exit 1 unless $l=~/200/;\n\
              while(<$sock>){{last if/^\\r\\n$/}}\n\
              open(O,\">\",$d)or exit 1;\n\
@@ -3208,13 +3277,13 @@ fn timeline_boundary_survives_failover() {
         .args([
             "run",
             "--rm",
-            "--add-host=host.docker.internal:host-gateway",
+            "--network=host",
             "-v",
             &format!("{pgdata1_str}:/pgdata"),
             "postgres:18",
             "pg_basebackup",
             "-d",
-            &format!("host=host.docker.internal port={pg_port} user=postgres"),
+            &format!("host=127.0.0.1 port={pg_port} user=postgres"),
             "--pgdata",
             "/pgdata",
             "--format=plain",
@@ -3227,6 +3296,23 @@ fn timeline_boundary_survives_failover() {
         out.status.success(),
         "pg_basebackup: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+
+    // pg_basebackup wrote files as uid 999 (postgres in container) with mode
+    // 0700. Make them host-readable so the cp -r below can read them.
+    let chmod_out = std::process::Command::new("docker")
+        .args([
+            "run", "--rm", "--user", "root",
+            "-v", &format!("{pgdata1_str}:/pgdata"),
+            "postgres:18",
+            "chmod", "-R", "a+rwX", "/pgdata",
+        ])
+        .output()
+        .expect("chmod pgdata1");
+    assert!(
+        chmod_out.status.success(),
+        "chmod pgdata1: {}",
+        String::from_utf8_lossy(&chmod_out.stderr)
     );
 
     // Copy pgdata1 → pgdata2 before modifying pgdata1 for replica1 recovery.
@@ -3281,18 +3367,18 @@ fn timeline_boundary_survives_failover() {
         .args([
             "run",
             "-d",
-            "--add-host=host.docker.internal:host-gateway",
+            "--network=host",
             "--user",
             "root",
             "-v",
             &format!("{pgdata1_str}:/pgdata"),
-            "-p",
-            &format!("{r1_port}:5432"),
             "postgres:18",
             "bash",
             "-c",
-            "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
-             && exec gosu postgres postgres -D /pgdata",
+            &format!(
+                "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
+                 && exec gosu postgres postgres -D /pgdata -c port={r1_port}"
+            ),
         ])
         .output()
         .expect("docker run replica1");
@@ -3517,18 +3603,18 @@ fn timeline_boundary_survives_failover() {
         .args([
             "run",
             "-d",
-            "--add-host=host.docker.internal:host-gateway",
+            "--network=host",
             "--user",
             "root",
             "-v",
             &format!("{pgdata2_str}:/pgdata"),
-            "-p",
-            &format!("{r2_port}:5432"),
             "postgres:18",
             "bash",
             "-c",
-            "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
-             && exec gosu postgres postgres -D /pgdata",
+            &format!(
+                "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
+                 && exec gosu postgres postgres -D /pgdata -c port={r2_port}"
+            ),
         ])
         .output()
         .expect("docker run replica2");
