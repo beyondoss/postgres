@@ -1692,30 +1692,6 @@ fn replica_recovers_via_archive() {
                 .output();
         }
     }
-    struct DropNetwork(String);
-    impl Drop for DropNetwork {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("docker")
-                .args(["network", "rm", &self.0])
-                .output();
-        }
-    }
-
-    // ── unique docker network ───────────────────────────────────────────────
-    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let net_name = format!("beyond-pg-archive-{}-{n}", std::process::id());
-    let out = std::process::Command::new("docker")
-        .args(["network", "create", &net_name])
-        .output()
-        .expect("docker network create");
-    assert!(
-        out.status.success(),
-        "network create: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let _net = DropNetwork(net_name.clone());
-
     // ── 1. primary with synchronous WAL ────────────────────────────────────
     let primary = Postgres::default()
         .with_tag("18")
@@ -1738,53 +1714,9 @@ fn replica_recovers_via_archive() {
     let pg_port = primary.get_host_port_ipv4(5432).unwrap();
     let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
 
-    // Connect the container to the test network before opening any postgres
-    // connection. This avoids the iptables disruption that docker network
-    // connect causes on already-established TCP connections.
-    let out = std::process::Command::new("docker")
-        .args(["network", "connect", &net_name, primary.id()])
-        .output()
-        .expect("network connect primary");
-    assert!(out.status.success());
-
-    let mut primary_client = {
-        // connect_timeout=3 so each attempt fails fast if iptables is still
-        // settling; without it libpq can block for the kernel TCP timeout
-        // (~30s), which exceeds the retry deadline on a single failed attempt.
-        let url = format!("{pg_url} connect_timeout=3");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match postgres::Client::connect(&url, postgres::NoTls) {
-                Ok(c) => break c,
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(e) => panic!("connect primary_client: {e}"),
-            }
-        }
-    };
+    let mut primary_client =
+        postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect to primary");
     allow_replication(&mut primary_client);
-
-    // Resolve primary's container-internal IP (for pg_basebackup container).
-    let template = format!(
-        r#"{{{{(index .NetworkSettings.Networks "{}").IPAddress}}}}"#,
-        net_name
-    );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let primary_ip = loop {
-        let out = std::process::Command::new("docker")
-            .args(["inspect", "-f", &template, primary.id()])
-            .output()
-            .unwrap();
-        let ip = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        if !ip.is_empty() {
-            break ip;
-        }
-        if Instant::now() > deadline {
-            panic!("primary has no IP on test network after 5s");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
 
     // ── 2. start sink on host ───────────────────────────────────────────────
     // Sink binds to 0.0.0.0, so containers reach it at host.docker.internal.
@@ -1869,13 +1801,13 @@ fn replica_recovers_via_archive() {
         .args([
             "run",
             "--rm",
-            &format!("--network={net_name}"),
+            "--add-host=host.docker.internal:host-gateway",
             "-v",
             &format!("{pgdata_str}:/pgdata"),
             "postgres:18",
             "pg_basebackup",
             "-d",
-            &format!("host={primary_ip} port=5432 user=postgres"),
+            &format!("host=host.docker.internal port={pg_port} user=postgres"),
             "--pgdata",
             "/pgdata",
             "--format=plain",
@@ -2387,15 +2319,6 @@ fn sink_crash_mid_write() {
                 .output();
         }
     }
-    struct DropNetwork(String);
-    impl Drop for DropNetwork {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("docker")
-                .args(["network", "rm", &self.0])
-                .output();
-        }
-    }
-
     fn complete_segs(dir: &std::path::Path) -> usize {
         std::fs::read_dir(dir)
             .into_iter()
@@ -2415,20 +2338,6 @@ fn sink_crash_mid_write() {
             .filter(|n| n.ends_with(".partial"))
             .collect()
     }
-
-    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let net_name = format!("beyond-pg-crash-{}-{n}", std::process::id());
-    let out = std::process::Command::new("docker")
-        .args(["network", "create", &net_name])
-        .output()
-        .expect("docker network create");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let _net = DropNetwork(net_name.clone());
 
     // ── 1. primary with synchronous WAL ──────────────────────────────────────
     let primary = Postgres::default()
@@ -2451,51 +2360,9 @@ fn sink_crash_mid_write() {
     let pg_port = primary.get_host_port_ipv4(5432).unwrap();
     let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
 
-    let out = std::process::Command::new("docker")
-        .args(["network", "connect", &net_name, primary.id()])
-        .output()
-        .expect("network connect");
-    assert!(out.status.success());
-
-    let mut primary_client = {
-        // connect_timeout=3 so each attempt fails fast if iptables is still
-        // settling; without it libpq can block for the kernel TCP timeout
-        // (~30s), which exceeds the retry deadline on a single failed attempt.
-        let url = format!("{pg_url} connect_timeout=3");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match postgres::Client::connect(&url, postgres::NoTls) {
-                Ok(c) => break c,
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(e) => panic!("connect primary_client: {e}"),
-            }
-        }
-    };
+    let mut primary_client =
+        postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect to primary");
     allow_replication(&mut primary_client);
-
-    let primary_ip = {
-        let tpl = format!(
-            r#"{{{{(index .NetworkSettings.Networks "{}").IPAddress}}}}"#,
-            net_name
-        );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let o = std::process::Command::new("docker")
-                .args(["inspect", "-f", &tpl, primary.id()])
-                .output()
-                .unwrap();
-            let ip = String::from_utf8_lossy(&o.stdout).trim().to_owned();
-            if !ip.is_empty() {
-                break ip;
-            }
-            if Instant::now() > deadline {
-                panic!("primary has no IP after 5s");
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
 
     // ── 2. sink on host ───────────────────────────────────────────────────────
     let sink_dir = std::env::temp_dir().join(format!("wal-sink-crash-{pg_port}"));
@@ -2586,13 +2453,13 @@ fn sink_crash_mid_write() {
         .args([
             "run",
             "--rm",
-            &format!("--network={net_name}"),
+            "--add-host=host.docker.internal:host-gateway",
             "-v",
             &format!("{pgdata_str}:/pgdata"),
             "postgres:18",
             "pg_basebackup",
             "-d",
-            &format!("host={primary_ip} port=5432 user=postgres"),
+            &format!("host=host.docker.internal port={pg_port} user=postgres"),
             "--pgdata",
             "/pgdata",
             "--format=plain",
@@ -2849,29 +2716,6 @@ fn wal_gap_stalls_replica() {
                 .output();
         }
     }
-    struct DropNetwork(String);
-    impl Drop for DropNetwork {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("docker")
-                .args(["network", "rm", &self.0])
-                .output();
-        }
-    }
-
-    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let net_name = format!("beyond-pg-gap-{}-{n}", std::process::id());
-    let out = std::process::Command::new("docker")
-        .args(["network", "create", &net_name])
-        .output()
-        .expect("docker network create");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let _net = DropNetwork(net_name.clone());
-
     // ── 1. primary — async replication so INSERTs succeed without the sink ───
     // No synchronous_standby_names: post-backup rows commit locally without
     // waiting for the sink (which we kill before sealing that segment).
@@ -2891,51 +2735,9 @@ fn wal_gap_stalls_replica() {
     let pg_port = primary.get_host_port_ipv4(5432).unwrap();
     let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
 
-    let out = std::process::Command::new("docker")
-        .args(["network", "connect", &net_name, primary.id()])
-        .output()
-        .expect("network connect");
-    assert!(out.status.success());
-
-    let mut primary_client = {
-        // connect_timeout=3 so each attempt fails fast if iptables is still
-        // settling; without it libpq can block for the kernel TCP timeout
-        // (~30s), which exceeds the retry deadline on a single failed attempt.
-        let url = format!("{pg_url} connect_timeout=3");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match postgres::Client::connect(&url, postgres::NoTls) {
-                Ok(c) => break c,
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(e) => panic!("connect primary_client: {e}"),
-            }
-        }
-    };
+    let mut primary_client =
+        postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect to primary");
     allow_replication(&mut primary_client);
-
-    let primary_ip = {
-        let tpl = format!(
-            r#"{{{{(index .NetworkSettings.Networks "{}").IPAddress}}}}"#,
-            net_name
-        );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let o = std::process::Command::new("docker")
-                .args(["inspect", "-f", &tpl, primary.id()])
-                .output()
-                .unwrap();
-            let ip = String::from_utf8_lossy(&o.stdout).trim().to_owned();
-            if !ip.is_empty() {
-                break ip;
-            }
-            if Instant::now() > deadline {
-                panic!("primary no IP after 5s");
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
 
     // ── 2. sink on host (archive pre-backup segment, then killed) ────────────
     let sink_dir = std::env::temp_dir().join(format!("wal-sink-gap-{pg_port}"));
@@ -3024,13 +2826,13 @@ fn wal_gap_stalls_replica() {
         .args([
             "run",
             "--rm",
-            &format!("--network={net_name}"),
+            "--add-host=host.docker.internal:host-gateway",
             "-v",
             &format!("{pgdata_str}:/pgdata"),
             "postgres:18",
             "pg_basebackup",
             "-d",
-            &format!("host={primary_ip} port=5432 user=postgres"),
+            &format!("host=host.docker.internal port={pg_port} user=postgres"),
             "--pgdata",
             "/pgdata",
             "--format=plain",
@@ -3238,15 +3040,6 @@ fn timeline_boundary_survives_failover() {
                 .output();
         }
     }
-    struct DropNetwork(String);
-    impl Drop for DropNetwork {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("docker")
-                .args(["network", "rm", &self.0])
-                .output();
-        }
-    }
-
     fn complete_segs(dir: &std::path::Path) -> usize {
         std::fs::read_dir(dir)
             .into_iter()
@@ -3255,28 +3048,6 @@ fn timeline_boundary_survives_failover() {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.len() == 24 && n.bytes().all(|b| b.is_ascii_hexdigit()))
             .count()
-    }
-
-    fn container_ip(id: &str, net: &str) -> String {
-        let tpl = format!(
-            r#"{{{{(index .NetworkSettings.Networks "{}").IPAddress}}}}"#,
-            net
-        );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let o = std::process::Command::new("docker")
-                .args(["inspect", "-f", &tpl, id])
-                .output()
-                .unwrap();
-            let ip = String::from_utf8_lossy(&o.stdout).trim().to_owned();
-            if !ip.is_empty() {
-                return ip;
-            }
-            if Instant::now() > deadline {
-                panic!("{id} has no IP on {net} after 10s");
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
     }
 
     fn write_recovery_cfg(pgdata: &std::path::Path, sink_port: u16) {
@@ -3323,20 +3094,6 @@ fn timeline_boundary_survives_failover() {
         );
     }
 
-    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let net_name = format!("beyond-pg-timeline-{}-{n}", std::process::id());
-    let out = std::process::Command::new("docker")
-        .args(["network", "create", &net_name])
-        .output()
-        .expect("docker network create");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let _net = DropNetwork(net_name.clone());
-
     // ── 1. T1 primary ─────────────────────────────────────────────────────────
     let primary = Postgres::default()
         .with_tag("18")
@@ -3358,27 +3115,9 @@ fn timeline_boundary_survives_failover() {
     let pg_port = primary.get_host_port_ipv4(5432).unwrap();
     let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
 
-    let out = std::process::Command::new("docker")
-        .args(["network", "connect", &net_name, primary.id()])
-        .output()
-        .expect("network connect");
-    assert!(out.status.success());
-
-    let mut t1_client = {
-        let url = format!("{pg_url} connect_timeout=3");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match postgres::Client::connect(&url, postgres::NoTls) {
-                Ok(c) => break c,
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(e) => panic!("connect t1_client: {e}"),
-            }
-        }
-    };
+    let mut t1_client =
+        postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect to primary");
     allow_replication(&mut t1_client);
-    let primary_ip = container_ip(primary.id(), &net_name);
 
     // ── 2. sink on host ───────────────────────────────────────────────────────
     let sink_dir = std::env::temp_dir().join(format!("wal-sink-timeline-{pg_port}"));
@@ -3469,13 +3208,13 @@ fn timeline_boundary_survives_failover() {
         .args([
             "run",
             "--rm",
-            &format!("--network={net_name}"),
+            "--add-host=host.docker.internal:host-gateway",
             "-v",
             &format!("{pgdata1_str}:/pgdata"),
             "postgres:18",
             "pg_basebackup",
             "-d",
-            &format!("host={primary_ip} port=5432 user=postgres"),
+            &format!("host=host.docker.internal port={pg_port} user=postgres"),
             "--pgdata",
             "/pgdata",
             "--format=plain",
