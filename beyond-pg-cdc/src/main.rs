@@ -236,13 +236,19 @@ fn run_replication(args: &Args, subs: &Subscribers, stats: &Arc<Stats>) -> Resul
                     broadcast(subs, msg);
                     stats.events_total.fetch_add(1, Ordering::Relaxed);
                 }
-                // Advance flush only after delivering the event (best-effort).
-                // If the process crashes between recv and here, the slot replays.
+                // Advance flush_lsn and immediately tell postgres so it can
+                // advance confirmed_flush_lsn on the slot. Without this eager
+                // send_status, if the process is killed before the next
+                // keepalive or 10-second timer, the slot replays already-
+                // delivered events on restart.
                 if lsn > last_flush_lsn {
                     last_flush_lsn = lsn;
                     if let Ok(mut g) = stats.last_flush_lsn.lock() {
                         *g = last_flush_lsn;
                     }
+                    proto::send_status(&mut conn, last_write_lsn, last_flush_lsn)
+                        .map_err(CdcError::Io)?;
+                    last_status = Instant::now();
                 }
             }
             Ok(WalMsg::Keepalive {
