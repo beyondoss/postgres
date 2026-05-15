@@ -1825,53 +1825,44 @@ fn replica_recovers_via_archive() {
 
     // ── 6. write rows AFTER basebackup — archive-only recovery needed ───────
 
-    // Count complete segments before writing post-backup rows.  We need the
-    // segment containing those rows to also reach the sink as a complete file.
-    let complete_segs_before = || -> usize {
-        std::fs::read_dir(&sink_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.len() == 24 && n.bytes().all(|b| b.is_ascii_hexdigit()))
-            .count()
-    };
-    let segs_before = complete_segs_before();
-
     primary_client
         .batch_execute(
             "INSERT INTO archive_test (v) \
                SELECT 'post-' || g FROM generate_series(1, 50) g;",
         )
         .expect("post-basebackup rows");
-    // Switch WAL so the segment containing the post-backup rows is sealed on the
-    // primary.  The sink's streaming receiver must then finalize the sealed
-    // segment (rename .partial → full name) before we kill the primary.
+
+    // Capture the exact segment containing the post-backup commit BEFORE
+    // pg_switch_wal advances to the next segment. We'll wait for THIS segment
+    // to land in sink_dir as a sealed file.
+    let post_segment: String = primary_client
+        .query_one("SELECT pg_walfile_name(pg_current_wal_lsn())", &[])
+        .unwrap()
+        .get(0);
+
+    // Switch WAL so the segment containing the post-backup rows is sealed.
     primary_client
         .execute("SELECT pg_switch_wal()", &[])
         .unwrap();
 
-    // Wait until the sink has archived at least one more COMPLETE segment than
-    // before we wrote the post-backup rows.  This ensures the segment with those
-    // rows is fully received and renamed from .partial before we stop the primary.
-    let mut segs: Vec<String> = Vec::new();
-    for _ in 0..120 {
-        segs = std::fs::read_dir(&sink_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.len() == 24 && n.bytes().all(|b| b.is_ascii_hexdigit()))
-            .collect();
-        if segs.len() > segs_before {
-            break;
+    // Wait for the specific segment containing post-backup data to appear in
+    // sink_dir as a complete (renamed) file. Deterministic — no race on
+    // whatever the sink might or might not have archived earlier.
+    let target_path = sink_dir.join(&post_segment);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !target_path.exists() {
+        if Instant::now() > deadline {
+            let ls: Vec<String> = std::fs::read_dir(&sink_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            panic!(
+                "post-backup segment {post_segment} never archived within 60s\nsink_dir contents: {ls:?}"
+            );
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(200));
     }
-    assert!(
-        segs.len() > segs_before,
-        "post-backup WAL segment never archived: had {segs_before} complete segments before, \
-         still {}",
-        segs.len()
-    );
 
     // ── 7. kill primary ──────────────────────────────────────────────────────
     // Drop the client first so no TCP connections linger into the stopped container.
@@ -2495,12 +2486,18 @@ fn sink_crash_mid_write() {
     // ── 5. post-backup rows — sync commit guarantees WAL is in .partial ──────
     // With synchronous_commit=remote_write, INSERT blocks until flush_lsn ≥
     // commit LSN, so when this returns the WAL is on disk in a .partial file.
-    let segs_before_crash = complete_segs(&sink_dir);
     primary_client
         .batch_execute(
             "INSERT INTO crash_test (v) SELECT 'post-' || g FROM generate_series(1,50) g;",
         )
         .unwrap();
+
+    // Capture the segment containing post-backup commit before pg_switch_wal
+    // advances. We'll wait for this exact segment to appear sealed in sink_dir.
+    let post_segment: String = primary_client
+        .query_one("SELECT pg_walfile_name(pg_current_wal_lsn())", &[])
+        .unwrap()
+        .get(0);
     // Verify .partial exists before killing
     assert!(
         !partial_files(&sink_dir).is_empty(),
@@ -2565,18 +2562,21 @@ fn sink_crash_mid_write() {
         .execute("SELECT pg_switch_wal()", &[])
         .unwrap();
 
-    for _ in 0..120 {
-        if complete_segs(&sink_dir) > segs_before_crash {
-            break;
+    let target_path = sink_dir.join(&post_segment);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !target_path.exists() {
+        if Instant::now() > deadline {
+            let ls: Vec<String> = std::fs::read_dir(&sink_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            panic!(
+                "post-backup segment {post_segment} never archived within 60s\nsink_dir contents: {ls:?}"
+            );
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(200));
     }
-    assert!(
-        complete_segs(&sink_dir) > segs_before_crash,
-        "post-crash segment never archived: had {segs_before_crash} before crash, \
-         still {} after restart",
-        complete_segs(&sink_dir)
-    );
     let _ = segs_after_pre; // suppress unused warning
 
     // ── 9. kill primary ───────────────────────────────────────────────────────
@@ -3295,28 +3295,35 @@ fn timeline_boundary_survives_failover() {
     );
 
     // ── 5. T1 post-backup rows ────────────────────────────────────────────────
-    // Snapshot segment count AFTER basebackup so the wait below actually tracks
-    // the segment that contains the post-backup rows (the basebackup itself may
-    // have generated additional WAL segments, so segs_after_pre is stale).
-    let segs_before_post = complete_segs(&sink_dir);
     t1_client
         .batch_execute(
             "INSERT INTO timeline_test (v) SELECT 't1-post-' || g FROM generate_series(1,50) g;",
         )
         .unwrap();
+
+    // Capture the segment containing T1 post-backup commit; wait for it to be
+    // archived as a complete file after pg_switch_wal seals it.
+    let t1_post_segment: String = t1_client
+        .query_one("SELECT pg_walfile_name(pg_current_wal_lsn())", &[])
+        .unwrap()
+        .get(0);
     t1_client.execute("SELECT pg_switch_wal()", &[]).unwrap();
 
+    let t1_target = sink_dir.join(&t1_post_segment);
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if complete_segs(&sink_dir) > segs_before_post {
-            break;
-        }
+    while !t1_target.exists() {
         if Instant::now() > deadline {
-            panic!("T1 post-backup segment never archived");
+            let ls: Vec<String> = std::fs::read_dir(&sink_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            panic!(
+                "T1 post-backup segment {t1_post_segment} never archived within 60s\nsink_dir: {ls:?}"
+            );
         }
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(200));
     }
-    let _segs_after_t1 = complete_segs(&sink_dir);
 
     // ── 6. kill T1 primary ────────────────────────────────────────────────────
     // Keep _sink alive: replica1 needs its HTTP server to fetch T1 archive segments.
@@ -3573,24 +3580,32 @@ fn timeline_boundary_survives_failover() {
     }
 
     // ── 12. T2 rows ───────────────────────────────────────────────────────────
-    let segs_before_t2 = complete_segs(&sink_dir);
     r1_client
         .batch_execute(
             "INSERT INTO timeline_test (v) SELECT 't2-' || g FROM generate_series(1,50) g;",
         )
         .unwrap();
+
+    let t2_post_segment: String = r1_client
+        .query_one("SELECT pg_walfile_name(pg_current_wal_lsn())", &[])
+        .unwrap()
+        .get(0);
     r1_client.execute("SELECT pg_switch_wal()", &[]).unwrap();
 
-    // Wait for the T2 segment to land in the sink.
+    let t2_target = sink_dir.join(&t2_post_segment);
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if complete_segs(&sink_dir) > segs_before_t2 {
-            break;
-        }
+    while !t2_target.exists() {
         if Instant::now() > deadline {
-            panic!("T2 segment never archived");
+            let ls: Vec<String> = std::fs::read_dir(&sink_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            panic!(
+                "T2 segment {t2_post_segment} never archived within 60s\nsink_dir: {ls:?}"
+            );
         }
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(200));
     }
 
     // ── 13. kill T2 primary ───────────────────────────────────────────────────
