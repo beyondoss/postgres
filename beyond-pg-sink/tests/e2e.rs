@@ -1747,11 +1747,20 @@ fn replica_recovers_via_archive() {
         .expect("network connect primary");
     assert!(out.status.success());
     // docker network connect reconfigures iptables on the host, which can
-    // briefly reset established TCP connections. Sleep and reconnect so
-    // primary_client is fresh before we start polling pg_stat_replication.
-    std::thread::sleep(Duration::from_millis(500));
-    let mut primary_client =
-        postgres::Client::connect(&pg_url, postgres::NoTls).expect("reconnect primary_client");
+    // briefly reset established TCP connections and leave the port
+    // temporarily unreachable. Retry until the port is back (≤10s).
+    let mut primary_client = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match postgres::Client::connect(&pg_url, postgres::NoTls) {
+                Ok(c) => break c,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("reconnect primary_client: {e}"),
+            }
+        }
+    };
 
     // Resolve primary's container-internal IP (for pg_basebackup container).
     let template = format!(
@@ -2447,10 +2456,20 @@ fn sink_crash_mid_write() {
         .expect("network connect");
     assert!(out.status.success());
     // docker network connect reconfigures iptables on the host, which can
-    // briefly reset established TCP connections. Sleep and reconnect.
-    std::thread::sleep(Duration::from_millis(500));
-    let mut primary_client =
-        postgres::Client::connect(&pg_url, postgres::NoTls).expect("reconnect primary_client");
+    // briefly reset established TCP connections and leave the port
+    // temporarily unreachable. Retry until the port is back (≤10s).
+    let mut primary_client = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match postgres::Client::connect(&pg_url, postgres::NoTls) {
+                Ok(c) => break c,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("reconnect primary_client: {e}"),
+            }
+        }
+    };
 
     let primary_ip = {
         let tpl = format!(
@@ -2876,10 +2895,20 @@ fn wal_gap_stalls_replica() {
         .expect("network connect");
     assert!(out.status.success());
     // docker network connect reconfigures iptables on the host, which can
-    // briefly reset established TCP connections. Sleep and reconnect.
-    std::thread::sleep(Duration::from_millis(500));
-    let mut primary_client =
-        postgres::Client::connect(&pg_url, postgres::NoTls).expect("reconnect primary_client");
+    // briefly reset established TCP connections and leave the port
+    // temporarily unreachable. Retry until the port is back (≤10s).
+    let mut primary_client = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match postgres::Client::connect(&pg_url, postgres::NoTls) {
+                Ok(c) => break c,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("reconnect primary_client: {e}"),
+            }
+        }
+    };
 
     let primary_ip = {
         let tpl = format!(
@@ -3332,10 +3361,20 @@ fn timeline_boundary_survives_failover() {
         .expect("network connect");
     assert!(out.status.success());
     // docker network connect reconfigures iptables on the host, which can
-    // briefly reset established TCP connections. Sleep and reconnect.
-    std::thread::sleep(Duration::from_millis(500));
-    let mut t1_client =
-        postgres::Client::connect(&pg_url, postgres::NoTls).expect("reconnect t1_client");
+    // briefly reset established TCP connections and leave the port
+    // temporarily unreachable. Retry until the port is back (≤10s).
+    let mut t1_client = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match postgres::Client::connect(&pg_url, postgres::NoTls) {
+                Ok(c) => break c,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("reconnect t1_client: {e}"),
+            }
+        }
+    };
     let primary_ip = container_ip(primary.id(), &net_name);
 
     // ── 2. sink on host ───────────────────────────────────────────────────────
