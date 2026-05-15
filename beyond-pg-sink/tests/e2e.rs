@@ -1748,9 +1748,13 @@ fn replica_recovers_via_archive() {
     assert!(out.status.success());
 
     let mut primary_client = {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // connect_timeout=3 so each attempt fails fast if iptables is still
+        // settling; without it libpq can block for the kernel TCP timeout
+        // (~30s), which exceeds the retry deadline on a single failed attempt.
+        let url = format!("{pg_url} connect_timeout=3");
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            match postgres::Client::connect(&pg_url, postgres::NoTls) {
+            match postgres::Client::connect(&url, postgres::NoTls) {
                 Ok(c) => break c,
                 Err(_) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
@@ -2454,9 +2458,13 @@ fn sink_crash_mid_write() {
     assert!(out.status.success());
 
     let mut primary_client = {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // connect_timeout=3 so each attempt fails fast if iptables is still
+        // settling; without it libpq can block for the kernel TCP timeout
+        // (~30s), which exceeds the retry deadline on a single failed attempt.
+        let url = format!("{pg_url} connect_timeout=3");
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            match postgres::Client::connect(&pg_url, postgres::NoTls) {
+            match postgres::Client::connect(&url, postgres::NoTls) {
                 Ok(c) => break c,
                 Err(_) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
@@ -2890,9 +2898,13 @@ fn wal_gap_stalls_replica() {
     assert!(out.status.success());
 
     let mut primary_client = {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // connect_timeout=3 so each attempt fails fast if iptables is still
+        // settling; without it libpq can block for the kernel TCP timeout
+        // (~30s), which exceeds the retry deadline on a single failed attempt.
+        let url = format!("{pg_url} connect_timeout=3");
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            match postgres::Client::connect(&pg_url, postgres::NoTls) {
+            match postgres::Client::connect(&url, postgres::NoTls) {
                 Ok(c) => break c,
                 Err(_) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
@@ -3353,9 +3365,10 @@ fn timeline_boundary_survives_failover() {
     assert!(out.status.success());
 
     let mut t1_client = {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let url = format!("{pg_url} connect_timeout=3");
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            match postgres::Client::connect(&pg_url, postgres::NoTls) {
+            match postgres::Client::connect(&url, postgres::NoTls) {
                 Ok(c) => break c,
                 Err(_) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
