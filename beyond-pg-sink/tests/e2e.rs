@@ -7241,21 +7241,17 @@ fn slot_blocks_wal_pruning_when_consumer_stops() {
             .expect("pg_hba rewrite");
     }
 
-    fn count_wal_segments(container_id: &str) -> usize {
-        let out = std::process::Command::new("docker")
-            .args([
-                "exec",
-                container_id,
-                "bash",
-                "-c",
-                "ls /var/lib/postgresql/data/pg_wal | grep -E '^[0-9A-F]{24}$' | wc -l",
-            ])
-            .output()
-            .expect("docker exec ls pg_wal");
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse::<usize>()
-            .unwrap_or(0)
+    fn count_wal_segments(client: &mut postgres::Client) -> i64 {
+        // pg_ls_waldir() lists pg_wal/ contents via SQL — no docker exec
+        // permission/path surprises. Filter to 24-char hex segment files only
+        // (excludes archive_status/, .partial, .history, etc.).
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_ls_waldir() WHERE name ~ '^[0-9A-F]{24}$'",
+                &[],
+            )
+            .unwrap()
+            .get(0)
     }
 
     // ── 1. primary with small WAL retention so it recycles quickly ──────────
@@ -7277,7 +7273,7 @@ fn slot_blocks_wal_pruning_when_consumer_stops() {
 
     let pg_port = primary.get_host_port_ipv4(5432).unwrap();
     let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
-    let primary_id = primary.id().to_owned();
+    let _primary_id = primary.id().to_owned();
     let mut client =
         postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect primary");
     allow_replication(&mut client);
@@ -7376,7 +7372,7 @@ fn slot_blocks_wal_pruning_when_consumer_stops() {
         )
         .unwrap()
         .get(0);
-    let wal_count_before = count_wal_segments(&primary_id);
+    let wal_count_before = count_wal_segments(&mut client);
 
     // ── 5. SIGSTOP the sink (process stays alive, slot stays "active") ──────
     #[cfg(unix)]
@@ -7406,7 +7402,7 @@ fn slot_blocks_wal_pruning_when_consumer_stops() {
     }
 
     // ── 7. assertions while paused ──────────────────────────────────────────
-    let wal_count_after_stop = count_wal_segments(&primary_id);
+    let wal_count_after_stop = count_wal_segments(&mut client);
     assert!(
         wal_count_after_stop > wal_count_before,
         "WAL did not grow with paused consumer: before={wal_count_before} after={wal_count_after_stop}"
@@ -7497,7 +7493,7 @@ fn slot_blocks_wal_pruning_when_consumer_stops() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut last_count;
     loop {
-        last_count = count_wal_segments(&primary_id);
+        last_count = count_wal_segments(&mut client);
         if last_count <= wal_count_after_stop {
             // Some WAL was pruned (count went down or stayed); we tolerate equal
             // since at minimum primary stopped growing under recycling pressure.
