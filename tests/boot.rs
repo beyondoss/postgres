@@ -244,24 +244,45 @@ fn assert_boot_files(env: &BootEnv) {
         "pg_hba.conf content mismatch"
     );
 
-    assert_eq!(
-        std::fs::read_to_string(env.etc_pgb.path().join("pgbouncer.ini")).unwrap(),
-        beyond_pg::config::PGBOUNCER_INI,
-        "pgbouncer.ini content mismatch"
+    let pgbouncer_ini = std::fs::read_to_string(env.etc_pgb.path().join("pgbouncer.ini")).unwrap();
+    assert!(
+        pgbouncer_ini.starts_with(beyond_pg::config::PGBOUNCER_INI_BASE),
+        "pgbouncer.ini should start with the static base; got:\n{pgbouncer_ini}"
+    );
+    assert!(
+        pgbouncer_ini.contains("client_tls_sslmode = allow"),
+        "pgbouncer.ini missing TLS keys; got:\n{pgbouncer_ini}"
+    );
+    assert!(
+        pgbouncer_ini.contains("client_tls_cert_file"),
+        "pgbouncer.ini missing client_tls_cert_file; got:\n{pgbouncer_ini}"
     );
 
-    for name in ["01-tuning.conf", "02-memory.conf"] {
+    for name in ["01-tuning.conf", "02-memory.conf", "06-tls.conf"] {
         assert!(
             pgdata.join("conf.d").join(name).exists(),
             "{name} missing from conf.d"
         );
     }
 
+    // Default test boot (no /run/beyond/tls/, no .user-managed) → self-signed
+    // fallback writes the cert into PGDATA/beyond/.
     assert!(
         pgdata.join("beyond/server.crt").exists(),
         "TLS cert missing"
     );
     assert!(pgdata.join("beyond/server.key").exists(), "TLS key missing");
+
+    // 06-tls.conf points at the self-signed cert in this default test case.
+    let tls_conf = std::fs::read_to_string(pgdata.join("conf.d/06-tls.conf")).unwrap();
+    assert!(
+        tls_conf.contains("ssl_cert_file"),
+        "06-tls.conf missing ssl_cert_file directive; got:\n{tls_conf}"
+    );
+    assert!(
+        tls_conf.contains("beyond/server.crt"),
+        "06-tls.conf should point at self-signed cert path; got:\n{tls_conf}"
+    );
 }
 
 fn assert_no_pitr_state(env: &BootEnv) {
@@ -406,6 +427,76 @@ fn boot_is_idempotent() {
         std::fs::read_to_string(env.etc_pgb.path().join("pgbouncer.ini")).unwrap(),
         pgb,
         "pgbouncer.ini changed on second boot"
+    );
+}
+
+/// When the platform mounts `/run/beyond/tls/cert.pem`, `provision()` must
+/// prefer it over the self-signed fallback. Asserts:
+///   - No self-signed cert is generated under PGDATA/beyond/.
+///   - 06-tls.conf points at the platform paths.
+///   - pgbouncer.ini's `client_tls_cert_file` points at the platform path.
+///   - Platform CA is wired as `ssl_ca_file` / `client_tls_ca_file`.
+#[test]
+#[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
+fn boot_with_platform_cert() {
+    let _guard = DOCKER.lock().unwrap();
+    let Some((binary, platform)) = build_linux_beyond_pg() else {
+        return;
+    };
+    let env = BootEnv::new();
+
+    // Pre-populate a fake platform TLS dir. The content doesn't have to be a
+    // valid cert — boot only checks existence; downstream PG would fail to
+    // load it but that's not what this test exercises.
+    let tls_dir = tempfile::tempdir().expect("tls tempdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tls_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(tls_dir.path().join("cert.pem"), b"fake-cert\n").unwrap();
+    std::fs::write(tls_dir.path().join("key.pem"), b"fake-key\n").unwrap();
+    std::fs::write(tls_dir.path().join("ca.pem"), b"fake-ca\n").unwrap();
+
+    let tls_mount = format!("{}:/run/beyond/tls", tls_dir.path().display());
+    let extra = ["-v", &tls_mount];
+
+    let out = env.run_boot_ex(&binary, platform, &mmds(&[]), &extra, "postgres:18");
+    eprintln!("stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "boot exited {}", out.status);
+
+    let pgdata = env.pgdata();
+
+    // No self-signed cert was generated — provision() short-circuited to Platform.
+    assert!(
+        !pgdata.join("beyond/server.crt").exists(),
+        "platform mode must NOT generate self-signed cert"
+    );
+
+    // 06-tls.conf points at platform paths.
+    let tls_conf = std::fs::read_to_string(pgdata.join("conf.d/06-tls.conf")).unwrap();
+    assert!(
+        tls_conf.contains("ssl_cert_file = '/run/beyond/tls/cert.pem'"),
+        "06-tls.conf wrong cert path:\n{tls_conf}"
+    );
+    assert!(
+        tls_conf.contains("ssl_key_file = '/run/beyond/tls/key.pem'"),
+        "06-tls.conf wrong key path:\n{tls_conf}"
+    );
+    assert!(
+        tls_conf.contains("ssl_ca_file = '/run/beyond/tls/ca.pem'"),
+        "06-tls.conf missing ssl_ca_file:\n{tls_conf}"
+    );
+
+    // PgBouncer config wired with platform paths.
+    let pgb = std::fs::read_to_string(env.etc_pgb.path().join("pgbouncer.ini")).unwrap();
+    assert!(
+        pgb.contains("client_tls_cert_file = /run/beyond/tls/cert.pem"),
+        "pgbouncer.ini wrong cert path:\n{pgb}"
+    );
+    assert!(
+        pgb.contains("client_tls_ca_file = /run/beyond/tls/ca.pem"),
+        "pgbouncer.ini missing client_tls_ca_file:\n{pgb}"
     );
 }
 

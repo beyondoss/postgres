@@ -1,5 +1,6 @@
 mod archive;
 mod boot;
+mod cert_watcher;
 mod config;
 mod init;
 mod log_forwarder;

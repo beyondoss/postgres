@@ -81,25 +81,16 @@ async fn do_boot_primary(cfg: &MmdsConfig) -> Result<(), BootError> {
     ensure_conf_d()?;
     verify_wal_symlink()?;
     fetch_wal_gap(cfg).await?;
-    write_config_files(cfg)?;
+
+    // Resolve TLS material before writing config files — write_config_files
+    // emits 05-tls.conf and the templated pgbouncer.ini from this.
+    let tls = crate::tls::provision(Path::new(PGDATA))?;
+    info!("tls: source={:?} cert={}", tls.source, tls.cert.display());
+
+    write_config_files(cfg, &tls)?;
     write_pitr_config(cfg)?;
     let shared_buffers_mb = (cfg.ram_bytes / (1024 * 1024) / 4).max(128);
     apply_kernel_settings(shared_buffers_mb);
-
-    match crate::tls::ensure_cert(Path::new(PGDATA))? {
-        crate::tls::TlsCertOutcome::Generated => info!("tls: generated new self-signed cert"),
-        crate::tls::TlsCertOutcome::Renewed => {
-            info!("tls: renewed self-signed cert (was near expiry)");
-            // Best-effort reload; if postgres is not yet started this is a no-op.
-            if let Err(e) = pg::reload().await {
-                info!("tls: pg_ctl reload skipped (postgres not yet started): {e}");
-            }
-        }
-        crate::tls::TlsCertOutcome::UserManaged => {
-            info!("tls: skipping cert — .user-managed sentinel present")
-        }
-        crate::tls::TlsCertOutcome::StillValid => info!("tls: cert still valid"),
-    }
 
     run_hook_scripts(HOOKS_PRE_START).await?;
 
@@ -135,8 +126,11 @@ async fn do_boot_replica(cfg: &MmdsConfig) -> Result<(), BootError> {
     ensure_conf_d()?;
     verify_wal_symlink()?;
 
+    let tls = crate::tls::provision(Path::new(PGDATA))?;
+    info!("tls: source={:?} cert={}", tls.source, tls.cert.display());
+
     // Standard config files (tuning, memory, hba, pgbouncer, etc.)
-    write_config_files(cfg)?;
+    write_config_files(cfg, &tls)?;
 
     // Replica-specific config: primary_conninfo + optional restore_command.
     let replica_conf = config::replica_conf(conninfo, cfg.wal_sink.as_deref());
@@ -145,20 +139,6 @@ async fn do_boot_replica(cfg: &MmdsConfig) -> Result<(), BootError> {
 
     let shared_buffers_mb = (cfg.ram_bytes / (1024 * 1024) / 4).max(128);
     apply_kernel_settings(shared_buffers_mb);
-
-    match crate::tls::ensure_cert(Path::new(PGDATA))? {
-        crate::tls::TlsCertOutcome::Generated => info!("tls: generated new self-signed cert"),
-        crate::tls::TlsCertOutcome::Renewed => {
-            info!("tls: renewed self-signed cert (was near expiry)");
-            if let Err(e) = pg::reload().await {
-                info!("tls: pg_ctl reload skipped (postgres not yet started): {e}");
-            }
-        }
-        crate::tls::TlsCertOutcome::UserManaged => {
-            info!("tls: skipping cert — .user-managed sentinel present")
-        }
-        crate::tls::TlsCertOutcome::StillValid => info!("tls: cert still valid"),
-    }
 
     run_hook_scripts(HOOKS_PRE_START).await?;
 
@@ -719,11 +699,15 @@ async fn http_get(url: &str) -> Result<Vec<u8>, String> {
 // Config file writes
 // ---------------------------------------------------------------------------
 
-fn write_config_files(cfg: &MmdsConfig) -> Result<(), BootError> {
+fn write_config_files(cfg: &MmdsConfig, tls: &crate::tls::TlsConfig) -> Result<(), BootError> {
     use config::write_atomic;
 
     // 00-beyond.conf — image opinions, overwritten every boot
     write_atomic(Path::new(&config::beyond_conf_path()), config::BEYOND_CONF)?;
+
+    // 05-tls.conf — resolved cert paths, overrides 00-beyond.conf's defaults
+    // via alpha order under conf.d/. Numbered 05 so it lands after 04-replica.
+    write_atomic(Path::new(&config::tls_conf_path()), &config::tls_conf(tls))?;
 
     // 01-tuning.conf — postmaster-context params, written once at boot
     write_atomic(
@@ -777,11 +761,12 @@ fn write_config_files(cfg: &MmdsConfig) -> Result<(), BootError> {
     };
     write_atomic(Path::new(PG_HBA_PATH), &hba)?;
 
-    // pgbouncer.ini — overwritten every boot
+    // pgbouncer.ini — overwritten every boot, with client_tls_* keys pointing
+    // at the same cert Postgres uses.
     if let Some(parent) = Path::new(PGBOUNCER_INI_PATH).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    write_atomic(Path::new(PGBOUNCER_INI_PATH), config::PGBOUNCER_INI)?;
+    write_atomic(Path::new(PGBOUNCER_INI_PATH), &config::pgbouncer_ini(tls))?;
 
     Ok(())
 }

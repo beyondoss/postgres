@@ -1,15 +1,22 @@
-//! TLS certificate auto-provisioning for the Postgres server.
+//! TLS certificate provisioning for the Postgres server.
 //!
-//! Generates a self-signed Ed25519 certificate on first boot and renews it when
-//! within 30 days of expiry. The cert lives under `PGDATA/beyond/` so it forks
-//! with the database identity.
+//! Three sources, checked in order:
 //!
-//! If `PGDATA/beyond/.user-managed` exists, generation is skipped entirely —
-//! the operator is supplying their own cert.
+//! 1. **User-managed** (`PGDATA/beyond/.user-managed` sentinel): operator
+//!    supplies their own `server.{crt,key}` at the standard path. We do
+//!    nothing.
+//! 2. **Platform** (`/run/beyond/tls/cert.pem` exists): the Beyond box
+//!    contract — guest agent provisions a per-app CA-chained leaf cert at
+//!    boot, rotated every 22h via atomic rename. We point config at it and
+//!    a watcher elsewhere triggers reloads on rotation. See
+//!    `../beyond/boxes/docs/09-internal-tls.md`.
+//! 3. **Self-signed** (fallback): for dev/test and any environment without
+//!    the platform contract. Generates an Ed25519 cert under `PGDATA/beyond/`
+//!    and renews it within 30 days of expiry.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rcgen::string::Ia5String;
@@ -18,6 +25,10 @@ use tracing::{info, warn};
 
 const RENEWAL_THRESHOLD_SECS: u64 = 30 * 24 * 3600;
 const CERT_VALIDITY_DAYS: i64 = 365;
+
+/// Default location where the Beyond platform mounts the per-VM cert.
+/// Tests override via `provision_with_paths`.
+pub const PLATFORM_TLS_DIR: &str = "/run/beyond/tls";
 
 /// Outcome of [`ensure_cert`]. The caller uses this to decide whether to
 /// trigger a `pg_ctl reload`.
@@ -31,6 +42,81 @@ pub enum TlsCertOutcome {
     UserManaged,
     /// Existing cert is valid; no action taken.
     StillValid,
+}
+
+/// Resolved TLS material — paths the supervisor templates into
+/// `postgresql.conf` and `pgbouncer.ini`. Returned by [`provision`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsConfig {
+    pub source: TlsSource,
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    /// CA bundle path. `None` for self-signed (no chain to validate against).
+    pub ca: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsSource {
+    /// Operator-managed cert at `PGDATA/beyond/server.{crt,key}`. Whatever's
+    /// there, untouched.
+    UserManaged,
+    /// Beyond platform-provisioned cert at `/run/beyond/tls/`. Auto-rotated
+    /// every 22h — caller is expected to watch the cert file for changes.
+    Platform,
+    /// Self-signed cert generated and renewed by this process.
+    SelfSigned,
+}
+
+/// Provision TLS material for Postgres.
+///
+/// Detection order is precedence order: a user-managed sentinel beats the
+/// platform cert beats the self-signed fallback. The platform path is
+/// detected by file existence (the env var is informational; the file
+/// contract is what matters and survives shell-quoting surprises).
+pub fn provision(pgdata: &Path) -> Result<TlsConfig, TlsError> {
+    provision_with_paths(pgdata, Path::new(PLATFORM_TLS_DIR))
+}
+
+/// Test entry point: lets tests redirect the platform path to a temp dir.
+pub fn provision_with_paths(pgdata: &Path, platform_dir: &Path) -> Result<TlsConfig, TlsError> {
+    let beyond_dir = pgdata.join("beyond");
+    let user_sentinel = beyond_dir.join(".user-managed");
+
+    if user_sentinel.exists() {
+        info!("tls: .user-managed sentinel present, using operator-supplied cert");
+        return Ok(TlsConfig {
+            source: TlsSource::UserManaged,
+            cert: beyond_dir.join("server.crt"),
+            key: beyond_dir.join("server.key"),
+            // A user-managed cert may or may not be CA-chained — if the
+            // operator wants `verify-full` they can drop a ca.crt and wire
+            // it via 99-user.conf themselves. We don't assume.
+            ca: None,
+        });
+    }
+
+    let platform_cert = platform_dir.join("cert.pem");
+    if platform_cert.exists() {
+        info!(
+            "tls: using platform cert at {} (rotated by guest agent)",
+            platform_dir.display()
+        );
+        return Ok(TlsConfig {
+            source: TlsSource::Platform,
+            cert: platform_cert,
+            key: platform_dir.join("key.pem"),
+            ca: Some(platform_dir.join("ca.pem")),
+        });
+    }
+
+    // Fallback: generate/renew under PGDATA/beyond/.
+    let _ = ensure_cert(pgdata)?;
+    Ok(TlsConfig {
+        source: TlsSource::SelfSigned,
+        cert: beyond_dir.join("server.crt"),
+        key: beyond_dir.join("server.key"),
+        ca: None,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -412,6 +498,67 @@ mod tests {
             !beyond_dir.join("server.key").exists(),
             "must not write key when user-managed"
         );
+    }
+
+    /// `provision()` prefers the user-managed sentinel over the platform dir
+    /// and the self-signed fallback. No cert files are generated.
+    #[test]
+    fn test_provision_user_managed_wins() {
+        let (_dir, pgdata) = pgdata();
+        let beyond_dir = pgdata.join("beyond");
+        std::fs::create_dir_all(&beyond_dir).unwrap();
+        std::fs::write(beyond_dir.join(".user-managed"), "").unwrap();
+
+        // Also populate a fake platform dir to prove user-managed beats it.
+        let platform = TempDir::new().unwrap();
+        std::fs::write(platform.path().join("cert.pem"), "").unwrap();
+
+        let tls = provision_with_paths(&pgdata, platform.path()).unwrap();
+        assert_eq!(tls.source, TlsSource::UserManaged);
+        assert_eq!(tls.cert, beyond_dir.join("server.crt"));
+        assert_eq!(tls.key, beyond_dir.join("server.key"));
+        assert!(
+            tls.ca.is_none(),
+            "user-managed CA is opt-in via 99-user.conf"
+        );
+        assert!(!beyond_dir.join("server.crt").exists(), "must not generate");
+    }
+
+    /// Platform cert wins over self-signed fallback when present.
+    #[test]
+    fn test_provision_platform_preferred() {
+        let (_dir, pgdata) = pgdata();
+        let platform = TempDir::new().unwrap();
+        std::fs::write(platform.path().join("cert.pem"), "").unwrap();
+        std::fs::write(platform.path().join("key.pem"), "").unwrap();
+        std::fs::write(platform.path().join("ca.pem"), "").unwrap();
+
+        let tls = provision_with_paths(&pgdata, platform.path()).unwrap();
+        assert_eq!(tls.source, TlsSource::Platform);
+        assert_eq!(tls.cert, platform.path().join("cert.pem"));
+        assert_eq!(tls.key, platform.path().join("key.pem"));
+        assert_eq!(
+            tls.ca.as_deref(),
+            Some(platform.path().join("ca.pem").as_path())
+        );
+        assert!(
+            !pgdata.join("beyond/server.crt").exists(),
+            "must not generate self-signed when platform cert present"
+        );
+    }
+
+    /// No sentinel and no platform cert → self-signed generated under PGDATA.
+    #[test]
+    fn test_provision_self_signed_fallback() {
+        let (_dir, pgdata) = pgdata();
+        let platform = TempDir::new().unwrap(); // empty
+
+        let tls = provision_with_paths(&pgdata, platform.path()).unwrap();
+        assert_eq!(tls.source, TlsSource::SelfSigned);
+        assert_eq!(tls.cert, pgdata.join("beyond/server.crt"));
+        assert!(tls.ca.is_none());
+        assert!(pgdata.join("beyond/server.crt").exists());
+        assert!(pgdata.join("beyond/server.key").exists());
     }
 
     /// Write a self-signed cert that expires in `days_until_expiry` days,

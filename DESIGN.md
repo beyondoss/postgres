@@ -869,41 +869,64 @@ There is no `trust` rule anywhere, even on the loopback interface,
 so a misconfigured PgBouncer or runaway local process can't bypass
 authentication.
 
-**TLS is on by default.** `beyond-pg supervisor` generates a
-self-signed cert on first boot, writes it under PGDATA (so it forks
-with the database — the fork has the same identity), and `00-beyond.conf`
-sets:
+**TLS is on by default.** `beyond-pg supervisor` resolves TLS material
+at boot from one of three sources (precedence in this order) and writes
+`PGDATA/conf.d/06-tls.conf` pointing at the resolved paths:
+
+1. **User-managed.** If `PGDATA/beyond/.user-managed` exists, the
+   supervisor uses `PGDATA/beyond/server.{crt,key}` as-is — drop in
+   your own cert and touch the sentinel.
+2. **Platform-provisioned** (default on Beyond infra). If
+   `/run/beyond/tls/cert.pem` exists, the supervisor uses it. The
+   Beyond box guest agent provisions every VM with a per-app
+   CA-chained leaf cert there, rotated every ~22h via atomic
+   `rename(2)`. The supervisor watches the cert mtime and runs
+   `pg_ctl reload` + `SIGHUP pgbouncer` on rotation. See
+   `../beyond/boxes/docs/09-internal-tls.md`.
+3. **Self-signed fallback** (dev/test). Supervisor generates an
+   Ed25519 cert under `PGDATA/beyond/server.{crt,key}` and renews
+   within 30 days of expiry.
+
+The resulting `06-tls.conf` overrides the `ssl_*_file` lines in
+`00-beyond.conf` (alpha order in `conf.d/` — last setting wins). For
+the platform path the file looks like:
 
 ```ini
-ssl = on
-ssl_cert_file = '/var/lib/postgresql/18/main/beyond/server.crt'
-ssl_key_file  = '/var/lib/postgresql/18/main/beyond/server.key'
+ssl_cert_file = '/run/beyond/tls/cert.pem'
+ssl_key_file  = '/run/beyond/tls/key.pem'
+ssl_ca_file   = '/run/beyond/tls/ca.pem'
 ```
 
-PgBouncer terminates TLS for the public 5432 port using the same cert
-(`client_tls_sslmode = allow`, `client_tls_cert_file`,
-`client_tls_key_file`). The PgBouncer→Postgres hop runs over the unix
-socket, no TLS needed there.
+`ssl_ca_file` is only set when a CA bundle is available (platform).
+With it wired, an operator can opt into mTLS for in-app callers with
+a single `99-user.conf` line: `clientcert=verify-full` in
+`pg_hba.conf` against the per-app CA.
 
-**Why TLS on, not off.** Defense in depth is nearly free if we
-auto-provision. The cert lives on the data volume so it survives
-image swaps and forks naturally. Once we ship TLS-off, turning it on
-later is a breaking change for some clients (depending on driver
-defaults). Pay it now.
+PgBouncer terminates TLS for the public 5432 port using the same
+cert; its `client_tls_cert_file` / `client_tls_key_file` /
+`client_tls_ca_file` are templated at boot from the same resolved
+paths. `client_tls_sslmode = allow` matches the `host` (not
+`hostssl`) posture in `pg_hba.conf` — TLS available, plaintext still
+accepted. Flipping to `require` is a separate policy decision (see
+DECISIONS.md I-004 alternatives). PgBouncer→Postgres runs over the
+unix socket, no TLS there.
+
+**Why platform cert.** It's a per-app CA-chained cert with SANs for
+`{vm_id}.internal` and `{service_name}.internal`, so in-app clients
+can connect with
+`sslmode=verify-full sslrootcert=/run/beyond/tls/ca.pem host=<service>.internal`
+and the chain plus hostname validate. The self-signed fallback can't
+do `verify-full` (rejected by the client). Rotation cadence is also
+better — 22h vs 30 days — and the rotation code lives in the
+platform's guest agent, not in `beyond-pg`.
+
+External clients (apps outside Beyond) still get `sslmode=require`
+against this cert because they don't have the per-app CA. Publishing
+a public CA bundle or wiring ACME is a separate change.
 
 Beyond's network is still the perimeter for non-Postgres concerns
 (mTLS tunnel, private VXLAN, eBPF policy); PG TLS adds defense-in-
-depth, not the perimeter itself. Customers with strict CA-chain
-requirements override the cert in `99-user.conf` and supply their
-own. The auto-provisioned cert is the floor, not the ceiling.
-
-Cert rotation: supervisor regenerates if the cert is within 30 days
-of expiry (1-year cert by default), then runs `pg_ctl reload`.
-Idempotent.
-
-**User override**: if `PGDATA/beyond/.user-managed` exists, cert generation
-is skipped entirely — place your own `server.{crt,key}` in that directory
-and touch `.user-managed` to prevent the supervisor from overwriting them.
+depth, not the perimeter itself.
 
 ---
 

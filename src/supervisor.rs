@@ -139,6 +139,19 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // Background: update reload-safe tuning params when virtio-mem changes RAM
     let memory_watcher_handle = tokio::spawn(memory_watcher_task(cfg.vcpus, cfg.ram_bytes));
 
+    // Background: watch the platform TLS cert for rotation, if applicable.
+    // The guest agent atomically replaces /run/beyond/tls/cert.pem every ~22h.
+    // Postgres and PgBouncer cache the cert in shared memory and only re-read
+    // on SIGHUP, so we drive both reloads from the watcher.
+    let platform_cert = std::path::PathBuf::from(crate::tls::PLATFORM_TLS_DIR).join("cert.pem");
+    let (cert_reload_tx, mut cert_reload_rx) = mpsc::channel::<()>(4);
+    let cert_watcher_handle = if platform_cert.exists() {
+        Some(crate::cert_watcher::spawn(platform_cert, cert_reload_tx))
+    } else {
+        info!("cert_watcher: no platform cert, watcher disabled");
+        None
+    };
+
     // Signal handles — must be set up after blocking the signals
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -168,14 +181,14 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 info!("received SIGTERM, draining children");
                 abort_wal_forwarder(&mut wal_forwarder_handle).await;
                 drain_children(&mut pg_state, &mut pgb_state, cdc_state.as_mut()).await;
-                shutdown_background_tasks(log_writer_handle, rpc_handle, memory_watcher_handle).await;
+                shutdown_background_tasks(log_writer_handle, rpc_handle, memory_watcher_handle, cert_watcher_handle).await;
                 return Ok(());
             }
             _ = sigint.recv() => {
                 info!("received SIGINT, draining children");
                 abort_wal_forwarder(&mut wal_forwarder_handle).await;
                 drain_children(&mut pg_state, &mut pgb_state, cdc_state.as_mut()).await;
-                shutdown_background_tasks(log_writer_handle, rpc_handle, memory_watcher_handle).await;
+                shutdown_background_tasks(log_writer_handle, rpc_handle, memory_watcher_handle, cert_watcher_handle).await;
                 return Ok(());
             }
             status = async {
@@ -212,7 +225,42 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     maybe_restart_cdc(state, &log_tx).await?;
                 }
             }
+            Some(()) = cert_reload_rx.recv() => {
+                info!("cert rotated, reloading postgres and pgbouncer");
+                if let Err(e) = pg::reload().await {
+                    warn!("pg_ctl reload after cert rotation failed: {e}");
+                }
+                sighup_pgbouncer(&pgb_state);
+            }
         }
+    }
+}
+
+/// Send SIGHUP to PgBouncer to reload its config (used for cert rotation).
+/// Best-effort: if pgbouncer is between exit and restart, the pid is absent
+/// and the next spawn will pick up the rotated cert anyway.
+fn sighup_pgbouncer(state: &ChildState) {
+    let Some(child) = state.child.as_ref() else {
+        info!("pgbouncer: no live child, SIGHUP skipped");
+        return;
+    };
+    let Some(pid) = child.id() else {
+        info!("pgbouncer: child has no pid (already reaped), SIGHUP skipped");
+        return;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        match kill(Pid::from_raw(pid as i32), Signal::SIGHUP) {
+            Ok(()) => info!("pgbouncer: SIGHUP sent (pid={pid})"),
+            Err(e) => warn!("pgbouncer: SIGHUP failed (pid={pid}): {e}"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid; // suppress unused warning on non-Linux dev hosts
+        info!("pgbouncer: SIGHUP skipped (non-Linux build)");
     }
 }
 
@@ -573,15 +621,23 @@ async fn shutdown_background_tasks(
     log_writer: tokio::task::JoinHandle<()>,
     rpc_server: tokio::task::JoinHandle<()>,
     memory_watcher: tokio::task::JoinHandle<()>,
+    cert_watcher: Option<tokio::task::JoinHandle<()>>,
 ) {
     log_writer.abort();
     rpc_server.abort();
     memory_watcher.abort();
-    for (name, result) in [
+    if let Some(h) = &cert_watcher {
+        h.abort();
+    }
+    let mut results: Vec<(&str, _)> = vec![
         ("log-writer", log_writer.await),
         ("rpc-server", rpc_server.await),
         ("memory-watcher", memory_watcher.await),
-    ] {
+    ];
+    if let Some(h) = cert_watcher {
+        results.push(("cert-watcher", h.await));
+    }
+    for (name, result) in results {
         // is_cancelled() is the normal outcome after abort() — no log needed
         if let Err(e) = result
             && e.is_panic()

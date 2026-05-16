@@ -897,13 +897,10 @@ satisfies both constraints.
 
 ### I-001 — TLS on by default with auto-provisioned self-signed cert
 
-**Decision.** `ssl = on` in `00-beyond.conf`. `beyond-pg supervisor`
-generates a self-signed cert at first boot under
-`PGDATA/beyond/server.{crt,key}` and regenerates it within 30 days
-of expiry. Cert lives on the data volume so it forks with the
-database identity. PgBouncer terminates client TLS on port 5432
-using the same cert; PgBouncer→PG runs over the unix socket
-(no TLS needed).
+> **Superseded in part by I-013.** Self-signed generation is retained
+> as a dev/test fallback; in production on Beyond infra the platform
+> cert at `/run/beyond/tls/` takes precedence. Original rationale below
+> is preserved.
 
 **Why.** Earlier sketch was `ssl = off`, reasoning that "Beyond's
 network is the perimeter (mTLS tunnel, private VXLAN, eBPF)." That's
@@ -967,6 +964,89 @@ control RPC, not a network port.
 it, never another VM, never the network. No auth needed, no firewall
 hole, no surface for credential theft. This is how every other Beyond
 guest agent talks to its host.
+
+### I-004 — Prefer platform-provisioned TLS cert over self-signed
+
+**Decision.** When `/run/beyond/tls/cert.pem` exists, point
+`ssl_cert_file` / `ssl_key_file` / `ssl_ca_file` and PgBouncer's
+`client_tls_*` directly at the platform-provided files. The
+`beyond-pg cert_watcher` polls cert mtime every 60s and triggers
+`pg_ctl reload` + `SIGHUP pgbouncer` on rotation. Self-signed
+generation under `PGDATA/beyond/` survives as a dev/test fallback,
+behind the existing `.user-managed` sentinel.
+
+Detection order: `.user-managed` → platform cert → self-signed.
+
+**Why.** The Beyond box guest agent (`../beyond/boxes/docs/09-internal-tls.md`)
+provisions every VM with a per-app CA-chained leaf cert at
+`/run/beyond/tls/{cert,key,ca}.pem`, with SANs for `{vm_id}.internal`
+and `{service_name}.internal`, auto-rotated every ~22h via atomic
+`rename(2)`. We were ignoring it and shipping a worse cert (self-signed,
+30-day cadence, no chain) when the platform already gives us a better
+one for free. On every axis:
+
+| Axis           | Self-signed (I-001)              | Platform (I-004)             |
+| -------------- | -------------------------------- | ---------------------------- |
+| Chain validity | None                             | Per-app CA                   |
+| `verify-full`  | Rejected by client               | Validates against CA + SAN   |
+| Rotation       | 30 days, in-place                | ~22h, atomic rename          |
+| Code we own    | ~90 lines (`tls.rs` gen + renew) | Detection by file existence  |
+| mTLS opt-in    | No CA to verify against          | One-line `99-user.conf` flip |
+
+**Why not delete self-signed entirely.** Three reasons. (a) Local dev
+and the `tests/boot.rs` Docker harness don't have a Beyond guest
+agent and need _some_ cert to boot. (b) Operators running this image
+off-Beyond (a contributor experimenting, a fork) shouldn't hit a
+mandatory-platform-cert wall. (c) The fallback is cheap to keep —
+~90 lines that already work — and removing it would gain nothing.
+
+**Alternatives considered.**
+
+- _Make the platform cert mandatory._ Rejected — breaks dev and any
+  off-Beyond runs. Detect-by-file existence is one `if exists` call;
+  the cost of supporting both is trivial.
+- _Read `$BEYOND_TLS_CERT` instead of probing the file path._
+  Rejected — file existence is the durable contract; the env var is
+  informational. Saves one tolerance for ordering (env not yet set
+  at the moment we check) and shell-quoting surprises.
+- _Symlink platform files into `PGDATA/beyond/server.{crt,key}` and
+  keep the existing paths in `00-beyond.conf`._ Rejected — symlink in
+  PGDATA confuses PG-on-recovery and `pg_basebackup`. A `conf.d/`
+  override (`06-tls.conf`) is the idiomatic Postgres mechanism.
+- _Flip pg_hba `host`→`hostssl` and PgBouncer `allow`→`require` to
+  match Neon/RDS-force_ssl floor._ Out of scope here. This decision
+  only changes cert _quality_; rejecting plaintext is a separate
+  policy decision worth its own entry.
+- _Enable `clientcert=verify-full` (mTLS) by default._ Out of scope.
+  Sibling services (queue/kv/auth/objects) do this because their
+  callers are other Beyond services; Postgres callers are user code
+  where mandatory mTLS is a UX disaster. Available as an opt-in via
+  `99-user.conf` now that `ssl_ca_file` is wired.
+
+**Cost / consequences.**
+
+- New `src/cert_watcher.rs` (~75 lines): 60s mtime poll task; sends
+  one event per rotation; no new crate deps (uses `tokio::fs`).
+- `src/supervisor.rs` gains one select-arm and a `sighup_pgbouncer`
+  helper (`nix::sys::signal::kill` to the tracked pgbouncer pid).
+- `src/tls.rs::provision()` is the new public entry point;
+  `ensure_cert()` becomes the self-signed branch implementation.
+- `src/config.rs` exposes `tls_conf(&TlsConfig)` and `pgbouncer_ini(&TlsConfig)`
+  templating helpers. `PGBOUNCER_INI` constant renamed to
+  `PGBOUNCER_INI_BASE`.
+- New `PGDATA/conf.d/06-tls.conf` is written on every boot. Numbered
+  `06` to land after `05-pitr.conf` and override the baseline
+  `ssl_*_file` lines in `00-beyond.conf` (alpha order).
+- In-app clients (other Beyond services or customer apps running in
+  the same Beyond app) can connect with
+  `sslmode=verify-full sslrootcert=/run/beyond/tls/ca.pem host={service}.internal`
+  and the chain validates. External clients still get
+  `sslmode=require` against this cert — that gap is a separate
+  problem (publish a CA bundle, or ACME).
+- Compliance: platform cert is per-app CA, not a public root, so this
+  still doesn't satisfy regimes that require public-CA chain
+  validation (HIPAA-tech-impl, PCI). Real CA via ACME is still the
+  compliance path. We've shrunk the gap, not closed it.
 
 ---
 
