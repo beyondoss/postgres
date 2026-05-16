@@ -5711,7 +5711,7 @@ fn sink_reconnects_after_primary_pause() {
 
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let flushed: Option<bool> = client
+        let row = client
             .query_opt(
                 &format!(
                     "SELECT flush_lsn >= '{lsn_a}'::pg_lsn \
@@ -5720,9 +5720,11 @@ fn sink_reconnects_after_primary_pause() {
                 ),
                 &[],
             )
-            .unwrap()
-            .map(|r| r.get(0));
-        if flushed == Some(true) {
+            .unwrap();
+        let flushed = row
+            .and_then(|r| r.try_get::<_, Option<bool>>(0).ok().flatten())
+            .unwrap_or(false);
+        if flushed {
             break;
         }
         if Instant::now() > deadline {
@@ -5784,7 +5786,7 @@ fn sink_reconnects_after_primary_pause() {
 
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let flushed: Option<bool> = client
+        let row = client
             .query_opt(
                 &format!(
                     "SELECT flush_lsn >= '{lsn_b}'::pg_lsn \
@@ -5793,9 +5795,11 @@ fn sink_reconnects_after_primary_pause() {
                 ),
                 &[],
             )
-            .unwrap()
-            .map(|r| r.get(0));
-        if flushed == Some(true) {
+            .unwrap();
+        let flushed = row
+            .and_then(|r| r.try_get::<_, Option<bool>>(0).ok().flatten())
+            .unwrap_or(false);
+        if flushed {
             break;
         }
         if Instant::now() > deadline {
