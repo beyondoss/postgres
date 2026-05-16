@@ -31,6 +31,9 @@ libc = "0.2"
 libc = "0.2"
 
 [dev-dependencies]
+beyond-pg = { path = ".." }
+native-tls = "0.2"
 postgres = "0.19"
+postgres-native-tls = "0.5"
 tempfile = "3"
 testcontainers-modules = { version = "0.15", features = ["blocking", "postgres"] }

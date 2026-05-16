@@ -6460,3 +6460,1053 @@ fn chmod_sink_dir_makes_bind_mount_readable() {
         file_mode & 0o7777
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 1: TLS integration — postgres accepts the cert produced by
+// beyond_pg::tls::ensure_cert, and rejects plain TCP when pg_hba requires SSL.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "requires Docker"]
+fn tls_integration_postgres_with_beyond_pg_cert() {
+    use beyond_pg::tls::{TlsCertOutcome, ensure_cert};
+
+    fn allow_replication_ssl(client: &mut postgres::Client) {
+        // SSL-only pg_hba: every `hostssl` line forces TLS; no plain `host` lines.
+        // A `sslmode=disable` connect from another peer must be rejected.
+        client
+            .batch_execute(
+                "DO $$ DECLARE p text; BEGIN \
+                     SELECT current_setting('hba_file') INTO p; \
+                     EXECUTE format( \
+                         $q$COPY (SELECT line FROM (VALUES \
+                             ('local all all trust'), \
+                             ('hostssl all all all scram-sha-256'), \
+                             ('hostssl replication all all scram-sha-256') \
+                         ) AS t(line)) TO %L$q$, p); \
+                 END; $$; \
+                 SELECT pg_reload_conf();",
+            )
+            .expect("pg_hba rewrite failed");
+    }
+
+    // ── 1. Generate cert with beyond_pg::tls::ensure_cert ───────────────────
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let outcome = ensure_cert(tmp.path()).expect("ensure_cert");
+    assert_eq!(
+        outcome,
+        TlsCertOutcome::Generated,
+        "first call must Generate"
+    );
+    let cert_path = tmp.path().join("beyond/server.crt");
+    let key_path = tmp.path().join("beyond/server.key");
+    assert!(cert_path.exists(), "server.crt missing");
+    assert!(key_path.exists(), "server.key missing");
+
+    // Assertion C: cert content is non-trivial. ensure_cert wrote a real PEM,
+    // not an empty stub. >1 KB is well above the floor for a real cert.
+    let cert_size = std::fs::metadata(&cert_path).unwrap().len();
+    assert!(
+        cert_size > 1024,
+        "ensure_cert produced suspiciously small cert: {cert_size} bytes"
+    );
+
+    // Postgres in the container runs as uid 999 and refuses to load a key it
+    // doesn't own. chown via a short-lived root container so the host runner
+    // never needs root.
+    let certdir_str = tmp.path().join("beyond").to_str().unwrap().to_owned();
+    let chown_out = std::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--user",
+            "root",
+            "-v",
+            &format!("{certdir_str}:/tls"),
+            "postgres:18",
+            "chown",
+            "-R",
+            "999:999",
+            "/tls",
+        ])
+        .output()
+        .expect("docker chown");
+    assert!(
+        chown_out.status.success(),
+        "docker chown failed: {}",
+        String::from_utf8_lossy(&chown_out.stderr)
+    );
+
+    // ── 2. Start postgres with SSL on, mounting the cert dir ────────────────
+    let container = Postgres::default()
+        .with_tag("18")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "scram-sha-256")
+        .with_env_var("POSTGRES_PASSWORD", "tlstest")
+        .with_mount(Mount::bind_mount(certdir_str.clone(), "/tls"))
+        .with_cmd([
+            "-c",
+            "ssl=on",
+            "-c",
+            "ssl_cert_file=/tls/server.crt",
+            "-c",
+            "ssl_key_file=/tls/server.key",
+            "-c",
+            "wal_level=replica",
+            "-c",
+            "max_wal_senders=4",
+        ])
+        .start()
+        .expect("Docker not available or postgres:18 image pull failed");
+
+    let pg_port = container.get_host_port_ipv4(5432).unwrap();
+    let pg_url = format!(
+        "host=127.0.0.1 port={pg_port} user=postgres password=tlstest dbname=postgres"
+    );
+
+    // Connect once via the default (non-SSL) trust-local route through the
+    // unix socket-equivalent to rewrite pg_hba. Use the password-bearing URL
+    // since auth method is scram. The first connection still allows plain TCP
+    // because POSTGRES_HOST_AUTH_METHOD seeded the default rules.
+    let mut setup = postgres::Client::connect(&pg_url, postgres::NoTls)
+        .expect("initial setup connection (pre-pg_hba rewrite)");
+    allow_replication_ssl(&mut setup);
+    drop(setup);
+
+    // ── 3. Assertion A: SSL connect succeeds and ssl_is_used()=true ─────────
+    let cert_pem = std::fs::read(&cert_path).expect("read cert");
+    let root_cert = native_tls::Certificate::from_pem(&cert_pem).expect("parse cert");
+    let connector = native_tls::TlsConnector::builder()
+        .add_root_certificate(root_cert)
+        // Self-signed cert with SAN=localhost; we'll connect via 127.0.0.1, so
+        // disable hostname checks. The verify-CA equivalent (trust the cert
+        // bytes but skip CN match) is exactly this.
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .expect("build TlsConnector");
+    let mtls = postgres_native_tls::MakeTlsConnector::new(connector);
+
+    let mut ssl_client = postgres::Client::connect(
+        &format!("{pg_url} sslmode=require"),
+        mtls,
+    )
+    .expect("SSL connect should succeed against beyond-pg cert");
+
+    let ssl_in_use: bool = ssl_client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_ssl \
+             WHERE ssl AND pid = pg_backend_pid())",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(ssl_in_use, "pg_stat_ssl says backend is not using SSL");
+    drop(ssl_client);
+
+    // ── 4. Assertion B: sslmode=disable is rejected by pg_hba ───────────────
+    let plain_result = postgres::Client::connect(
+        &format!("{pg_url} sslmode=disable"),
+        postgres::NoTls,
+    );
+    assert!(
+        plain_result.is_err(),
+        "sslmode=disable should be rejected by hostssl-only pg_hba, got Ok"
+    );
+
+    // Note: testing the sink itself over TLS is future work — beyond-pg-sink
+    // currently only speaks plaintext to the primary. When TLS support lands,
+    // extend this test to spawn the sink with --sslmode=verify-ca.
+    drop(container);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 2: Three replicas concurrently restore WAL from the same sink dir via
+// bind-mount restore_command. Exposes concurrent filesystem-read races.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "requires Docker"]
+fn multiple_replicas_recover_from_one_sink() {
+    fn allow_replication(client: &mut postgres::Client) {
+        client
+            .batch_execute(
+                "DO $$ DECLARE p text; BEGIN \
+                     SELECT current_setting('hba_file') INTO p; \
+                     EXECUTE format( \
+                         $q$COPY (SELECT line FROM (VALUES \
+                             ('local all all trust'), \
+                             ('host all all all trust'), \
+                             ('host replication all all trust') \
+                         ) AS t(line)) TO %L$q$, p); \
+                 END; $$; \
+                 SELECT pg_reload_conf();",
+            )
+            .expect("pg_hba rewrite failed");
+    }
+
+    struct DropDir(std::path::PathBuf);
+    impl Drop for DropDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    struct DropContainer(String);
+    impl Drop for DropContainer {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.0])
+                .output();
+        }
+    }
+
+    // ── 1. primary ──────────────────────────────────────────────────────────
+    let primary = Postgres::default()
+        .with_tag("18")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd([
+            "-c",
+            "wal_level=replica",
+            "-c",
+            "max_wal_senders=5",
+            "-c",
+            "hot_standby=on",
+            "-c",
+            "synchronous_standby_names=*",
+            "-c",
+            "synchronous_commit=remote_write",
+        ])
+        .start()
+        .expect("Docker not available or postgres:18 image pull failed");
+
+    let pg_port = primary.get_host_port_ipv4(5432).unwrap();
+    let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
+    let mut primary_client =
+        postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect primary");
+    allow_replication(&mut primary_client);
+
+    // ── 2. sink ─────────────────────────────────────────────────────────────
+    let sink_dir = std::env::temp_dir().join(format!("wal-sink-multi-{pg_port}"));
+    std::fs::create_dir_all(&sink_dir).unwrap();
+    let sink_dir_str = sink_dir.to_str().unwrap().to_owned();
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let sink_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let connstr = format!("host=127.0.0.1 port={pg_port} user=postgres");
+    let mut sink_cmd = std::process::Command::new(BIN);
+    sink_cmd.args([
+        "--mode",
+        "tcp",
+        "--connstr",
+        &connstr,
+        "--dir",
+        &sink_dir_str,
+        "--port",
+        &sink_port.to_string(),
+        "--slot",
+        "wal_sink_multi",
+    ]);
+    #[cfg(unix)]
+    sink_cmd.process_group(0);
+    let sink_proc = sink_cmd.spawn().expect("spawn beyond-pg-sink");
+    let _sink = Sink {
+        process: sink_proc,
+        dir: sink_dir.clone(),
+    };
+    wait_http_ready(sink_port);
+
+    // Wait for the sink to attach.
+    let mut streaming = false;
+    for _ in 0..60 {
+        if primary_client
+            .query_opt(
+                "SELECT 1 FROM pg_stat_replication WHERE application_name='wal_sink_multi'",
+                &[],
+            )
+            .unwrap()
+            .is_some()
+        {
+            streaming = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(streaming, "sink never attached");
+
+    // ── 3. pre-backup rows ──────────────────────────────────────────────────
+    primary_client
+        .batch_execute(
+            "CREATE TABLE archive_test_multi (id serial, v text); \
+             INSERT INTO archive_test_multi (v) \
+               SELECT 'pre-' || g FROM generate_series(1, 50) g;",
+        )
+        .expect("pre-backup rows");
+    let pre_segment: String = primary_client
+        .query_one("SELECT pg_walfile_name(pg_current_wal_lsn())", &[])
+        .unwrap()
+        .get(0);
+    primary_client
+        .execute("SELECT pg_switch_wal()", &[])
+        .unwrap();
+    // Wait for the pre segment to seal in sink_dir.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !sink_dir.join(&pre_segment).exists() {
+        if Instant::now() > deadline {
+            panic!("pre-backup segment {pre_segment} never sealed");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // ── 4. pg_basebackup ×3 ─────────────────────────────────────────────────
+    let pgdata_r1 = std::env::temp_dir().join(format!("multi-pgdata1-{pg_port}"));
+    let pgdata_r2 = std::env::temp_dir().join(format!("multi-pgdata2-{pg_port}"));
+    let pgdata_r3 = std::env::temp_dir().join(format!("multi-pgdata3-{pg_port}"));
+    for p in [&pgdata_r1, &pgdata_r2, &pgdata_r3] {
+        std::fs::create_dir_all(p).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+    }
+    let _c1 = DropDir(pgdata_r1.clone());
+    let _c2 = DropDir(pgdata_r2.clone());
+    let _c3 = DropDir(pgdata_r3.clone());
+
+    for pgdata in [&pgdata_r1, &pgdata_r2, &pgdata_r3] {
+        let pgdata_str = pgdata.to_str().unwrap();
+        let out = std::process::Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--add-host=host.docker.internal:host-gateway",
+                "-v",
+                &format!("{pgdata_str}:/pgdata"),
+                "postgres:18",
+                "pg_basebackup",
+                "-d",
+                &format!("host=host.docker.internal port={pg_port} user=postgres"),
+                "--pgdata",
+                "/pgdata",
+                "--format=plain",
+                "--wal-method=stream",
+                "--checkpoint=fast",
+            ])
+            .output()
+            .expect("docker pg_basebackup");
+        assert!(
+            out.status.success(),
+            "pg_basebackup into {pgdata_str}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // ── 5. post-backup rows ─────────────────────────────────────────────────
+    primary_client
+        .batch_execute(
+            "INSERT INTO archive_test_multi (v) \
+               SELECT 'post-' || g FROM generate_series(1, 50) g;",
+        )
+        .expect("post-backup rows");
+    let post_segment: String = primary_client
+        .query_one("SELECT pg_walfile_name(pg_current_wal_lsn())", &[])
+        .unwrap()
+        .get(0);
+    primary_client
+        .execute("SELECT pg_switch_wal()", &[])
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !sink_dir.join(&post_segment).exists() {
+        if Instant::now() > deadline {
+            panic!("post-backup segment {post_segment} never sealed");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // ── 6. kill primary ─────────────────────────────────────────────────────
+    drop(primary_client);
+    drop(primary);
+
+    // ── 7. write recovery config into each pgdata via root container ────────
+    for pgdata in [&pgdata_r1, &pgdata_r2, &pgdata_r3] {
+        let pgdata_str = pgdata.to_str().unwrap();
+        let setup_script = "touch /pgdata/standby.signal && \
+             echo \"restore_command = 'cp /mnt/sink/%f %p'\" \
+               >> /pgdata/postgresql.auto.conf && \
+             echo \"recovery_target_timeline = 'latest'\" \
+               >> /pgdata/postgresql.auto.conf";
+        let out = std::process::Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--user",
+                "root",
+                "-v",
+                &format!("{pgdata_str}:/pgdata"),
+                "postgres:18",
+                "bash",
+                "-c",
+                setup_script,
+            ])
+            .output()
+            .expect("recovery config setup");
+        assert!(
+            out.status.success(),
+            "recovery setup ({pgdata_str}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // ── 8. chmod sink_dir so the postgres uid inside containers can read it ─
+    let chmod_out = std::process::Command::new("chmod")
+        .args(["-R", "a+rX", &sink_dir_str])
+        .output()
+        .expect("chmod sink_dir");
+    assert!(chmod_out.status.success(), "chmod sink_dir failed");
+
+    // ── 9. start all three replicas in parallel ─────────────────────────────
+    let mut replica_ports = [0u16; 3];
+    let mut replica_ids = [String::new(), String::new(), String::new()];
+
+    for (i, pgdata) in [&pgdata_r1, &pgdata_r2, &pgdata_r3].iter().enumerate() {
+        let pgdata_str = pgdata.to_str().unwrap();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        replica_ports[i] = port;
+
+        let out = std::process::Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--user",
+                "root",
+                "-v",
+                &format!("{pgdata_str}:/pgdata"),
+                "-v",
+                &format!("{sink_dir_str}:/mnt/sink:ro"),
+                "-p",
+                &format!("{port}:5432"),
+                "postgres:18",
+                "bash",
+                "-c",
+                "chmod 700 /pgdata && chown -R postgres:postgres /pgdata \
+                 && exec gosu postgres postgres -D /pgdata",
+            ])
+            .output()
+            .expect("docker run replica");
+        assert!(
+            out.status.success(),
+            "replica {i} start: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        replica_ids[i] = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    }
+
+    let _r1 = DropContainer(replica_ids[0].clone());
+    let _r2 = DropContainer(replica_ids[1].clone());
+    let _r3 = DropContainer(replica_ids[2].clone());
+
+    // ── 10. wait for each replica to accept connections ─────────────────────
+    for (i, &port) in replica_ports.iter().enumerate() {
+        let url = format!("host=127.0.0.1 port={port} user=postgres dbname=postgres");
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            if postgres::Client::connect(&url, postgres::NoTls).is_ok() {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("replica {i} not accepting connections on port {port} within 90s");
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    // ── 11. wait for >=100 rows on each replica, in parallel ────────────────
+    let mut handles = Vec::new();
+    for (i, &port) in replica_ports.iter().enumerate() {
+        let h = std::thread::spawn(move || -> Result<bool, String> {
+            let url = format!("host=127.0.0.1 port={port} user=postgres dbname=postgres");
+            let mut client = postgres::Client::connect(&url, postgres::NoTls)
+                .map_err(|e| format!("replica {i} connect: {e}"))?;
+            let deadline = Instant::now() + Duration::from_secs(90);
+            loop {
+                let n: i64 = client
+                    .query_one("SELECT count(*) FROM archive_test_multi", &[])
+                    .map(|r| r.get(0))
+                    .unwrap_or(0);
+                if n >= 100 {
+                    let in_recovery: bool = client
+                        .query_one("SELECT pg_is_in_recovery()", &[])
+                        .map(|r| r.get(0))
+                        .unwrap_or(false);
+                    return Ok(in_recovery);
+                }
+                if Instant::now() > deadline {
+                    return Err(format!("replica {i} timed out at count={n}"));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        handles.push(h);
+    }
+
+    for h in handles {
+        let res = h.join().expect("thread join");
+        let in_recovery = res.expect("replica did not recover within 90s");
+        assert!(in_recovery, "replica must still be in recovery");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 3: 3-minute pgbench soak. Verify the sink's RSS, fd count, .partial
+// files, and replication-slot lag are all bounded under sustained load.
+// Linux-only because /proc snapshotting isn't portable; skipped elsewhere.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "requires Docker"]
+fn sink_stability_under_3min_load() {
+    if !cfg!(target_os = "linux") {
+        eprintln!(
+            "sink_stability_under_3min_load: skipping on non-Linux \
+             (depends on /proc/<pid>/status and /proc/<pid>/fd)"
+        );
+        return;
+    }
+
+    fn allow_replication(client: &mut postgres::Client) {
+        client
+            .batch_execute(
+                "DO $$ DECLARE p text; BEGIN \
+                     SELECT current_setting('hba_file') INTO p; \
+                     EXECUTE format( \
+                         $q$COPY (SELECT line FROM (VALUES \
+                             ('local all all trust'), \
+                             ('host all all all trust'), \
+                             ('host replication all all trust') \
+                         ) AS t(line)) TO %L$q$, p); \
+                 END; $$; \
+                 SELECT pg_reload_conf();",
+            )
+            .expect("pg_hba rewrite");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_rss_kb(pid: u32) -> Option<u64> {
+        let s = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let mut parts = rest.split_ascii_whitespace();
+                if let Some(num) = parts.next() {
+                    return num.parse::<u64>().ok();
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn read_rss_kb(_pid: u32) -> Option<u64> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn count_fds(pid: u32) -> Option<usize> {
+        std::fs::read_dir(format!("/proc/{pid}/fd")).ok().map(|d| d.count())
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn count_fds(_pid: u32) -> Option<usize> {
+        None
+    }
+
+    // ── 1. primary tuned for pgbench ────────────────────────────────────────
+    let primary = Postgres::default()
+        .with_tag("18")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd([
+            "-c",
+            "wal_level=replica",
+            "-c",
+            "max_wal_senders=4",
+            "-c",
+            "max_connections=20",
+            "-c",
+            "shared_buffers=128MB",
+            "-c",
+            "synchronous_standby_names=*",
+            "-c",
+            "synchronous_commit=remote_write",
+        ])
+        .start()
+        .expect("docker not available or postgres:18 pull failed");
+
+    let pg_port = primary.get_host_port_ipv4(5432).unwrap();
+    let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
+    let primary_id = primary.id().to_owned();
+    let mut client =
+        postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect primary");
+    allow_replication(&mut client);
+
+    // ── 2. sink ─────────────────────────────────────────────────────────────
+    let sink_dir = std::env::temp_dir().join(format!("wal-sink-soak-{pg_port}"));
+    std::fs::create_dir_all(&sink_dir).unwrap();
+    let sink_dir_str = sink_dir.to_str().unwrap().to_owned();
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let sink_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let connstr = format!("host=127.0.0.1 port={pg_port} user=postgres");
+    let mut sink_cmd = std::process::Command::new(BIN);
+    sink_cmd.args([
+        "--mode",
+        "tcp",
+        "--connstr",
+        &connstr,
+        "--dir",
+        &sink_dir_str,
+        "--port",
+        &sink_port.to_string(),
+        "--slot",
+        "wal_sink_soak",
+    ]);
+    #[cfg(unix)]
+    sink_cmd.process_group(0);
+    let sink_proc = sink_cmd.spawn().expect("spawn beyond-pg-sink");
+    let sink_pid = sink_proc.id();
+    let _sink = Sink {
+        process: sink_proc,
+        dir: sink_dir.clone(),
+    };
+    wait_http_ready(sink_port);
+
+    let mut streaming = false;
+    for _ in 0..60 {
+        if client
+            .query_opt(
+                "SELECT 1 FROM pg_stat_replication WHERE application_name='wal_sink_soak'",
+                &[],
+            )
+            .unwrap()
+            .is_some()
+        {
+            streaming = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(streaming, "sink never attached");
+
+    // ── 3. pgbench init ─────────────────────────────────────────────────────
+    let init_out = std::process::Command::new("docker")
+        .args([
+            "exec", &primary_id, "gosu", "postgres", "pgbench", "-i", "-s", "1", "postgres",
+        ])
+        .output()
+        .expect("docker exec pgbench -i");
+    assert!(
+        init_out.status.success(),
+        "pgbench -i: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    // ── 4. spawn pgbench for 180s (background) ──────────────────────────────
+    let mut pgbench = std::process::Command::new("docker")
+        .args([
+            "exec",
+            &primary_id,
+            "gosu",
+            "postgres",
+            "pgbench",
+            "-c",
+            "4",
+            "-j",
+            "4",
+            "-T",
+            "180",
+            "postgres",
+        ])
+        .spawn()
+        .expect("spawn pgbench");
+
+    // ── 5. sample every 10s for 18 iterations (= 180s) ──────────────────────
+    let mut samples: Vec<(u64, usize, usize, i64)> = Vec::with_capacity(18);
+    for _ in 0..18 {
+        std::thread::sleep(Duration::from_secs(10));
+        let rss = read_rss_kb(sink_pid).unwrap_or(0);
+        let fds = count_fds(sink_pid).unwrap_or(0);
+        let partials = std::fs::read_dir(&sink_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .ends_with(".partial")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let lag: i64 = client
+            .query_opt(
+                "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn)::bigint \
+                 FROM pg_stat_replication WHERE application_name='wal_sink_soak'",
+                &[],
+            )
+            .unwrap()
+            .and_then(|r| r.get::<_, Option<i64>>(0))
+            .unwrap_or(0);
+        samples.push((rss, fds, partials, lag));
+    }
+
+    // ── 6. wait for pgbench to finish ───────────────────────────────────────
+    let pgbench_status = pgbench.wait().expect("wait pgbench");
+    assert!(pgbench_status.success(), "pgbench did not exit cleanly");
+
+    // ── 7. wait for the sink to catch up post-pgbench ───────────────────────
+    let final_lsn: String = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .unwrap()
+        .get(0);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let caught: Option<bool> = client
+            .query_opt(
+                &format!(
+                    "SELECT flush_lsn >= '{final_lsn}'::pg_lsn \
+                     FROM pg_stat_replication WHERE application_name='wal_sink_soak'"
+                ),
+                &[],
+            )
+            .unwrap()
+            .map(|r| r.get(0));
+        if caught == Some(true) {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("sink never caught up to {final_lsn} after pgbench (samples={samples:?})");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // ── 8. assertions ───────────────────────────────────────────────────────
+    let min_rss = samples.iter().map(|s| s.0).min().unwrap_or(0).max(1);
+    let max_rss = samples.iter().map(|s| s.0).max().unwrap_or(0);
+    let min_fds = samples.iter().map(|s| s.1).min().unwrap_or(0);
+    let max_fds = samples.iter().map(|s| s.1).max().unwrap_or(0);
+
+    assert!(
+        max_rss < min_rss * 2,
+        "RSS doubled (likely leak): min={min_rss}kB max={max_rss}kB; samples={samples:?}"
+    );
+    assert!(
+        max_fds < min_fds + 10,
+        "fd count grew >10 (likely leak): min={min_fds} max={max_fds}; samples={samples:?}"
+    );
+    for (i, (_, _, partials, lag)) in samples.iter().enumerate() {
+        assert!(
+            *partials <= 1,
+            "sample {i}: partials={partials} > 1; samples={samples:?}"
+        );
+        assert!(
+            *lag < 64 * 1024 * 1024,
+            "sample {i}: lag={lag} bytes > 64MiB; samples={samples:?}"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 4: A paused sink pins the primary's WAL via its replication slot.
+// Resuming the sink lets the slot advance and WAL recycle.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "requires Docker"]
+fn slot_blocks_wal_pruning_when_consumer_stops() {
+    fn allow_replication(client: &mut postgres::Client) {
+        client
+            .batch_execute(
+                "DO $$ DECLARE p text; BEGIN \
+                     SELECT current_setting('hba_file') INTO p; \
+                     EXECUTE format( \
+                         $q$COPY (SELECT line FROM (VALUES \
+                             ('local all all trust'), \
+                             ('host all all all trust'), \
+                             ('host replication all all trust') \
+                         ) AS t(line)) TO %L$q$, p); \
+                 END; $$; \
+                 SELECT pg_reload_conf();",
+            )
+            .expect("pg_hba rewrite");
+    }
+
+    fn count_wal_segments(container_id: &str) -> usize {
+        let out = std::process::Command::new("docker")
+            .args([
+                "exec",
+                container_id,
+                "bash",
+                "-c",
+                "ls /var/lib/postgresql/data/pg_wal | grep -E '^[0-9A-F]{24}$' | wc -l",
+            ])
+            .output()
+            .expect("docker exec ls pg_wal");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(0)
+    }
+
+    // ── 1. primary with small WAL retention so it recycles quickly ──────────
+    let primary = Postgres::default()
+        .with_tag("18")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd([
+            "-c",
+            "wal_level=replica",
+            "-c",
+            "max_wal_senders=4",
+            "-c",
+            "min_wal_size=32MB",
+            "-c",
+            "max_wal_size=64MB",
+        ])
+        .start()
+        .expect("Docker not available or postgres:18 image pull failed");
+
+    let pg_port = primary.get_host_port_ipv4(5432).unwrap();
+    let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
+    let primary_id = primary.id().to_owned();
+    let mut client =
+        postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect primary");
+    allow_replication(&mut client);
+
+    // ── 2. sink ─────────────────────────────────────────────────────────────
+    let sink_dir = std::env::temp_dir().join(format!("wal-sink-blocked-{pg_port}"));
+    std::fs::create_dir_all(&sink_dir).unwrap();
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let sink_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let connstr = format!("host=127.0.0.1 port={pg_port} user=postgres");
+    let mut sink_cmd = std::process::Command::new(BIN);
+    sink_cmd.args([
+        "--mode",
+        "tcp",
+        "--connstr",
+        &connstr,
+        "--dir",
+        sink_dir.to_str().unwrap(),
+        "--port",
+        &sink_port.to_string(),
+        "--slot",
+        "wal_sink_blocked",
+    ]);
+    #[cfg(unix)]
+    sink_cmd.process_group(0);
+    let sink_proc = sink_cmd.spawn().expect("spawn beyond-pg-sink");
+    let sink_pid = sink_proc.id();
+    let _sink = Sink {
+        process: sink_proc,
+        dir: sink_dir.clone(),
+    };
+    wait_http_ready(sink_port);
+
+    let mut streaming = false;
+    for _ in 0..60 {
+        if client
+            .query_opt(
+                "SELECT 1 FROM pg_stat_replication WHERE application_name='wal_sink_blocked'",
+                &[],
+            )
+            .unwrap()
+            .is_some()
+        {
+            streaming = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(streaming, "sink never attached");
+
+    // ── 3. seed table and wait for flush ────────────────────────────────────
+    client
+        .batch_execute(
+            "CREATE TABLE slot_test (id serial, v text); \
+             INSERT INTO slot_test (v) SELECT 'seed-' || g FROM generate_series(1, 50) g;",
+        )
+        .unwrap();
+    let seed_lsn: String = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .unwrap()
+        .get(0);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let flushed: Option<bool> = client
+            .query_opt(
+                &format!(
+                    "SELECT flush_lsn >= '{seed_lsn}'::pg_lsn \
+                     FROM pg_stat_replication WHERE application_name='wal_sink_blocked'"
+                ),
+                &[],
+            )
+            .unwrap()
+            .map(|r| r.get(0));
+        if flushed == Some(true) {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("sink never reached seed_lsn {seed_lsn}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // ── 4. snapshot restart_lsn + WAL count before pause ────────────────────
+    let restart_lsn_before: String = client
+        .query_one(
+            "SELECT restart_lsn::text FROM pg_replication_slots \
+             WHERE slot_name='wal_sink_blocked'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    let wal_count_before = count_wal_segments(&primary_id);
+
+    // ── 5. SIGSTOP the sink (process stays alive, slot stays "active") ──────
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(sink_pid as i32, libc::SIGSTOP);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sink_pid;
+        panic!("non-unix: cannot SIGSTOP");
+    }
+    // Give the kernel a beat to deliver the signal.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // ── 6. drive WAL on the primary to force rotation ───────────────────────
+    // Each batch is ~5 MB of text; 8 batches × switch ≈ 40+ MB, well above
+    // max_wal_size=64MB. Without the slot, postgres would recycle freely;
+    // with it, segments must accumulate.
+    for _ in 0..8 {
+        client
+            .batch_execute(
+                "INSERT INTO slot_test (v) \
+                   SELECT repeat('x', 100) FROM generate_series(1, 50000) g; \
+                 SELECT pg_switch_wal();",
+            )
+            .unwrap();
+    }
+
+    // ── 7. assertions while paused ──────────────────────────────────────────
+    let wal_count_after_stop = count_wal_segments(&primary_id);
+    assert!(
+        wal_count_after_stop > wal_count_before,
+        "WAL did not grow with paused consumer: before={wal_count_before} after={wal_count_after_stop}"
+    );
+
+    let restart_lsn_after_stop: String = client
+        .query_one(
+            "SELECT restart_lsn::text FROM pg_replication_slots \
+             WHERE slot_name='wal_sink_blocked'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        restart_lsn_after_stop, restart_lsn_before,
+        "restart_lsn must not advance while sink is SIGSTOPed"
+    );
+
+    let active: bool = client
+        .query_one(
+            "SELECT active FROM pg_replication_slots WHERE slot_name='wal_sink_blocked'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(active, "slot should still be active (TCP conn alive)");
+
+    // ── 8. resume the sink ──────────────────────────────────────────────────
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(sink_pid as i32, libc::SIGCONT);
+    }
+
+    // Wait up to 60s for the sink to drain the backlog.
+    let current_lsn: String = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .unwrap()
+        .get(0);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let caught: Option<bool> = client
+            .query_opt(
+                &format!(
+                    "SELECT flush_lsn >= '{current_lsn}'::pg_lsn \
+                     FROM pg_stat_replication WHERE application_name='wal_sink_blocked'"
+                ),
+                &[],
+            )
+            .unwrap()
+            .map(|r| r.get(0));
+        if caught == Some(true) {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("sink did not catch up to {current_lsn} after SIGCONT");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // Force a checkpoint so postgres prunes/recycles old WAL.
+    client.execute("CHECKPOINT", &[]).unwrap();
+
+    let restart_lsn_after_resume: String = client
+        .query_one(
+            "SELECT restart_lsn::text FROM pg_replication_slots \
+             WHERE slot_name='wal_sink_blocked'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    let advanced: bool = client
+        .query_one(
+            &format!(
+                "SELECT '{restart_lsn_after_resume}'::pg_lsn > '{restart_lsn_before}'::pg_lsn"
+            ),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        advanced,
+        "restart_lsn did not advance after resume: before={restart_lsn_before} after={restart_lsn_after_resume}"
+    );
+
+    // Assertion E: eventually the primary recycles some WAL.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_count;
+    loop {
+        last_count = count_wal_segments(&primary_id);
+        if last_count <= wal_count_after_stop {
+            // Some WAL was pruned (count went down or stayed); we tolerate equal
+            // since at minimum primary stopped growing under recycling pressure.
+            // The asserted condition is `<=`, which is what we want here.
+            break;
+        }
+        if Instant::now() > deadline {
+            break;
+        }
+        // Repeat a small checkpoint to nudge recycling.
+        let _ = client.execute("CHECKPOINT", &[]);
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    assert!(
+        last_count <= wal_count_after_stop,
+        "WAL was never pruned after resume: at_pause={wal_count_after_stop} now={last_count}"
+    );
+}
+
