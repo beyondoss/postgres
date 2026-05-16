@@ -3307,10 +3307,17 @@ fn timeline_boundary_survives_failover() {
     // 0700. Make them host-readable so the cp -r below can read them.
     let chmod_out = std::process::Command::new("docker")
         .args([
-            "run", "--rm", "--user", "root",
-            "-v", &format!("{pgdata1_str}:/pgdata"),
+            "run",
+            "--rm",
+            "--user",
+            "root",
+            "-v",
+            &format!("{pgdata1_str}:/pgdata"),
             "postgres:18",
-            "chmod", "-R", "a+rwX", "/pgdata",
+            "chmod",
+            "-R",
+            "a+rwX",
+            "/pgdata",
         ])
         .output()
         .expect("chmod pgdata1");
@@ -3553,10 +3560,8 @@ fn timeline_boundary_survives_failover() {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &history_dst,
-                    std::fs::Permissions::from_mode(0o644),
-                );
+                let _ =
+                    std::fs::set_permissions(&history_dst, std::fs::Permissions::from_mode(0o644));
             }
             break;
         }
@@ -3580,10 +3585,7 @@ fn timeline_boundary_survives_failover() {
     {
         let (status, body) = http_get(sink_port, "/00000002.history");
         assert_eq!(status, 200, "sink HTTP must serve .history file");
-        assert!(
-            !body.is_empty(),
-            "served .history file must be non-empty"
-        );
+        assert!(!body.is_empty(), "served .history file must be non-empty");
         // .history files are text — first byte must be ASCII (typically a digit
         // for the parent timeline id).
         assert!(
@@ -3671,9 +3673,7 @@ fn timeline_boundary_survives_failover() {
                 .filter_map(|e| e.ok())
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .collect();
-            panic!(
-                "T2 segment {t2_post_segment} never archived within 60s\nsink_dir: {ls:?}"
-            );
+            panic!("T2 segment {t2_post_segment} never archived within 60s\nsink_dir: {ls:?}");
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -4835,12 +4835,7 @@ fn sink_slot_offline_catch_up() {
     let primary = Postgres::default()
         .with_tag("18")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-        .with_cmd([
-            "-c",
-            "wal_level=replica",
-            "-c",
-            "max_wal_senders=4",
-        ])
+        .with_cmd(["-c", "wal_level=replica", "-c", "max_wal_senders=4"])
         .start()
         .expect("docker not available or postgres:18 pull failed");
     let pg_port = primary.get_host_port_ipv4(5432).unwrap();
@@ -5379,12 +5374,7 @@ fn sink_recovers_from_corrupted_partial() {
     let container = Postgres::default()
         .with_tag("18")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-        .with_cmd([
-            "-c",
-            "wal_level=replica",
-            "-c",
-            "max_wal_senders=4",
-        ])
+        .with_cmd(["-c", "wal_level=replica", "-c", "max_wal_senders=4"])
         .start()
         .expect("Docker not available or postgres:18 image pull failed");
 
@@ -5486,11 +5476,7 @@ fn sink_recovers_from_corrupted_partial() {
     let partials: Vec<_> = std::fs::read_dir(&sink_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .ends_with(".partial")
-        })
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
         .collect();
     if partials.is_empty() {
         let path = sink_dir.join("000000010000000000000999.partial");
@@ -5500,11 +5486,7 @@ fn sink_recovers_from_corrupted_partial() {
     let partial_count = std::fs::read_dir(&sink_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .ends_with(".partial")
-        })
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
         .count();
     assert!(
         partial_count >= 1,
@@ -5529,11 +5511,7 @@ fn sink_recovers_from_corrupted_partial() {
         let remaining = std::fs::read_dir(&sink_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with(".partial")
-            })
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
             .count();
         // After cleanup_partial_segments + a fresh stream, sink may create a
         // new .partial for the live segment. We only require that the
@@ -5633,12 +5611,7 @@ fn sink_reconnects_after_primary_pause() {
     let primary = Postgres::default()
         .with_tag("18")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-        .with_cmd([
-            "-c",
-            "wal_level=replica",
-            "-c",
-            "max_wal_senders=4",
-        ])
+        .with_cmd(["-c", "wal_level=replica", "-c", "max_wal_senders=4"])
         .start()
         .expect("Docker not available or postgres:18 image pull failed");
 
@@ -6000,7 +5973,10 @@ fn sink_handles_disk_full() {
         .output()
         .expect("docker inspect");
     let running = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    assert_eq!(running, "true", "sink crashed under disk-full (running={running})");
+    assert_eq!(
+        running, "true",
+        "sink crashed under disk-full (running={running})"
+    );
 
     // List segments inside container.
     let out = std::process::Command::new("docker")
@@ -6042,12 +6018,7 @@ fn sink_retention_prunes_under_streaming() {
     let container = Postgres::default()
         .with_tag("18")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-        .with_cmd([
-            "-c",
-            "wal_level=replica",
-            "-c",
-            "max_wal_senders=4",
-        ])
+        .with_cmd(["-c", "wal_level=replica", "-c", "max_wal_senders=4"])
         .start()
         .expect("Docker not available or postgres:18 image pull failed");
 
@@ -6180,12 +6151,7 @@ fn sink_streams_with_md5_auth() {
         .with_tag("18")
         .with_env_var("POSTGRES_PASSWORD", "testpass123")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "scram-sha-256")
-        .with_cmd([
-            "-c",
-            "wal_level=replica",
-            "-c",
-            "max_wal_senders=4",
-        ])
+        .with_cmd(["-c", "wal_level=replica", "-c", "max_wal_senders=4"])
         .start()
         .expect("Docker not available or postgres:18 image pull failed");
 
@@ -6316,12 +6282,7 @@ fn sink_seals_segment_with_quiet_primary() {
     let container = Postgres::default()
         .with_tag("18")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-        .with_cmd([
-            "-c",
-            "wal_level=replica",
-            "-c",
-            "max_wal_senders=4",
-        ])
+        .with_cmd(["-c", "wal_level=replica", "-c", "max_wal_senders=4"])
         .start()
         .expect("Docker not available or postgres:18 image pull failed");
 
@@ -6410,9 +6371,7 @@ fn sink_seals_segment_with_quiet_primary() {
                     (n, s)
                 })
                 .collect();
-            panic!(
-                "segment {pre_switch_segment} never sealed with quiet primary; dir: {ls:?}"
-            );
+            panic!("segment {pre_switch_segment} never sealed with quiet primary; dir: {ls:?}");
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -6435,8 +6394,7 @@ fn chmod_sink_dir_makes_bind_mount_readable() {
             .expect("chmod file 0600");
     }
 
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .expect("chmod dir 0700");
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("chmod dir 0700");
 
     let out = std::process::Command::new("chmod")
         .args(["-R", "a+rX", dir.to_str().unwrap()])
@@ -6564,9 +6522,8 @@ fn tls_integration_postgres_with_beyond_pg_cert() {
         .expect("Docker not available or postgres:18 image pull failed");
 
     let pg_port = container.get_host_port_ipv4(5432).unwrap();
-    let pg_url = format!(
-        "host=127.0.0.1 port={pg_port} user=postgres password=tlstest dbname=postgres"
-    );
+    let pg_url =
+        format!("host=127.0.0.1 port={pg_port} user=postgres password=tlstest dbname=postgres");
 
     // Connect once via the default (non-SSL) trust-local route through the
     // unix socket-equivalent to rewrite pg_hba. Use the password-bearing URL
@@ -6590,11 +6547,8 @@ fn tls_integration_postgres_with_beyond_pg_cert() {
         .expect("build TlsConnector");
     let mtls = postgres_native_tls::MakeTlsConnector::new(connector);
 
-    let mut ssl_client = postgres::Client::connect(
-        &format!("{pg_url} sslmode=require"),
-        mtls,
-    )
-    .expect("SSL connect should succeed against beyond-pg cert");
+    let mut ssl_client = postgres::Client::connect(&format!("{pg_url} sslmode=require"), mtls)
+        .expect("SSL connect should succeed against beyond-pg cert");
 
     let ssl_in_use: bool = ssl_client
         .query_one(
@@ -6608,10 +6562,8 @@ fn tls_integration_postgres_with_beyond_pg_cert() {
     drop(ssl_client);
 
     // ── 4. Assertion B: sslmode=disable is rejected by pg_hba ───────────────
-    let plain_result = postgres::Client::connect(
-        &format!("{pg_url} sslmode=disable"),
-        postgres::NoTls,
-    );
+    let plain_result =
+        postgres::Client::connect(&format!("{pg_url} sslmode=disable"), postgres::NoTls);
     assert!(
         plain_result.is_err(),
         "sslmode=disable should be rejected by hostssl-only pg_hba, got Ok"
@@ -7018,7 +6970,9 @@ fn sink_stability_under_3min_load() {
 
     #[cfg(target_os = "linux")]
     fn count_fds(pid: u32) -> Option<usize> {
-        std::fs::read_dir(format!("/proc/{pid}/fd")).ok().map(|d| d.count())
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .ok()
+            .map(|d| d.count())
     }
     #[cfg(not(target_os = "linux"))]
     fn count_fds(_pid: u32) -> Option<usize> {
@@ -7049,8 +7003,7 @@ fn sink_stability_under_3min_load() {
     let pg_port = primary.get_host_port_ipv4(5432).unwrap();
     let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
     let primary_id = primary.id().to_owned();
-    let mut client =
-        postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect primary");
+    let mut client = postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect primary");
     allow_replication(&mut client);
 
     // ── 2. sink ─────────────────────────────────────────────────────────────
@@ -7106,7 +7059,15 @@ fn sink_stability_under_3min_load() {
     // ── 3. pgbench init ─────────────────────────────────────────────────────
     let init_out = std::process::Command::new("docker")
         .args([
-            "exec", &primary_id, "gosu", "postgres", "pgbench", "-i", "-s", "1", "postgres",
+            "exec",
+            &primary_id,
+            "gosu",
+            "postgres",
+            "pgbench",
+            "-i",
+            "-s",
+            "1",
+            "postgres",
         ])
         .output()
         .expect("docker exec pgbench -i");
@@ -7144,11 +7105,7 @@ fn sink_stability_under_3min_load() {
         let partials = std::fs::read_dir(&sink_dir)
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_name()
-                            .to_string_lossy()
-                            .ends_with(".partial")
-                    })
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
                     .count()
             })
             .unwrap_or(0);
@@ -7278,8 +7235,7 @@ fn slot_blocks_wal_pruning_when_consumer_stops() {
     let pg_port = primary.get_host_port_ipv4(5432).unwrap();
     let pg_url = format!("host=127.0.0.1 port={pg_port} user=postgres dbname=postgres");
     let _primary_id = primary.id().to_owned();
-    let mut client =
-        postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect primary");
+    let mut client = postgres::Client::connect(&pg_url, postgres::NoTls).expect("connect primary");
     allow_replication(&mut client);
 
     // ── 2. sink ─────────────────────────────────────────────────────────────
@@ -7516,4 +7472,3 @@ fn slot_blocks_wal_pruning_when_consumer_stops() {
         "WAL was never pruned after resume: at_pause={wal_count_after_stop} now={last_count}"
     );
 }
-
