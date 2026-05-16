@@ -6504,10 +6504,11 @@ fn tls_integration_postgres_with_beyond_pg_cert() {
     assert!(key_path.exists(), "server.key missing");
 
     // Assertion C: cert content is non-trivial. ensure_cert wrote a real PEM,
-    // not an empty stub. >1 KB is well above the floor for a real cert.
+    // not an empty stub. Ed25519 certs are compact (~470 bytes PEM-encoded);
+    // 300 bytes is well above any plausible empty/stub but below real content.
     let cert_size = std::fs::metadata(&cert_path).unwrap().len();
     assert!(
-        cert_size > 1024,
+        cert_size > 300,
         "ensure_cert produced suspiciously small cert: {cert_size} bytes"
     );
 
@@ -7343,7 +7344,9 @@ fn slot_blocks_wal_pruning_when_consumer_stops() {
         .get(0);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let flushed: Option<bool> = client
+        // flush_lsn can transiently be NULL before the standby has fully
+        // initialised, so deserialise as Option<bool> and treat NULL as false.
+        let row = client
             .query_opt(
                 &format!(
                     "SELECT flush_lsn >= '{seed_lsn}'::pg_lsn \
@@ -7351,9 +7354,11 @@ fn slot_blocks_wal_pruning_when_consumer_stops() {
                 ),
                 &[],
             )
-            .unwrap()
-            .map(|r| r.get(0));
-        if flushed == Some(true) {
+            .unwrap();
+        let flushed = row
+            .and_then(|r| r.try_get::<_, Option<bool>>(0).ok().flatten())
+            .unwrap_or(false);
+        if flushed {
             break;
         }
         if Instant::now() > deadline {
@@ -7442,7 +7447,7 @@ fn slot_blocks_wal_pruning_when_consumer_stops() {
         .get(0);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let caught: Option<bool> = client
+        let row = client
             .query_opt(
                 &format!(
                     "SELECT flush_lsn >= '{current_lsn}'::pg_lsn \
@@ -7450,9 +7455,11 @@ fn slot_blocks_wal_pruning_when_consumer_stops() {
                 ),
                 &[],
             )
-            .unwrap()
-            .map(|r| r.get(0));
-        if caught == Some(true) {
+            .unwrap();
+        let caught = row
+            .and_then(|r| r.try_get::<_, Option<bool>>(0).ok().flatten())
+            .unwrap_or(false);
+        if caught {
             break;
         }
         if Instant::now() > deadline {
