@@ -25,6 +25,10 @@ run = "cargo test --test boot -- --include-ignored --nocapture"
 description = "Run supervisor lifecycle tests (requires Docker + musl target + beyond-pg-test image)"
 run = "cargo test --test supervisor -- --include-ignored --nocapture"
 
+[tasks."test:handoff"]
+description = "Run beyond-pg-init → supervisor handoff e2e tests (requires Docker + musl target + beyond-pg-test image)"
+run = "cargo test --release --test handoff_e2e -- --include-ignored --nocapture --test-threads=1"
+
 [tasks."test:e2e:sink"]
 description = "Run WAL sink end-to-end test (requires Docker and pg_receivewal on PATH)"
 run = "cargo test -p beyond-pg-sink --test e2e -- --include-ignored --nocapture"
