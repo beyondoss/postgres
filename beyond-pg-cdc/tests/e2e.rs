@@ -144,10 +144,10 @@ fn spawn_resp_reader(port: u16) -> std::sync::mpsc::Receiver<serde_json::Value> 
                 if payload == b"heartbeat" {
                     continue;
                 }
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
-                    if tx.send(v).is_err() {
-                        return;
-                    }
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload)
+                    && tx.send(v).is_err()
+                {
+                    return;
                 }
             }
         }

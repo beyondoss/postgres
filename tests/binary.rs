@@ -1,10 +1,10 @@
-/// Integration tests that exercise the actual `beyond-pg` binary via
-/// `CARGO_BIN_EXE_beyond-pg`. Each test spawns the binary as a subprocess so
-/// we prove the real artifact behaves correctly, not just library internals.
-///
-/// `archive` subcommand tests run without Docker: they control the MMDS path
-/// via `BEYOND_PG_MMDS_PATH` and swap in a fake `aws` script by prepending a
-/// temp directory to `PATH`.
+//! Integration tests that exercise the actual `beyond-pg` binary via
+//! `CARGO_BIN_EXE_beyond-pg`. Each test spawns the binary as a subprocess so
+//! we prove the real artifact behaves correctly, not just library internals.
+//!
+//! `archive` subcommand tests run without Docker: they control the MMDS path
+//! via `BEYOND_PG_MMDS_PATH` and swap in a fake `aws` script by prepending a
+//! temp directory to `PATH`.
 
 #[cfg(unix)]
 mod archive {

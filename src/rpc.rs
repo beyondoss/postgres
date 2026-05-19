@@ -1,4 +1,5 @@
-//! Vsock control RPC server — `beyond-pg supervisor` binds this on `RPC_PORT`.
+//! Control RPC server — `beyond-pg supervisor` serves this on the inherited
+//! listener (vsock in production; unix-socket fallback for tests / local dev).
 //!
 //! Wire format: length-prefixed MessagePack.
 //!   Request:  [4-byte BE u32 length][msgpack RpcRequest]
@@ -11,20 +12,53 @@
 //!   promote    → pg_ctl promote -w (blocks until standby exits recovery; ok:true = primary)
 //!   backup     → stub (not implemented)
 //!
-//! Only available on Linux (vsock is a Linux kernel feature).
+//! Only available on Linux.
 
 #[cfg(target_os = "linux")]
 mod inner {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener, VsockStream};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
     use tracing::{error, info, warn};
 
+    use crate::handoff_bridge::SharedState;
     use crate::vsock::RPC_PORT;
 
-    const MAX_RPC_BODY: usize = 1024 * 1024; // 1 MiB — guards against host sending a huge length
-    // promote blocks for up to 55 s waiting for standby→primary transition; all
-    // other commands complete in well under 1 s.
-    const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const MAX_RPC_BODY: usize = 1024 * 1024;
+    const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Carries one of two concrete listener types behind a single accept-loop.
+    ///
+    /// Production: vsock (Firecracker has it as a virtio device, no extra caps).
+    /// Tests / local dev: unix domain socket (vsock is not available on most
+    /// host kernels without `vhost_vsock` module + capabilities).
+    pub enum RpcListener {
+        Vsock(VsockListener),
+        Unix(tokio::net::UnixListener),
+    }
+
+    impl RpcListener {
+        async fn accept(&self) -> std::io::Result<RpcStream> {
+            match self {
+                RpcListener::Vsock(l) => {
+                    let (s, _addr) = l.accept().await?;
+                    Ok(RpcStream::Vsock(s))
+                }
+                RpcListener::Unix(l) => {
+                    let (s, _addr) = l.accept().await?;
+                    Ok(RpcStream::Unix(s))
+                }
+            }
+        }
+    }
+
+    enum RpcStream {
+        Vsock(tokio_vsock::VsockStream),
+        Unix(tokio::net::UnixStream),
+    }
 
     #[derive(serde::Deserialize)]
     struct RpcRequest {
@@ -53,27 +87,37 @@ mod inner {
         }
     }
 
-    pub async fn serve() {
-        let listener = match VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, RPC_PORT)) {
-            Ok(l) => l,
-            Err(e) => {
-                error!("rpc: failed to bind vsock port {RPC_PORT}: {e}");
-                return;
-            }
+    /// Serve the control RPC.
+    ///
+    /// `listener` is the bound listener (vsock in production, unix-socket
+    /// fallback for tests / local dev). `state` shares `accept_paused` +
+    /// `in_flight` with the handoff `Drainable` so drain can pause accepts
+    /// and wait for in-flight handlers to complete.
+    pub async fn serve(listener: RpcListener, state: SharedState) {
+        let kind = match &listener {
+            RpcListener::Vsock(_) => format!("vsock port {RPC_PORT}"),
+            RpcListener::Unix(_) => "unix socket".to_string(),
         };
-        info!("rpc: listening on vsock port {RPC_PORT}");
+        info!("rpc: listening on {kind}");
 
         loop {
+            // Honor the drain pause without spinning the accept loop tight.
+            while state.accept_paused.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+
             match listener.accept().await {
-                Ok((stream, addr)) => {
-                    info!("rpc: connection from {addr:?}");
+                Ok(stream) => {
+                    let in_flight = Arc::clone(&state.in_flight);
+                    in_flight.fetch_add(1, Ordering::SeqCst);
                     tokio::spawn(async move {
-                        let result = tokio::time::timeout(RPC_TIMEOUT, handle(stream)).await;
+                        let result = tokio::time::timeout(RPC_TIMEOUT, handle_stream(stream)).await;
                         match result {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => warn!("rpc: connection error: {e}"),
                             Err(_) => warn!("rpc: connection timed out"),
                         }
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
                 Err(e) => {
@@ -83,7 +127,32 @@ mod inner {
         }
     }
 
-    async fn handle(mut stream: VsockStream) -> std::io::Result<()> {
+    /// Bind a fresh listener for the cold-start path. Picks the unix-socket
+    /// fallback when `BEYOND_PG_RPC_UNIX_PATH` is set; otherwise binds vsock
+    /// on [`RPC_PORT`]. Tests set the env var; production leaves it unset.
+    pub fn bind_cold_start() -> std::io::Result<RpcListener> {
+        if let Ok(path) = std::env::var("BEYOND_PG_RPC_UNIX_PATH") {
+            let _ = std::fs::remove_file(&path);
+            let std_listener = std::os::unix::net::UnixListener::bind(&path)?;
+            std_listener.set_nonblocking(true)?;
+            let listener = tokio::net::UnixListener::from_std(std_listener)?;
+            return Ok(RpcListener::Unix(listener));
+        }
+        let v = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, RPC_PORT))?;
+        Ok(RpcListener::Vsock(v))
+    }
+
+    async fn handle_stream(stream: RpcStream) -> std::io::Result<()> {
+        match stream {
+            RpcStream::Vsock(s) => handle(s).await,
+            RpcStream::Unix(s) => handle(s).await,
+        }
+    }
+
+    async fn handle<S>(mut stream: S) -> std::io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
@@ -142,9 +211,9 @@ mod inner {
 }
 
 #[cfg(target_os = "linux")]
-pub use inner::serve;
+pub use inner::{RpcListener, bind_cold_start, serve};
 
 #[cfg(not(target_os = "linux"))]
-pub async fn serve() {
+pub async fn serve(_listener: (), _state: crate::handoff_bridge::SharedState) {
     tracing::warn!("rpc: vsock not available on this platform");
 }

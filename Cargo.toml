@@ -1,5 +1,12 @@
 [workspace]
-members = [".", "beyond-pg-cdc", "beyond-pg-sink", "wal-proto"]
+members = [
+  ".",
+  "beyond-pg-cdc",
+  "beyond-pg-core",
+  "beyond-pg-init",
+  "beyond-pg-sink",
+  "wal-proto",
+]
 resolver = "2"
 
 [package]
@@ -13,6 +20,7 @@ name = "beyond-pg"
 path = "src/main.rs"
 
 [dependencies]
+beyond-pg-core = { path = "./beyond-pg-core" }
 clap = { version = "4", features = ["derive"] }
 quinn = "0.11"
 rcgen = "0.14"
@@ -33,6 +41,7 @@ x509-parser = "0.18"
 libc = "0.2"
 nix = { version = "0.31", features = ["signal", "process", "hostname"] }
 tokio-vsock = "0.7"
+handoff = { version = "0.1", package = "beyond-handoff" }
 
 [dev-dependencies]
 postgres = "0.19"

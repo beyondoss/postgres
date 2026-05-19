@@ -40,10 +40,12 @@ run = "cargo build"
 run = "cargo build --release"
 
 [tasks."build:beyond-pg"]
-description = "Cross-compile beyond-pg for Linux amd64 + arm64 as musl static binaries"
+description = "Cross-compile beyond-pg + beyond-pg-init for Linux amd64 + arm64 as musl static binaries"
 run = '''
-cross build --release -p beyond-pg --target x86_64-unknown-linux-musl
-cross build --release -p beyond-pg --target aarch64-unknown-linux-musl
+cross build --release -p beyond-pg      --target x86_64-unknown-linux-musl
+cross build --release -p beyond-pg      --target aarch64-unknown-linux-musl
+cross build --release -p beyond-pg-init --target x86_64-unknown-linux-musl
+cross build --release -p beyond-pg-init --target aarch64-unknown-linux-musl
 '''
 
 [tasks."build:sink"]
@@ -111,11 +113,13 @@ case "${ARCH}" in
 esac
 echo "==> Building musl static binaries for ${MUSL_TARGET}..."
 cross build --release -p beyond-pg      --target "${MUSL_TARGET}"
+cross build --release -p beyond-pg-init --target "${MUSL_TARGET}"
 cross build --release -p beyond-pg-sink --target "${MUSL_TARGET}"
 
 # Stage pre-built binaries for Packer to install.
 mkdir -p packer/staging/beyond-pg-bin
 cp "target/${MUSL_TARGET}/release/beyond-pg"      packer/staging/beyond-pg-bin/
+cp "target/${MUSL_TARGET}/release/beyond-pg-init" packer/staging/beyond-pg-bin/
 cp "target/${MUSL_TARGET}/release/beyond-pg-sink" packer/staging/beyond-pg-bin/
 
 IMAGE_VERSION=$(git rev-parse --short HEAD)

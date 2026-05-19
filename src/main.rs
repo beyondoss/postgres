@@ -1,7 +1,11 @@
 mod archive;
 mod boot;
 mod cert_watcher;
+#[cfg(target_os = "linux")]
+mod children;
 mod config;
+#[cfg(target_os = "linux")]
+mod handoff_bridge;
 mod init;
 mod log_forwarder;
 mod mmds;
@@ -39,11 +43,22 @@ fn main() {
         }
         Cmd::Supervisor => {
             init::run();
+            // handoff::detect_role mutates env vars (LISTEN_FDS, HANDOFF_ROLE,
+            // HANDOFF_SOCK_FD). Per its module contract, it must run on a
+            // single-threaded context before any tokio worker starts. We're
+            // still on the main thread here, before runtime construction.
+            #[cfg(target_os = "linux")]
+            let role = handoff::detect_role().expect("handoff::detect_role");
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("tokio runtime")
-                .block_on(supervisor::run());
+                .block_on(async move {
+                    #[cfg(target_os = "linux")]
+                    supervisor::run(role).await;
+                    #[cfg(not(target_os = "linux"))]
+                    supervisor::run().await;
+                });
         }
         Cmd::Boot => {
             tokio::runtime::Builder::new_current_thread()

@@ -98,24 +98,27 @@ mod linux {
 
         let ipv6 = read_cmdline_ipv6();
         if let Some((ref addr, prefix_len, ref gw)) = ipv6 {
-            let _ = std::process::Command::new("ip")
-                .args([
+            run_ip_cmd(
+                &[
                     "-6",
                     "addr",
                     "add",
                     &format!("{addr}/{prefix_len}"),
                     "dev",
                     "eth0",
-                ])
-                .status();
-            let _ = std::process::Command::new("ip")
-                .args(["-6", "route", "add", "default", "via", gw, "dev", "eth0"])
-                .status();
+                ],
+                "add IPv6 address",
+            );
+            run_ip_cmd(
+                &["-6", "route", "add", "default", "via", gw, "dev", "eth0"],
+                "add IPv6 default route",
+            );
         }
         if let Some(ref gua) = read_cmdline_ipv6_ext() {
-            let _ = std::process::Command::new("ip")
-                .args(["-6", "addr", "add", &format!("{gua}/128"), "dev", "eth0"])
-                .status();
+            run_ip_cmd(
+                &["-6", "addr", "add", &format!("{gua}/128"), "dev", "eth0"],
+                "add IPv6 GUA address",
+            );
         }
 
         let mut nameservers = String::new();
@@ -127,6 +130,27 @@ mod linux {
         nameservers.push_str("nameserver 8.8.8.8\n");
         if let Err(e) = std::fs::write("/etc/resolv.conf", &nameservers) {
             eprintln!("[init] WARNING: failed to write resolv.conf: {e}");
+        }
+    }
+
+    /// Run `ip <args>` and log a warning on spawn failure or non-zero exit.
+    /// A misconfigured network is not fatal (the VM may still come up over
+    /// the MMDS link), but silent failure leaves operators chasing ghosts.
+    fn run_ip_cmd(args: &[&str], what: &str) {
+        match std::process::Command::new("ip").args(args).status() {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!(
+                "[init] WARNING: ip {} ({}) exited {}",
+                args.join(" "),
+                what,
+                s
+            ),
+            Err(e) => eprintln!(
+                "[init] WARNING: failed to spawn `ip {}` ({}): {}",
+                args.join(" "),
+                what,
+                e
+            ),
         }
     }
 
@@ -324,10 +348,10 @@ mod linux {
             return;
         }
 
-        if let Ok(algos) = std::fs::read_to_string("/sys/block/zram0/comp_algorithm") {
-            if algos.contains("lz4") {
-                let _ = std::fs::write("/sys/block/zram0/comp_algorithm", "lz4");
-            }
+        if let Ok(algos) = std::fs::read_to_string("/sys/block/zram0/comp_algorithm")
+            && algos.contains("lz4")
+        {
+            let _ = std::fs::write("/sys/block/zram0/comp_algorithm", "lz4");
         }
 
         let mem_kib = read_proc_meminfo_kib("MemTotal").unwrap_or(4 * 1024 * 1024);

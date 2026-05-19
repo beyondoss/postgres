@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "==> Installing beyond-pg-init (pre-built musl static binary)..."
+install -m 0755 /tmp/beyond-pg-bin/beyond-pg-init /usr/local/bin/beyond-pg-init
+
 echo "==> Installing beyond-pg (pre-built musl static binary)..."
 install -m 0755 /tmp/beyond-pg-bin/beyond-pg /usr/local/bin/beyond-pg
 

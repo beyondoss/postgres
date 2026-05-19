@@ -40,6 +40,22 @@ const MAX_BACKOFF_MS: u64 = 30_000;
 // Public entry point
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
+pub async fn run(role: handoff::Role) {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .init();
+
+    if let Err(e) = run_inner(role).await {
+        error!("supervisor fatal: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 pub async fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -54,7 +70,22 @@ pub async fn run() {
     }
 }
 
+#[cfg(target_os = "linux")]
+async fn run_inner(role: handoff::Role) -> Result<(), Box<dyn std::error::Error>> {
+    run_inner_inner(Some(role)).await
+}
+
+#[cfg(not(target_os = "linux"))]
 async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
+    run_inner_inner(None::<()>).await
+}
+
+#[cfg(target_os = "linux")]
+type MaybeRole = Option<handoff::Role>;
+#[cfg(not(target_os = "linux"))]
+type MaybeRole = Option<()>;
+
+async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Error>> {
     // Block SIGTERM/SIGINT before spawning any children so signals are queued
     // for our tokio::signal handles and not delivered as SIG_DFL.
     // Each child unblocks them in its pre_exec hook (see spawn_*).
@@ -69,37 +100,157 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = crate::mmds::read().await?;
 
-    // Boot setup — idempotent
-    boot::do_boot(&cfg).await?;
-
     // Bounded channel for log frames from all child pipes
     let (log_tx, log_rx) = mpsc::channel::<LogFrame>(1024);
 
-    // Spawn Postgres
-    let mut pg_state = ChildState::new("postgres");
-    spawn_postgres(&mut pg_state, &log_tx)?;
+    // PersistedChildren is the supervisor's record of who it spawned, so a
+    // post-handoff or post-crash successor can adopt those PIDs via pidfd.
+    // Written atomically (tmp + rename) after each spawn and on exit.
+    #[cfg(target_os = "linux")]
+    let mut persisted = crate::children::PersistedChildren::empty();
 
-    // Wait for Postgres to be ready before post-start and PgBouncer
-    if !pg::wait_until_ready(Duration::from_secs(60)).await {
-        return Err("postgres did not become ready within 60s".into());
+    // Branch on role: cold start vs successor adoption. The successor path
+    // skips boot setup, postgres spawn + readiness wait, and post_start
+    // (postgres is already running with all DDL applied by the original
+    // supervisor). On successor we adopt the persisted PIDs via pidfd and
+    // resume supervision; otherwise we follow the original boot sequence.
+    #[cfg(target_os = "linux")]
+    let mut begun_successor: Option<handoff::BegunSuccessor> = None;
+    // When invoked by beyond-pg-init, the cold-start path inherits the
+    // "rpc" listener fd via LISTEN_FDS. Standalone invocations (no init)
+    // have no inherited listeners; we bind fresh below.
+    #[cfg(target_os = "linux")]
+    let mut cold_inherited: Option<handoff::InheritedListeners> = None;
+    #[cfg(target_os = "linux")]
+    let mut role_successor: Option<handoff::Successor> = None;
+    #[cfg(target_os = "linux")]
+    if let Some(r) = role {
+        match r {
+            handoff::Role::ColdStart { inherited } => cold_inherited = Some(inherited),
+            handoff::Role::Successor(s) => role_successor = Some(s),
+        }
     }
-    info!("postgres is ready");
 
-    // WAL forwarder must start BEFORE post_start.
-    //
-    // `03-wal-sink.conf` sets `synchronous_commit = remote_write` and
-    // `synchronous_standby_names = 'wal_sink'`.  Every commit in post_start
-    // blocks until the 'wal_sink' streaming standby ACKs the WAL.  The
-    // wal_forwarder connects to postgres with application_name='wal_sink',
-    // making it that standby.  Spawning it after post_start causes a deadlock.
-    //
-    // The handle is retained so we can abort the task on shutdown.  Aborting
-    // the task drops ack_tx, which unblocks the pg_reader_thread
-    // (spawn_blocking).  Without the explicit abort, the tokio current_thread
-    // runtime deadlocks on drop: it drains the blocking pool before dropping
-    // tasks, so ack_tx is never dropped and blocking_recv() blocks forever.
-    let mut wal_forwarder_handle: Option<tokio::task::JoinHandle<()>> = None;
-    if cfg.pg_tier != PgTier::Replica
+    #[cfg(target_os = "linux")]
+    let is_successor = role_successor.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let is_successor = false;
+
+    let mut pg_state: ChildState;
+    let mut pgb_state: ChildState;
+    let mut cdc_state: Option<ChildState>;
+    let cold_start_wal_handle: Option<tokio::task::JoinHandle<()>>;
+
+    if is_successor {
+        cold_start_wal_handle = None;
+        #[cfg(target_os = "linux")]
+        {
+            // Drive the handoff protocol. handshake + wait_for_begin are
+            // sync; on current_thread tokio they briefly block, which is
+            // fine during this startup-only window.
+            let s = role_successor
+                .take()
+                .expect("is_successor guarded the take above");
+            let build_id = env!("CARGO_PKG_VERSION").as_bytes().to_vec();
+            let s = s.handshake(build_id)?;
+            let s = s.wait_for_begin()?;
+            begun_successor = Some(s);
+
+            info!("successor: incumbent sealed; adopting children");
+
+            // Children.json was flushed by the old supervisor right before
+            // it released the data-dir lock during seal.
+            let prior = crate::children::PersistedChildren::load(&crate::children::state_dir())?;
+            pg_state = adopt_or_respawn_child("postgres", &prior, &log_tx, &mut persisted)?;
+            pgb_state = adopt_or_respawn_child("pgbouncer", &prior, &log_tx, &mut persisted)?;
+
+            // CDC is configured per-MMDS; adopt only if both the prior
+            // supervisor had it AND we still want it. If config flipped
+            // off, kill the adopted one (rare; just respawn-fresh logic
+            // is reused later if needed).
+            cdc_state = if cfg.pg_tier != PgTier::Replica
+                && cfg.cdc_enabled
+                && prior.get("beyond-pg-cdc").is_some()
+            {
+                Some(adopt_or_respawn_child(
+                    "beyond-pg-cdc",
+                    &prior,
+                    &log_tx,
+                    &mut persisted,
+                )?)
+            } else {
+                None
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            unreachable!("is_successor is only true on linux");
+        }
+    } else {
+        // Cold-start path: original boot sequence.
+        boot::do_boot(&cfg).await?;
+
+        let mut pg = ChildState::new("postgres");
+        spawn_postgres(&mut pg, &log_tx)?;
+        #[cfg(target_os = "linux")]
+        persist_child(&mut persisted, &pg)?;
+        pg_state = pg;
+
+        if !pg::wait_until_ready(Duration::from_secs(60)).await {
+            return Err("postgres did not become ready within 60s".into());
+        }
+        info!("postgres is ready");
+
+        // WAL forwarder must start BEFORE post_start.
+        //
+        // `03-wal-sink.conf` sets `synchronous_commit = remote_write` and
+        // `synchronous_standby_names = 'wal_sink'`.  Every commit in post_start
+        // blocks until the 'wal_sink' streaming standby ACKs the WAL.  The
+        // wal_forwarder connects to postgres with application_name='wal_sink',
+        // making it that standby.  Spawning it after post_start causes a deadlock.
+        let mut wfh: Option<tokio::task::JoinHandle<()>> = None;
+        if cfg.pg_tier != PgTier::Replica
+            && let Some(wal_sink) = &cfg.wal_sink
+        {
+            let sink_url = wal_sink.clone();
+            wfh = Some(tokio::spawn(crate::wal_forwarder::run(
+                sink_url,
+                "wal_sink".to_owned(),
+                crate::pg::PG_PORT,
+            )));
+            wait_for_sync_standby("wal_sink", std::time::Duration::from_secs(30)).await;
+        }
+        cold_start_wal_handle = wfh;
+
+        // Replicas are read-only hot standbys — DDL is rejected during recovery.
+        if cfg.pg_tier != PgTier::Replica {
+            post_start(&cfg).await?;
+        }
+
+        let mut pgb = ChildState::new("pgbouncer");
+        spawn_pgbouncer(&mut pgb, &log_tx)?;
+        #[cfg(target_os = "linux")]
+        persist_child(&mut persisted, &pgb)?;
+        pgb_state = pgb;
+
+        cdc_state = if cfg.pg_tier != PgTier::Replica && cfg.cdc_enabled {
+            let mut s = ChildState::new("beyond-pg-cdc");
+            spawn_cdc(&mut s, &log_tx)?;
+            #[cfg(target_os = "linux")]
+            persist_child(&mut persisted, &s)?;
+            Some(s)
+        } else {
+            None
+        };
+    }
+
+    // The cold-start branch above started the WAL forwarder before post_start
+    // for sync-replication ordering. The successor branch starts it below
+    // (postgres is already running, so reconnect time is the only window
+    // commits wait for sync acks).
+    let mut wal_forwarder_handle: Option<tokio::task::JoinHandle<()>> = cold_start_wal_handle;
+    if is_successor
+        && cfg.pg_tier != PgTier::Replica
         && let Some(wal_sink) = &cfg.wal_sink
     {
         let sink_url = wal_sink.clone();
@@ -108,33 +259,62 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             "wal_sink".to_owned(),
             crate::pg::PG_PORT,
         )));
-        wait_for_sync_standby("wal_sink", std::time::Duration::from_secs(30)).await;
+        // Don't wait_for_sync_standby here — postgres is already running and
+        // its commits will stall until our new forwarder ACKs (~250ms p99
+        // measured). Waiting here would re-introduce a deadlock if there
+        // were any holding-the-runtime DDL pending.
     }
-
-    // Replicas are read-only hot standbys — DDL is rejected during recovery.
-    // Extensions, roles, and slots are replicated from the primary.
-    if cfg.pg_tier != PgTier::Replica {
-        post_start(&cfg).await?;
-    }
-
-    // Spawn PgBouncer after post-start so the pgbouncer role and auth function exist.
-    // PgBouncer is useful on replicas too for read-only connection pooling.
-    let mut pgb_state = ChildState::new("pgbouncer");
-    spawn_pgbouncer(&mut pgb_state, &log_tx)?;
-
-    let mut cdc_state = if cfg.pg_tier != PgTier::Replica && cfg.cdc_enabled {
-        let mut s = ChildState::new("beyond-pg-cdc");
-        spawn_cdc(&mut s, &log_tx)?;
-        Some(s)
-    } else {
-        None
-    };
 
     // Background: forward logs to host vsock
     let log_writer_handle = tokio::spawn(log_writer_task(log_rx));
 
-    // Background: serve control RPC
-    let rpc_handle = tokio::spawn(crate::rpc::serve());
+    // Background: serve control RPC.
+    //
+    // The shared `SharedState` couples this accept loop to the handoff
+    // `Drainable`: `accept_paused` pauses new accepts during drain,
+    // `in_flight` tracks live handlers so drain can wait for them.
+    //
+    // On a fresh boot (cold start) we bind the listener ourselves. On the
+    // successor path we instead inherit the FD from the previous incumbent
+    // (transparently dup'd into slot 3 by `beyond-pg-init`'s handoff
+    // supervisor). Inheriting preserves the accept queue — clients see no
+    // socket close.
+    #[cfg(target_os = "linux")]
+    let rpc_state = crate::handoff_bridge::SharedState::new();
+    #[cfg(target_os = "linux")]
+    let rpc_listener = if is_successor {
+        take_inherited_rpc_listener(begun_successor.as_mut().expect("successor"))?
+    } else if let Some(mut inh) = cold_inherited.take()
+        && let Some(tcp) = inh.take("rpc")
+    {
+        take_inherited_rpc_from_tcp(tcp)?
+    } else {
+        crate::rpc::bind_cold_start()?
+    };
+    #[cfg(target_os = "linux")]
+    let rpc_handle = tokio::spawn(crate::rpc::serve(rpc_listener, rpc_state.clone()));
+    #[cfg(not(target_os = "linux"))]
+    let rpc_handle = tokio::spawn(crate::rpc::serve((), ()));
+
+    // Background: handoff::Incumbent control thread.
+    //
+    // `Incumbent::serve` is the *sync* loop that handles the protocol from
+    // the upper supervisor (beyond-pg-init). It blocks on a unix-socket
+    // accept and drives drain/seal callbacks on the same OS thread. Running
+    // it on a dedicated `std::thread` keeps the sync API isolated from the
+    // tokio current_thread runtime — the drain handler then polls the
+    // tokio-side `in_flight` atomic across the boundary.
+    //
+    // Cold start binds the unix socket via `bind_cold_start`. Successor
+    // takes over the socket path atomically via `announce_and_bind` — the
+    // bind happens after `Ready` is sent so the prior incumbent's socket
+    // ownership is released first.
+    #[cfg(target_os = "linux")]
+    let _handoff_thread = if let Some(s) = begun_successor.take() {
+        spawn_incumbent_thread_successor(s, rpc_state.clone())?
+    } else {
+        spawn_incumbent_thread(rpc_state.clone())?
+    };
 
     // Background: update reload-safe tuning params when virtio-mem changes RAM
     let memory_watcher_handle = tokio::spawn(memory_watcher_task(cfg.vcpus, cfg.ram_bytes));
@@ -191,38 +371,44 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 shutdown_background_tasks(log_writer_handle, rpc_handle, memory_watcher_handle, cert_watcher_handle).await;
                 return Ok(());
             }
-            status = async {
-                if let Some(ref mut ch) = pg_state.child {
-                    ch.wait().await
+            code = async {
+                if let Some(ref mut handle) = pg_state.handle {
+                    handle.wait().await
                 } else {
                     std::future::pending().await
                 }
             } => {
-                let status = status?;
-                pg_state.on_exit(status.code());
+                let code = code?;
+                pg_state.on_exit(code);
                 maybe_restart(&mut pg_state, &log_tx).await?;
+                #[cfg(target_os = "linux")]
+                persist_child(&mut persisted, &pg_state)?;
             }
-            status = async {
-                if let Some(ref mut ch) = pgb_state.child {
-                    ch.wait().await
+            code = async {
+                if let Some(ref mut handle) = pgb_state.handle {
+                    handle.wait().await
                 } else {
                     std::future::pending().await
                 }
             } => {
-                let status = status?;
-                pgb_state.on_exit(status.code());
+                let code = code?;
+                pgb_state.on_exit(code);
                 maybe_restart_pgbouncer(&mut pgb_state, &log_tx).await?;
+                #[cfg(target_os = "linux")]
+                persist_child(&mut persisted, &pgb_state)?;
             }
-            status = async {
-                match cdc_state.as_mut().and_then(|s| s.child.as_mut()) {
-                    Some(ch) => ch.wait().await,
+            code = async {
+                match cdc_state.as_mut().and_then(|s| s.handle.as_mut()) {
+                    Some(handle) => handle.wait().await,
                     None => std::future::pending().await,
                 }
             } => {
-                let status = status?;
+                let code = code?;
                 if let Some(state) = cdc_state.as_mut() {
-                    state.on_exit(status.code());
+                    state.on_exit(code);
                     maybe_restart_cdc(state, &log_tx).await?;
+                    #[cfg(target_os = "linux")]
+                    persist_child(&mut persisted, state)?;
                 }
             }
             Some(()) = cert_reload_rx.recv() => {
@@ -240,12 +426,8 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 /// Best-effort: if pgbouncer is between exit and restart, the pid is absent
 /// and the next spawn will pick up the rotated cert anyway.
 fn sighup_pgbouncer(state: &ChildState) {
-    let Some(child) = state.child.as_ref() else {
+    let Some(pid) = state.pid() else {
         info!("pgbouncer: no live child, SIGHUP skipped");
-        return;
-    };
-    let Some(pid) = child.id() else {
-        info!("pgbouncer: child has no pid (already reaped), SIGHUP skipped");
         return;
     };
     #[cfg(target_os = "linux")]
@@ -268,9 +450,58 @@ fn sighup_pgbouncer(state: &ChildState) {
 // Child state and restart logic
 // ---------------------------------------------------------------------------
 
+/// How the supervisor observes a child's lifecycle.
+///
+/// `Fresh` — spawned by *this* supervisor process. We hold the
+/// `tokio::process::Child` and reap on `.wait()` (we are its direct parent).
+///
+/// `Adopted` — inherited from a previous supervisor (post-handoff). The
+/// child is now PID-1's direct child (reparented when the old supervisor
+/// exited). We can't `waitpid` on it from here, so we observe death via a
+/// `pidfd` wrapped in `AsyncFd`. PID 1 reaps the zombie.
+#[allow(dead_code)] // adopted variant constructed by phase 5b adopt path
+enum WaitHandle {
+    Fresh(tokio::process::Child),
+    #[cfg(target_os = "linux")]
+    Adopted {
+        pid: u32,
+        fd: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    },
+}
+
+impl WaitHandle {
+    /// Process id, or `None` if the underlying Child has been reaped.
+    fn pid(&self) -> Option<u32> {
+        match self {
+            WaitHandle::Fresh(c) => c.id(),
+            #[cfg(target_os = "linux")]
+            WaitHandle::Adopted { pid, .. } => Some(*pid),
+        }
+    }
+
+    /// Await exit. Returns the exit code for `Fresh`; for `Adopted` we
+    /// only know *that* the process died (the kernel notifies via pidfd
+    /// readability) — exit status is unobservable because we're not the
+    /// parent. `None` therefore covers both "killed by signal" and
+    /// "adopted child, status unknown".
+    async fn wait(&mut self) -> std::io::Result<Option<i32>> {
+        match self {
+            WaitHandle::Fresh(c) => {
+                let status = c.wait().await?;
+                Ok(status.code())
+            }
+            #[cfg(target_os = "linux")]
+            WaitHandle::Adopted { fd, .. } => {
+                let _guard = fd.readable().await?;
+                Ok(None)
+            }
+        }
+    }
+}
+
 struct ChildState {
     name: &'static str,
-    child: Option<tokio::process::Child>,
+    handle: Option<WaitHandle>,
     restart_count: u32,
     last_start: Option<Instant>,
 }
@@ -279,7 +510,7 @@ impl ChildState {
     fn new(name: &'static str) -> Self {
         Self {
             name,
-            child: None,
+            handle: None,
             restart_count: 0,
             last_start: None,
         }
@@ -287,7 +518,7 @@ impl ChildState {
 
     /// Record exit. Resets backoff if the child was stable long enough.
     fn on_exit(&mut self, code: Option<i32>) {
-        self.child = None;
+        self.handle = None;
         // Measure how long this instance was alive
         let stable = self
             .last_start
@@ -310,10 +541,264 @@ impl ChildState {
     }
 
     fn record_start(&mut self, child: tokio::process::Child) {
-        self.child = Some(child);
+        self.handle = Some(WaitHandle::Fresh(child));
         self.last_start = Some(Instant::now());
         self.restart_count = self.restart_count.saturating_add(1);
     }
+
+    /// Adopt an already-running pid via pidfd. Used on the successor path
+    /// after handoff to pick up postgres/pgbouncer/cdc children that are
+    /// now reparented to init (PID 1). The fd must already be wrapped in
+    /// `AsyncFd` so tokio can observe readability on exit.
+    #[cfg(target_os = "linux")]
+    fn record_adopted(&mut self, pid: u32, fd: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>) {
+        self.handle = Some(WaitHandle::Adopted { pid, fd });
+        self.last_start = Some(Instant::now());
+        // Reset restart_count — adopted means previous supervisor was
+        // running stably enough that handoff was attempted.
+        self.restart_count = 0;
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.handle.as_ref().and_then(|h| h.pid())
+    }
+}
+
+/// Persist a single child's pid+starttime into the on-disk state file.
+///
+/// Called after every spawn (cold-start and restart-on-crash) so a
+/// successor or post-crash supervisor can `pidfd_open` the saved pid.
+#[cfg(target_os = "linux")]
+fn persist_child(
+    persisted: &mut crate::children::PersistedChildren,
+    state: &ChildState,
+) -> std::io::Result<()> {
+    if let Some(pid) = state.pid() {
+        persisted.record(state.name, pid)?;
+        persisted.save(&crate::children::state_dir())?;
+    }
+    Ok(())
+}
+
+/// Path of the unix socket where this incumbent listens for upgrade requests
+/// from `beyond-pg-init`. Matches the path init expects.
+#[cfg(target_os = "linux")]
+const HANDOFF_SOCKET_PATH: &str = "/var/lib/beyond-pg/state/handoff.sock";
+
+/// Adopt the named child from a `PersistedChildren` snapshot via pidfd, or
+/// respawn fresh if it's dead or its pid has been recycled.
+///
+/// Adoption verifies `(pid, starttime)` match the saved record before
+/// wrapping a `pidfd` in `AsyncFd` for the supervision loop. On any failure
+/// path we fall through to a fresh spawn — the postgres-side state is
+/// durable, so a respawn is safe (just visible as a brief disconnect for
+/// clients on the affected service).
+#[cfg(target_os = "linux")]
+fn adopt_or_respawn_child(
+    name: &'static str,
+    prior: &crate::children::PersistedChildren,
+    log_tx: &mpsc::Sender<LogFrame>,
+    persisted: &mut crate::children::PersistedChildren,
+) -> Result<ChildState, Box<dyn std::error::Error>> {
+    use crate::children::AdoptResult;
+    let mut state = ChildState::new(name);
+
+    if let Some(record) = prior.get(name) {
+        match crate::children::adopt(record)? {
+            AdoptResult::Adopted(fd) => {
+                let async_fd =
+                    tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)?;
+                state.record_adopted(record.pid, async_fd);
+                info!("{name}: adopted pid={} via pidfd", record.pid);
+                // Re-record into the new supervisor's persisted state so a
+                // subsequent crash/handoff finds the same pid.
+                persisted.record(name, record.pid)?;
+                persisted.save(&crate::children::state_dir())?;
+                return Ok(state);
+            }
+            AdoptResult::Dead => {
+                warn!("{name}: prior pid={} is dead; respawning", record.pid);
+            }
+            AdoptResult::Recycled { saved, live } => {
+                warn!(
+                    "{name}: prior pid={} starttime mismatch (saved={saved} live={live}); respawning",
+                    record.pid
+                );
+                // We can't trust this pid; ignore it and respawn.
+            }
+        }
+    } else {
+        warn!("{name}: no prior record in children.json; spawning fresh");
+    }
+
+    // Fall through to a fresh spawn.
+    match name {
+        "postgres" => spawn_postgres(&mut state, log_tx)?,
+        "pgbouncer" => spawn_pgbouncer(&mut state, log_tx)?,
+        "beyond-pg-cdc" => spawn_cdc(&mut state, log_tx)?,
+        other => return Err(format!("unknown child name in adoption: {other}").into()),
+    };
+    persist_child(persisted, &state)?;
+    Ok(state)
+}
+
+/// Spawn the sync `Incumbent::serve` loop on its own OS thread (cold start).
+///
+/// The path here is the same one `beyond-pg-init` uses when constructing the
+/// `handoff::Supervisor`; both ends agree on this filesystem rendezvous.
+#[cfg(target_os = "linux")]
+fn spawn_incumbent_thread(
+    state: crate::handoff_bridge::SharedState,
+) -> Result<std::thread::JoinHandle<()>, Box<dyn std::error::Error>> {
+    use crate::children::state_dir;
+    use std::path::Path;
+
+    std::fs::create_dir_all(state_dir())?;
+    let lock = handoff::DataDirLock::acquire_or_break_stale(&state_dir())?;
+    let incumbent = handoff::Incumbent::bind_cold_start(Path::new(HANDOFF_SOCKET_PATH), lock)?;
+    let drainable = crate::handoff_bridge::SupervisorDrainable::new(state);
+    let handle = std::thread::Builder::new()
+        .name("handoff-incumbent".into())
+        .spawn(move || {
+            if let Err(e) = incumbent.serve(drainable) {
+                tracing::error!("handoff::Incumbent::serve exited with error: {e}");
+            }
+        })?;
+    tracing::info!("handoff::Incumbent serving on {HANDOFF_SOCKET_PATH} (cold start)");
+    Ok(handle)
+}
+
+/// Successor variant: send `Ready` and bind the handoff socket atomically.
+///
+/// The data-dir lock was released by the prior incumbent during seal, so
+/// `acquire` here always succeeds. `announce_and_bind` orders Ready + bind
+/// safely against the abort path: if we crash between Ready and bind, the
+/// prior incumbent's `resume_after_abort` reacquires the lock and rebinds.
+#[cfg(target_os = "linux")]
+fn spawn_incumbent_thread_successor(
+    s: handoff::BegunSuccessor,
+    state: crate::handoff_bridge::SharedState,
+) -> Result<std::thread::JoinHandle<()>, Box<dyn std::error::Error>> {
+    use crate::children::state_dir;
+    use std::path::Path;
+
+    let lock = handoff::DataDirLock::acquire(&state_dir())?;
+    let snapshot = handoff::drainable::ReadinessSnapshot {
+        listening_on: vec![format!("vsock::{}", crate::vsock::RPC_PORT)],
+        healthz_ok: true,
+        advertised_revision_per_shard: Vec::new(),
+    };
+    let incumbent = s.announce_and_bind(snapshot, Path::new(HANDOFF_SOCKET_PATH), lock)?;
+    let drainable = crate::handoff_bridge::SupervisorDrainable::new(state);
+    let handle = std::thread::Builder::new()
+        .name("handoff-incumbent".into())
+        .spawn(move || {
+            if let Err(e) = incumbent.serve(drainable) {
+                tracing::error!("handoff::Incumbent::serve exited with error: {e}");
+            }
+        })?;
+    tracing::info!("handoff::Incumbent serving on {HANDOFF_SOCKET_PATH} (successor)");
+    Ok(handle)
+}
+
+/// Take the inherited "rpc" listener fd from a `BegunSuccessor` and wrap it
+/// as the right async listener type.
+///
+/// Handoff's `take_listener` returns a `TcpListener`. Underneath that's just
+/// a wrapper around the inherited raw fd — the kernel doesn't validate
+/// socket family. We unwrap back to a `RawFd` via `into_raw_fd`, query the
+/// actual socket family via `getsockname`, set the non-blocking flag the
+/// tokio runtime expects, and reclaim ownership as either `VsockListener`
+/// (production) or `tokio::net::UnixListener` (tests / local dev).
+#[cfg(target_os = "linux")]
+fn take_inherited_rpc_listener(
+    s: &mut handoff::BegunSuccessor,
+) -> Result<crate::rpc::RpcListener, Box<dyn std::error::Error>> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+
+    let tcp = s
+        .take_listener("rpc")
+        .ok_or("inherited listener 'rpc' missing from successor")?;
+    let raw_fd = tcp.into_raw_fd();
+
+    // SAFETY: `raw_fd` is owned (we just took it from TcpListener::into_raw_fd).
+    // fcntl(F_GETFL/F_SETFL) only reads/writes the fd's status flags.
+    let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    // Detect socket family via getsockname so we wrap as the matching
+    // tokio listener type. AF_VSOCK (40) → vsock; AF_UNIX (1) → unix.
+    let family = socket_family(raw_fd)?;
+    match family {
+        libc::AF_UNIX => {
+            // SAFETY: `raw_fd` is owned by us; from_raw_fd takes that ownership.
+            let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(raw_fd) };
+            std_listener.set_nonblocking(true)?;
+            let tokio_listener = tokio::net::UnixListener::from_std(std_listener)?;
+            Ok(crate::rpc::RpcListener::Unix(tokio_listener))
+        }
+        // AF_VSOCK is 40 on Linux; libc may not expose it as a constant on
+        // all platforms (it varies by libc version). Match it as the literal.
+        40 => {
+            // SAFETY: same — we just took ownership of raw_fd from TcpListener.
+            let v = unsafe { tokio_vsock::VsockListener::from_raw_fd(raw_fd) };
+            Ok(crate::rpc::RpcListener::Vsock(v))
+        }
+        other => Err(format!("inherited rpc fd has unexpected socket family: {other}").into()),
+    }
+}
+
+/// Same as `take_inherited_rpc_listener` but for the cold-start case where
+/// `handoff::detect_role` returned `ColdStart { inherited }` and we got the
+/// `TcpListener` from `InheritedListeners::take("rpc")` directly.
+#[cfg(target_os = "linux")]
+fn take_inherited_rpc_from_tcp(
+    tcp: std::net::TcpListener,
+) -> Result<crate::rpc::RpcListener, Box<dyn std::error::Error>> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+
+    let raw_fd = tcp.into_raw_fd();
+    let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    match socket_family(raw_fd)? {
+        libc::AF_UNIX => {
+            let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(raw_fd) };
+            std_listener.set_nonblocking(true)?;
+            let tokio_listener = tokio::net::UnixListener::from_std(std_listener)?;
+            Ok(crate::rpc::RpcListener::Unix(tokio_listener))
+        }
+        40 => {
+            let v = unsafe { tokio_vsock::VsockListener::from_raw_fd(raw_fd) };
+            Ok(crate::rpc::RpcListener::Vsock(v))
+        }
+        other => Err(format!("inherited rpc fd has unexpected socket family: {other}").into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn socket_family(fd: std::os::fd::RawFd) -> std::io::Result<libc::c_int> {
+    // sockaddr_storage is large enough for any socket family.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: storage is a stack buffer of correct size; `len` is initialized
+    // to the buffer's capacity; getsockname writes `<= len` bytes and updates
+    // `len` to the actual size.
+    let r =
+        unsafe { libc::getsockname(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(storage.ss_family as libc::c_int)
 }
 
 async fn maybe_restart(
@@ -561,14 +1046,14 @@ async fn drain_children(
         all.push(c);
     }
 
-    // Poll for all to exit, up to DRAIN_TIMEOUT
+    // Poll for all to exit, up to DRAIN_TIMEOUT.
+    //
+    // For Fresh we have a Child and can call try_wait(); for Adopted we'd
+    // need a non-blocking pidfd check. We use `kill(pid, 0)` as the
+    // portable cross-shape "is this pid alive?" check.
     let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
     loop {
-        let all_done = all.iter_mut().all(|s| {
-            s.child
-                .as_mut()
-                .is_none_or(|c| c.try_wait().ok().flatten().is_some())
-        });
+        let all_done = all.iter().all(|s| s.pid().map(is_pid_dead).unwrap_or(true));
         if all_done {
             info!("all children drained cleanly");
             break;
@@ -580,22 +1065,47 @@ async fn drain_children(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // SIGKILL any stragglers — intentional SIGKILL here
+    // SIGKILL any stragglers.
     for state in all {
-        if let Some(ref mut ch) = state.child
-            && ch.try_wait().ok().flatten().is_none()
+        if let Some(pid) = state.pid()
+            && !is_pid_dead(pid)
         {
-            warn!("{}: sending SIGKILL", state.name);
-            drop(ch.kill()); // kill() is async but we don't need to await its result
+            warn!("{}: sending SIGKILL (pid={pid})", state.name);
+            send_signal_to_pid(pid, libc::SIGKILL);
+        }
+        // Reap if it's a Fresh handle we own.
+        if let Some(WaitHandle::Fresh(ref mut ch)) = state.handle {
             let _ = ch.wait().await;
         }
     }
 }
 
+#[cfg(target_os = "linux")]
+fn is_pid_dead(pid: u32) -> bool {
+    // `kill(pid, 0)` returns 0 if the process exists, ESRCH if not.
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if r == 0 {
+        false
+    } else {
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_pid_dead(_pid: u32) -> bool {
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn send_signal_to_pid(pid: u32, sig: libc::c_int) {
+    unsafe { libc::kill(pid as libc::pid_t, sig) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn send_signal_to_pid(_pid: u32, _sig: libc::c_int) {}
+
 fn sigterm_child(state: &mut ChildState) {
-    if let Some(ref ch) = state.child
-        && let Some(pid) = ch.id()
-    {
+    if let Some(pid) = state.pid() {
         #[cfg(target_os = "linux")]
         {
             use nix::sys::signal::{Signal, kill};
@@ -813,7 +1323,7 @@ async fn memory_watcher_task(vcpus: u32, initial_ram_bytes: u64) {
     let mut last_ram_bytes = initial_ram_bytes;
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let ram_bytes = match read_memtotal_bytes() {
+        let ram_bytes = match read_memtotal_bytes().await {
             Some(v) => v,
             None => continue,
         };
@@ -841,8 +1351,11 @@ async fn memory_watcher_task(vcpus: u32, initial_ram_bytes: u64) {
     }
 }
 
-fn read_memtotal_bytes() -> Option<u64> {
-    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+async fn read_memtotal_bytes() -> Option<u64> {
+    // `/proc/meminfo` is normally fast, but under memory pressure — exactly
+    // when this watcher matters most — the kernel may block. Stay on tokio's
+    // I/O reactor so we don't stall the executor.
+    let content = tokio::fs::read_to_string("/proc/meminfo").await.ok()?;
     parse_memtotal_kib(&content).map(|kib| kib * 1024)
 }
 

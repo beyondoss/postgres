@@ -25,8 +25,9 @@ echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
 update-locale LANG=en_US.UTF-8
 
-# /sbin/init → beyond-pg: beyond-pg is PID 1 in this image. The binary is
-# installed by script 06; the symlink must exist for the kernel to find it.
-ln -sf /usr/local/bin/beyond-pg /sbin/init
+# /sbin/init → beyond-pg-init: a minimal sync PID 1 that supervises
+# beyond-pg (the postgres-supervisor binary) under a handoff::Supervisor.
+# Both binaries are installed by script 06.
+ln -sf /usr/local/bin/beyond-pg-init /sbin/init
 
 echo "==> 01-base-packages done"

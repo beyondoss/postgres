@@ -19,8 +19,29 @@ use wal_proto::{
 };
 
 // ---------------------------------------------------------------------------
-// TLS: accept any cert (private overlay network)
+// TLS: accept any cert
 // ---------------------------------------------------------------------------
+//
+// SECURITY POSTURE
+// ----------------
+// This client accepts any TLS server certificate without verification. The
+// sink side (`beyond-pg-sink/src/quic_recv.rs::make_server_config`) generates
+// a self-signed cert per process — there is no shared trust anchor between
+// the two endpoints. Confidentiality and integrity of replicated WAL rely
+// **entirely on the network layer** (VXLAN overlay tenant isolation). Any
+// host that can route to the sink's QUIC port can impersonate it, and a
+// MitM on the overlay can read every committed row.
+//
+// This is intentional today (private per-tenant overlay) but it is a
+// load-bearing assumption that should be tightened. Two paths are viable:
+//   - SPKI pinning: ship the expected server SPKI hash via MMDS, verify
+//     here. Requires no sink change (still self-signed) and small plumbing.
+//   - PSK / mTLS: bilateral change, sink and forwarder share a CA or PSK
+//     supplied by the platform.
+//
+// The `AcceptAnyCert` verifier below is *not* a bug — it's a documented
+// tradeoff. When tightening, change the type, not just the comment.
+// See audit findings in commit 995e55e+.
 
 #[derive(Debug)]
 struct AcceptAnyCert;
@@ -77,6 +98,15 @@ fn make_client_config() -> quinn::ClientConfig {
 pub async fn run(sink_url: String, slot: String, pg_port: u16) {
     // Install ring as the default rustls provider. Idempotent across modules.
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Operationally-visible reminder that the WAL stream's confidentiality
+    // depends on overlay network isolation, not on TLS cert verification.
+    // See the SECURITY POSTURE block above.
+    warn!(
+        sink = %sink_url,
+        "wal forwarder: TLS server cert verification is DISABLED; \
+         confidentiality relies on overlay network isolation"
+    );
 
     let mut backoff = std::time::Duration::from_secs(1);
     loop {

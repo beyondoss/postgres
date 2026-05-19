@@ -1,44 +1,17 @@
-//! Minimal vsock wire format — inlined from vsock-protocol to avoid a cross-repo
-//! path dependency. Values are copied verbatim; keep in sync with
-//! `beyond/boxes/vsock-protocol/src/lib.rs`.
+//! Vsock framing helpers for `beyond-pg` (supervisor side).
 //!
-//! All items here are used on Linux; the dead_code lint fires on macOS/dev builds.
+//! Port constants and type definitions live in [`beyond_pg_core::vsock`].
+//! This module adds the rmp-serde-based encode helpers that we don't want
+//! linked into PID 1 (`beyond-pg-init`).
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-/// Host log pipeline port (agent → host).
-pub const VSOCK_PORT: u32 = 52;
-
-/// Host CID — guests connect to this CID to reach the host.
-pub const HOST_CID: u32 = 2;
-
-/// Beyond-pg control RPC port (host → agent). PG-themed, clearly not DNS.
-pub const RPC_PORT: u32 = 5430;
-
-/// Maximum size of a single user-process log line before truncation.
-pub const MAX_USER_PROCESS_LINE_BYTES: usize = 256 * 1024;
+pub use beyond_pg_core::vsock::{
+    ExecStream, HOST_CID, MAX_USER_PROCESS_LINE_BYTES, RPC_PORT, UserProcessStreamDataPayload,
+    VSOCK_PORT,
+};
 
 /// Type byte for `UserProcessStreamData` frames (Agent → Host: supervised process output).
 const USER_PROCESS_STREAM_DATA: u8 = 0xA1;
-
-/// Which output stream a log line came from.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecStream {
-    Stdout,
-    Stderr,
-}
-
-/// Wire payload for a single log line from a supervised process.
-/// Must match `UserProcessStreamDataPayload` in vsock-protocol exactly.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct UserProcessStreamDataPayload {
-    pub stream: ExecStream,
-    pub line: String,
-    pub truncated: bool,
-    /// Zero UUID for long-running supervised processes.
-    #[serde(default)]
-    pub execution_id: String,
-}
 
 /// Encode one log frame: `[4-byte BE length][0xA1][msgpack payload]`.
 ///
