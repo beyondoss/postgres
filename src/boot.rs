@@ -872,8 +872,7 @@ pub async fn run_hook_scripts(dir: &str) -> Result<(), BootError> {
     for script in &scripts {
         let script_str = script.display().to_string();
         info!("running hook: {script_str}");
-        // Command::new — not sh -c — so the shebang is honored
-        let status = Command::new(script).status().await?;
+        let status = spawn_hook_with_etxtbsy_retry(script).await?;
         if !status.success() {
             let code = status.code().unwrap_or(-1);
             return Err(BootError::HookFailed {
@@ -884,4 +883,29 @@ pub async fn run_hook_scripts(dir: &str) -> Result<(), BootError> {
     }
 
     Ok(())
+}
+
+/// Spawn a hook script with a bounded retry on `ETXTBSY`.
+///
+/// Hook scripts may have been written by an in-flight deploy at the same
+/// instant we try to `execve` them; Linux returns `ETXTBSY` until the
+/// writer's inode reference is dropped. The same race can fire under
+/// `cargo test`'s multi-threaded executor when concurrent tests `fork()`
+/// while a sibling thread is mid-write to its own script. The kernel
+/// shouldn't see writers on *this* inode in either case for long, so a
+/// few short retries cover both with negligible production cost.
+async fn spawn_hook_with_etxtbsy_retry(script: &Path) -> std::io::Result<std::process::ExitStatus> {
+    let mut attempt: u32 = 0;
+    loop {
+        // Command::new — not sh -c — so the shebang is honored
+        match Command::new(script).status().await {
+            Ok(s) => return Ok(s),
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempt < 3 => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(10 << (attempt - 1))).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }

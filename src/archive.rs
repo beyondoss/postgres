@@ -36,10 +36,7 @@ fn run_inner(path: &str, filename: &str, aws_cmd: &str, mmds_path: &str) -> i32 
         None => 0,
         Some(target) => {
             let dest = format!("{}/{}", target.trim_end_matches('/'), filename);
-            match std::process::Command::new(aws_cmd)
-                .args(["s3", "cp", path, &dest, "--no-progress"])
-                .status()
-            {
+            match spawn_aws_with_etxtbsy_retry(aws_cmd, path, &dest) {
                 Ok(s) if s.success() => 0,
                 Ok(s) => {
                     eprintln!(
@@ -54,6 +51,39 @@ fn run_inner(path: &str, filename: &str, aws_cmd: &str, mmds_path: &str) -> i32 
                     1
                 }
             }
+        }
+    }
+}
+
+/// Run `aws s3 cp` with a bounded retry on `ETXTBSY`.
+///
+/// `archive_command` runs in a fresh subprocess that postgres `fork()`s on
+/// every WAL segment. If the host is concurrently writing the aws binary
+/// or one of its libraries (e.g. an in-place upgrade of awscli, or an
+/// overlay-fs commit), Linux can return `ETXTBSY` from `execve`. The
+/// retry is also why this same path passes under `cargo test`'s
+/// multi-threaded executor when other tests in the workspace are
+/// `fork()`-ing arbitrary commands at the same instant — those forks
+/// capture in-flight writer FDs which the kernel then sees on execve.
+fn spawn_aws_with_etxtbsy_retry(
+    aws_cmd: &str,
+    src: &str,
+    dest: &str,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut attempt: u32 = 0;
+    loop {
+        let result = std::process::Command::new(aws_cmd)
+            .args(["s3", "cp", src, dest, "--no-progress"])
+            .status();
+        match result {
+            Ok(s) => return Ok(s),
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempt < 3 => {
+                attempt += 1;
+                // 10ms, 20ms, 40ms — total < 100ms cap before giving up.
+                std::thread::sleep(std::time::Duration::from_millis(10 << (attempt - 1)));
+                continue;
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -74,15 +104,32 @@ mod tests {
         f
     }
 
+    /// Write a 0o755 script and return the path. Single-step open-write-
+    /// close-via-drop with the mode set at creation: avoids the
+    /// `write → set_permissions → execve` window that races against the
+    /// kernel's `i_writecount` decrement (the cause of intermittent
+    /// `ETXTBSY` flakes under parallel `cargo test`).
+    #[cfg(unix)]
+    fn write_script(path: &std::path::Path, body: &str) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o755)
+            .open(path)
+            .unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+    }
+
     fn stub_aws(exit_code: i32) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("aws");
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::write(&stub, format!("#!/bin/sh\nexit {exit_code}\n")).unwrap();
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_script(&stub, &format!("#!/bin/sh\nexit {exit_code}\n"));
         let path_str = stub.to_str().unwrap().to_owned();
         (dir, path_str)
     }
@@ -93,11 +140,7 @@ mod tests {
         let log_path = log.path().display().to_string();
         let stub = dir.path().join("aws");
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::write(&stub, format!("#!/bin/sh\necho \"$@\" >> {log_path}\n")).unwrap();
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_script(&stub, &format!("#!/bin/sh\necho \"$@\" >> {log_path}\n"));
         let path_str = stub.to_str().unwrap().to_owned();
         (dir, log, path_str)
     }
