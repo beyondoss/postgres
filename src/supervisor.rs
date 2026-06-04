@@ -199,21 +199,39 @@ impl PgbScaler {
         }
     }
 
-    /// Sample pooler CPU for `pids`, decide, publish telemetry to `stats`, and
-    /// return the action for the caller to enact. The first call only establishes
-    /// a CPU baseline (returns Hold).
+    /// Production entry point: sample pooler CPU from `/proc`, decide, publish
+    /// telemetry, return the action. Thin wrapper over [`Self::tick_with`] with
+    /// the real `/proc` sampler injected.
     fn tick(
         &mut self,
         pids: &[u32],
         now: Instant,
         stats: &crate::handoff_bridge::PoolerStatsHandle,
     ) -> ScaleAction {
+        self.tick_with(pids, now, stats, |pid| {
+            crate::children::read_proc_cpu_ticks(pid).unwrap_or(0)
+        })
+    }
+
+    /// Sample pooler CPU for `pids` via `sample` (cumulative ticks per pid),
+    /// decide, publish telemetry to `stats`, and return the action for the
+    /// caller to enact. The first call only establishes a CPU baseline (returns
+    /// Hold). `sample` is injectable so the whole orchestration — the
+    /// prev-ticks-across-worker-churn map, the cores math, telemetry, and the
+    /// decision — is deterministically testable without real processes or load.
+    fn tick_with(
+        &mut self,
+        pids: &[u32],
+        now: Instant,
+        stats: &crate::handoff_bridge::PoolerStatsHandle,
+        sample: impl Fn(u32) -> u64,
+    ) -> ScaleAction {
         let live = pids.len();
         let mut cur: std::collections::HashMap<u32, u64> =
             std::collections::HashMap::with_capacity(live);
         let mut delta_ticks: u64 = 0;
         for &pid in pids {
-            let t = crate::children::read_proc_cpu_ticks(pid).unwrap_or(0);
+            let t = sample(pid);
             if let Some(&prev) = self.prev_ticks.get(&pid) {
                 delta_ticks += t.saturating_sub(prev);
             }
@@ -265,6 +283,58 @@ impl PgbScaler {
             }
         }
         action
+    }
+}
+
+/// What [`apply_scale_action`] actually did, so the caller can persist/log with
+/// the right worker and count.
+#[derive(Debug, PartialEq, Eq)]
+enum ScaleOutcome {
+    /// Spawned and pushed an extra worker with this stable name.
+    SpawnedUp(&'static str),
+    /// SIGINT'd the named worker for graceful drain (still in `pgb_extra` until
+    /// it exits and the `wait_any_child` arm reaps it).
+    ReapedDown(&'static str),
+    /// Nothing changed (Hold, at the name cap, spawn failed, or nothing to reap).
+    NoOp,
+}
+
+/// Enact a [`ScaleAction`] on the extra-worker set. Process I/O is injected via
+/// `spawn` (build+start a worker; `None` = failed) and `reap` (signal one to
+/// drain) so the name-selection, bounds, and set mutation are unit-testable
+/// without forking real pgbouncers. The new worker's name index is exactly the
+/// current extra count (worker 0 is `pgb_state`); `decide_scale` guarantees
+/// `live < max ≤ 8`, and the explicit bound is belt-and-suspenders.
+fn apply_scale_action(
+    action: ScaleAction,
+    pgb_extra: &mut Vec<ChildState>,
+    spawn: impl FnOnce(&'static str) -> Option<ChildState>,
+    reap: impl FnOnce(&ChildState),
+) -> ScaleOutcome {
+    match action {
+        ScaleAction::Up => {
+            let idx = pgb_extra.len();
+            if idx >= PGB_EXTRA_NAMES.len() {
+                return ScaleOutcome::NoOp; // already at the worker-name cap
+            }
+            let name = PGB_EXTRA_NAMES[idx];
+            match spawn(name) {
+                Some(w) => {
+                    pgb_extra.push(w);
+                    ScaleOutcome::SpawnedUp(name)
+                }
+                None => ScaleOutcome::NoOp,
+            }
+        }
+        ScaleAction::Down => match pgb_extra.last() {
+            Some(w) => {
+                let name = w.name;
+                reap(w);
+                ScaleOutcome::ReapedDown(name)
+            }
+            None => ScaleOutcome::NoOp,
+        },
+        ScaleAction::Hold => ScaleOutcome::NoOp,
     }
 }
 
@@ -714,46 +784,46 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
                         pids.push(p);
                     }
                 }
-                match pgb_scaler.tick(&pids, now, &pooler_stats) {
-                    ScaleAction::Up => {
-                        // index into PGB_EXTRA_NAMES == current extra count (worker 0
-                        // is pgb_state). decide_scale guarantees live < max ≤ 8, so the
-                        // index is in range; the guard is belt-and-suspenders.
-                        let idx = pgb_extra.len();
-                        if idx < PGB_EXTRA_NAMES.len() {
-                            let name = PGB_EXTRA_NAMES[idx];
-                            let mut w = ChildState::new(name);
-                            match spawn_pgbouncer(&mut w, &log_tx) {
-                                Ok(()) => {
-                                    info!(
-                                        "pooler scaler: UP to {} workers (per-worker CPU saturated; spawned '{name}')",
-                                        pids.len() + 1
-                                    );
-                                    #[cfg(target_os = "linux")]
-                                    if let Err(e) = persist_child(&mut persisted, &w) {
-                                        warn!("pooler scaler: persist of '{name}' failed: {e}");
-                                    }
-                                    pgb_extra.push(w);
-                                }
-                                Err(e) => {
-                                    warn!("pooler scaler: failed to spawn '{name}': {e}");
-                                }
+                let action = pgb_scaler.tick(&pids, now, &pooler_stats);
+                let outcome = apply_scale_action(
+                    action,
+                    &mut pgb_extra,
+                    // spawn: build + start a real worker; None on failure (logged here).
+                    |name| {
+                        let mut w = ChildState::new(name);
+                        match spawn_pgbouncer(&mut w, &log_tx) {
+                            Ok(()) => Some(w),
+                            Err(e) => {
+                                warn!("pooler scaler: failed to spawn '{name}': {e}");
+                                None
                             }
                         }
-                    }
-                    ScaleAction::Down => {
-                        // Graceful: SIGINT drains in-flight txns then exits; the
-                        // wait_any_child arm reaps it from pgb_extra + persisted.
-                        if let Some(w) = pgb_extra.last() {
-                            info!(
-                                "pooler scaler: DOWN from {} workers (SIGINT graceful drain of '{}')",
-                                pids.len(),
-                                w.name
-                            );
-                            sigint_pgbouncer(w);
+                    },
+                    // reap: SIGINT for graceful drain; the wait_any_child arm
+                    // removes it from pgb_extra + persisted once it exits.
+                    sigint_pgbouncer,
+                );
+                match outcome {
+                    ScaleOutcome::SpawnedUp(name) => {
+                        let live = 1 + pgb_extra.len();
+                        info!(
+                            "pooler scaler: UP to {live} workers (per-worker CPU saturated; spawned '{name}')"
+                        );
+                        #[cfg(target_os = "linux")]
+                        if let Some(w) = pgb_extra.last()
+                            && let Err(e) = persist_child(&mut persisted, w)
+                        {
+                            warn!("pooler scaler: persist of '{name}' failed: {e}");
                         }
                     }
-                    ScaleAction::Hold => {}
+                    ScaleOutcome::ReapedDown(name) => {
+                        // worker still draining (not yet reaped from the vec).
+                        let live = 1 + pgb_extra.len();
+                        info!(
+                            "pooler scaler: DOWN from {live} workers (SIGINT graceful drain of '{name}')"
+                        );
+                    }
+                    ScaleOutcome::NoOp => {}
                 }
             }
         }
@@ -1807,6 +1877,273 @@ mod tests {
         let (a, _u, down) = decide_scale(0.7, 1.4, 2, 4, 0, 5, COOL);
         assert_eq!(a, ScaleAction::Hold);
         assert_eq!(down, 0, "warm tick resets the down streak");
+    }
+
+    // --- PgbScaler::tick orchestration (sampling + decide + telemetry),
+    //     deterministic via an injected CPU sampler + manual clock ---
+
+    fn test_scaler(max: usize) -> PgbScaler {
+        PgbScaler {
+            clk_tck: 100.0, // fixed USER_HZ so the cores math is exact in tests
+            max_workers: max,
+            prev_ticks: std::collections::HashMap::new(),
+            prev_at: None,
+            up_streak: 0,
+            down_streak: 0,
+            last_action_at: None,
+        }
+    }
+
+    #[test]
+    fn tick_baseline_then_scales_up_and_publishes_telemetry() {
+        let stats = crate::handoff_bridge::new_pooler_stats();
+        let mut s = test_scaler(4);
+        let cpu = std::cell::Cell::new(0u64); // cumulative ticks the sampler reports
+        let sample = |_pid: u32| cpu.get();
+        let t0 = Instant::now();
+        let pids = [100u32];
+
+        // 1st tick: no prior sample → baseline only, Hold.
+        assert_eq!(s.tick_with(&pids, t0, &stats, sample), ScaleAction::Hold);
+        // +1s, +90 ticks ⇒ 0.90 cores (1 worker). Hot, but needs 2 ticks.
+        cpu.set(90);
+        assert_eq!(
+            s.tick_with(&pids, t0 + Duration::from_secs(1), &stats, sample),
+            ScaleAction::Hold
+        );
+        // +1s, +90 ticks ⇒ 2nd hot tick ⇒ Up (no prior action → cooldown satisfied).
+        cpu.set(180);
+        assert_eq!(
+            s.tick_with(&pids, t0 + Duration::from_secs(2), &stats, sample),
+            ScaleAction::Up
+        );
+
+        let snap = stats.lock().unwrap().clone();
+        assert_eq!(snap.live_workers, 1);
+        assert_eq!(snap.max_workers, 4);
+        assert!(
+            (snap.per_worker_cores - 0.90).abs() < 0.01,
+            "per_worker_cores={}",
+            snap.per_worker_cores
+        );
+        assert_eq!(snap.last_action, "up");
+        assert!(!snap.at_ceiling, "1 of 4 workers is not at the ceiling");
+    }
+
+    #[test]
+    fn tick_scales_down_when_cold() {
+        let stats = crate::handoff_bridge::new_pooler_stats();
+        let mut s = test_scaler(4);
+        s.down_streak = SCALE_DOWN_TICKS - 1; // one cold tick away from a reap
+        let cpu = std::cell::Cell::new(0u64);
+        let sample = |_pid: u32| cpu.get(); // same cumulative for both pids
+        let t0 = Instant::now();
+        let pids = [200u32, 201u32];
+
+        // baseline
+        assert_eq!(s.tick_with(&pids, t0, &stats, sample), ScaleAction::Hold);
+        // +1s, each pid +5 ticks ⇒ aggregate 10 ticks = 0.10 cores over 2 workers.
+        // Removing one leaves 0.10 < 0.5 ⇒ cold ⇒ down_streak hits the threshold.
+        cpu.set(5);
+        assert_eq!(
+            s.tick_with(&pids, t0 + Duration::from_secs(1), &stats, sample),
+            ScaleAction::Down
+        );
+        assert_eq!(stats.lock().unwrap().last_action, "down");
+    }
+
+    #[test]
+    fn tick_at_ceiling_flag_set_when_max_and_saturated() {
+        let stats = crate::handoff_bridge::new_pooler_stats();
+        let mut s = test_scaler(2); // max == live below
+        let cpu = std::cell::Cell::new(0u64);
+        let sample = |_pid: u32| cpu.get();
+        let t0 = Instant::now();
+        let pids = [10u32, 11u32]; // 2 live == max 2
+
+        assert_eq!(s.tick_with(&pids, t0, &stats, sample), ScaleAction::Hold);
+        // each pid +90 ⇒ aggregate 180 ticks = 1.8 cores / 2 = 0.9 per worker (> 0.75).
+        cpu.set(90);
+        // Hot, but live == max ⇒ never Up; at_ceiling must flag the box wants more.
+        assert_eq!(
+            s.tick_with(&pids, t0 + Duration::from_secs(1), &stats, sample),
+            ScaleAction::Hold
+        );
+        let snap = stats.lock().unwrap().clone();
+        assert!(
+            snap.at_ceiling,
+            "live==max && saturated must set at_ceiling"
+        );
+    }
+
+    #[test]
+    fn tick_worker_churn_does_not_spike_aggregate() {
+        // A pid appearing mid-window (no prior sample) contributes 0 this tick —
+        // its large absolute counter must NOT be read as a delta. This is the
+        // per-pid-keyed map's whole reason to exist.
+        let stats = crate::handoff_bridge::new_pooler_stats();
+        let mut s = test_scaler(4);
+        let t0 = Instant::now();
+
+        // baseline: only pid 100 (cumulative 1000).
+        assert_eq!(
+            s.tick_with(&[100u32], t0, &stats, |_| 1000),
+            ScaleAction::Hold
+        );
+        // +1s: pid 100 advances 50 ticks; brand-new pid 200 shows up with a huge
+        // absolute counter. Only pid 100's 50-tick delta counts ⇒ 0.5 cores agg.
+        let act = s.tick_with(
+            &[100u32, 200u32],
+            t0 + Duration::from_secs(1),
+            &stats,
+            |pid| {
+                if pid == 100 { 1050 } else { 9_999_999 }
+            },
+        );
+        assert_eq!(act, ScaleAction::Hold);
+        let snap = stats.lock().unwrap().clone();
+        assert!(
+            (snap.aggregate_cpu_cores - 0.50).abs() < 0.01,
+            "new worker must not spike aggregate: agg={}",
+            snap.aggregate_cpu_cores
+        );
+    }
+
+    // --- apply_scale_action: spawn/reap mutation with injected process I/O ---
+
+    #[test]
+    fn apply_up_spawns_workers_in_name_order() {
+        let mut extra: Vec<ChildState> = Vec::new();
+        let out = apply_scale_action(
+            ScaleAction::Up,
+            &mut extra,
+            |name| Some(ChildState::new(name)),
+            |_w| panic!("reap must not run on Up"),
+        );
+        assert_eq!(out, ScaleOutcome::SpawnedUp("pgbouncer-1"));
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].name, "pgbouncer-1");
+
+        let out = apply_scale_action(
+            ScaleAction::Up,
+            &mut extra,
+            |name| Some(ChildState::new(name)),
+            |_w| {},
+        );
+        assert_eq!(out, ScaleOutcome::SpawnedUp("pgbouncer-2"));
+        assert_eq!(extra.len(), 2);
+    }
+
+    #[test]
+    fn apply_down_reaps_last_but_keeps_it_pending() {
+        let mut extra = vec![
+            ChildState::new("pgbouncer-1"),
+            ChildState::new("pgbouncer-2"),
+        ];
+        let reaped = std::cell::Cell::new("");
+        let out = apply_scale_action(
+            ScaleAction::Down,
+            &mut extra,
+            |_n| panic!("spawn must not run on Down"),
+            |w| reaped.set(w.name),
+        );
+        assert_eq!(out, ScaleOutcome::ReapedDown("pgbouncer-2"));
+        assert_eq!(reaped.get(), "pgbouncer-2");
+        // Down does NOT remove from the vec — wait_any_child does, on actual exit.
+        assert_eq!(extra.len(), 2);
+    }
+
+    #[test]
+    fn apply_up_noops_at_name_cap() {
+        let mut extra: Vec<ChildState> = PGB_EXTRA_NAMES
+            .iter()
+            .map(|&n| ChildState::new(n))
+            .collect();
+        assert_eq!(extra.len(), PGB_EXTRA_NAMES.len());
+        let out = apply_scale_action(
+            ScaleAction::Up,
+            &mut extra,
+            |_n| panic!("must not spawn past the name cap"),
+            |_w| {},
+        );
+        assert_eq!(out, ScaleOutcome::NoOp);
+        assert_eq!(extra.len(), PGB_EXTRA_NAMES.len());
+    }
+
+    /// Real-process integration: the production `tick()` (real `/proc` sampler,
+    /// real clock) must turn a genuinely CPU-bound worker into a real `Up`
+    /// decision. Covers the wiring the injected-sampler tests stub out. Ignored
+    /// by default because it spawns a process and burns ~1.5s of CPU; run with
+    /// `cargo test -p beyond-pg --bins -- --ignored`.
+    #[test]
+    #[ignore = "spawns a real CPU-burning process; run with --ignored"]
+    fn scaler_tick_detects_real_cpu_load_and_decides_up() {
+        use std::process::{Command, Stdio};
+
+        // Cleanup guard: SIGKILL the burner even if an assertion panics.
+        struct Kill(u32);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = Command::new("kill")
+                    .arg("-9")
+                    .arg(self.0.to_string())
+                    .status();
+            }
+        }
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("while :; do :; done")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn CPU burner");
+        let pid = child.id();
+        let _guard = Kill(pid);
+
+        let stats = crate::handoff_bridge::new_pooler_stats();
+        let mut s = PgbScaler::new(4); // real clk_tck + real /proc sampler via tick()
+        let pids = [pid];
+
+        s.tick(&pids, Instant::now(), &stats); // baseline (no prior sample)
+        let mut scaled_up = false;
+        let mut max_cores = 0.0f64;
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(600));
+            let action = s.tick(&pids, Instant::now(), &stats);
+            max_cores = max_cores.max(stats.lock().unwrap().per_worker_cores);
+            if action == ScaleAction::Up {
+                scaled_up = true;
+                break;
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            max_cores > 0.7,
+            "real /proc sampling should read ~1 core for a busy loop, saw {max_cores}"
+        );
+        assert!(
+            scaled_up,
+            "scaler must decide Up under sustained real CPU load (peak per-worker {max_cores} cores)"
+        );
+    }
+
+    #[test]
+    fn apply_spawn_failure_and_empty_down_are_noops() {
+        let mut extra: Vec<ChildState> = Vec::new();
+        // spawn returns None (e.g. fork failed) → no growth.
+        assert_eq!(
+            apply_scale_action(ScaleAction::Up, &mut extra, |_n| None, |_w| {}),
+            ScaleOutcome::NoOp
+        );
+        assert!(extra.is_empty());
+        // Down with no extras → nothing to reap.
+        assert_eq!(
+            apply_scale_action(ScaleAction::Down, &mut extra, |_n| None, |_w| {}),
+            ScaleOutcome::NoOp
+        );
     }
 
     #[test]

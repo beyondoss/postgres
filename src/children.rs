@@ -214,6 +214,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn read_proc_cpu_ticks_for_self_increases_under_load() {
+        let me = std::process::id();
+        let before = read_proc_cpu_ticks(me).expect("read self cpu ticks");
+        // Burn CPU so utime/stime advance (≥ a few ticks at 100 Hz over 300 ms).
+        let mut x: u64 = 1;
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(300) {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+        }
+        std::hint::black_box(x);
+        let after = read_proc_cpu_ticks(me).expect("read self cpu ticks again");
+        assert!(
+            after > before,
+            "300ms of CPU burn must add ≥1 tick: {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn read_proc_cpu_ticks_missing_pid_errors() {
+        // No /proc/<u32::MAX>/stat — the read must surface an error, not 0.
+        assert!(read_proc_cpu_ticks(u32::MAX).is_err());
+    }
+
+    #[test]
     fn round_trip_save_load() {
         let dir = tempfile::tempdir().unwrap();
         let mut pc = PersistedChildren::empty();
