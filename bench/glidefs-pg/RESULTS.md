@@ -202,3 +202,29 @@ empty cache → cold reads). Result appended on completion.
 Measurement has already paid for itself by **killing two speculative knobs** (zstd, wal_recycle) that
 intuition/the-ZFS-playbook would have shipped. The high-value hypotheses (checkpoint frequency,
 maintenance_io_concurrency, cooldown-under-churn) remain open and need the tailored experiments above.
+
+## Round 4 — multi-worker with the REAL product config (Docker, pgbouncer 1.25.2)
+
+`multiworker-real-config.sh`, run in the `beyond-pg-test` image: the committed
+`packer/files/pgbouncer/pgbouncer.ini` + the lines `config::pgbouncer_ini`
+appends (scram `auth_query`, TLS, `unix_socket_dir =`, `so_reuseport = 1`), the
+exact `setup_pgbouncer_auth` SQL, 3 so_reuseport workers, real scram+TLS traffic.
+
+**Result (after working around the two bugs below):** 3 workers start and share
+`:5432`; 90/90 scram+TLS queries served, distributed across all three (per-worker
+CPU non-zero); SIGINT one → graceful reap (3→2) with 60/60 queries still served,
+0 errors. The multi-worker mechanism + graceful drain work with the real config.
+
+**Two pre-existing bugs this surfaced (NOT from the scaler; uncaught by CI — the
+supervisor tests only `pgrep pgbouncer` and check the role exists, never auth
+through `:5432`):**
+
+1. **Self-signed cert → pgbouncer won't start.** `config::pgbouncer_ini` omits
+   `client_tls_ca_file` for self-signed certs, but pgbouncer 1.25.2 fatals
+   (`TLS setup failed: failed to load CA: (null)`) when a client cert is set
+   without a CA. Bites the self-signed fallback (platform certs carry a CA).
+   Workaround in the script: point the CA at the self-signed cert (its own issuer).
+2. **`pgbouncer` role can't call `get_auth` → all scram auth fails.**
+   `setup_pgbouncer_auth` grants EXECUTE on the function but never `GRANT USAGE ON
+   SCHEMA pgbouncer TO pgbouncer`, so auth_query dies with `permission denied for
+   schema pgbouncer` for every client. One-line fix.
