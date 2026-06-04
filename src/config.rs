@@ -108,6 +108,13 @@ pub fn pgbouncer_ini(tls: &crate::tls::TlsConfig, ram_bytes: u64, vcpus: u32) ->
     out.push_str(&format!("client_tls_key_file = {}\n", tls.key.display()));
     if let Some(ca) = &tls.ca {
         out.push_str(&format!("client_tls_ca_file = {}\n", ca.display()));
+    } else {
+        // pgbouncer (1.25.x) requires client_tls_ca_file whenever a client cert is
+        // set — even for sslmode=allow — and FATALs with "failed to load CA:
+        // (null)" otherwise. A self-signed cert is its own issuer, so point the CA
+        // at the cert itself. This satisfies the requirement without changing
+        // client-cert behavior (sslmode=allow neither requests nor verifies them).
+        out.push_str(&format!("client_tls_ca_file = {}\n", tls.cert.display()));
     }
     out
 }
@@ -495,7 +502,9 @@ mod tests {
     }
 
     #[test]
-    fn pgbouncer_ini_self_signed_omits_ca() {
+    fn pgbouncer_ini_self_signed_points_ca_at_cert() {
+        // pgbouncer FATALs without client_tls_ca_file when a client cert is set, so
+        // a self-signed cert (its own issuer) must point the CA at itself.
         let tls = TlsConfig {
             source: TlsSource::SelfSigned,
             cert: PathBuf::from("/var/lib/postgresql/18/main/beyond/server.crt"),
@@ -506,8 +515,8 @@ mod tests {
         assert!(out.contains("client_tls_sslmode = allow"));
         assert!(out.contains("client_tls_cert_file"));
         assert!(
-            !out.contains("client_tls_ca_file"),
-            "self-signed has no CA: {out}"
+            out.contains("client_tls_ca_file = /var/lib/postgresql/18/main/beyond/server.crt"),
+            "self-signed CA points at the cert itself: {out}"
         );
     }
 

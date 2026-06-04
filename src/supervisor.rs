@@ -338,6 +338,14 @@ fn apply_scale_action(
     }
 }
 
+/// How many extra pooler workers to warm-start on cold boot: the count that was
+/// live before the restart (from the durable children.json), clamped to the
+/// current box's worker ceiling minus worker 0 — so a box that was resized
+/// smaller during the restart doesn't over-spawn.
+fn warm_start_extra_count(prior_live_extras: usize, vcpus: u32) -> usize {
+    prior_live_extras.min(crate::config::pgbouncer_max_workers(vcpus).saturating_sub(1))
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -506,6 +514,30 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
         }
     } else {
         // Cold-start path: original boot sequence.
+        //
+        // Warm-start hint: children.json is durable across reboots (the rootfs is
+        // GlideFS-backed), so it records how many extra pooler workers were live
+        // before this restart. Capture that COUNT now — before our first persist
+        // overwrites the file — so we can bring the pooler back up to its
+        // pre-restart size instead of meeting the post-restart reconnect storm
+        // (peak TLS-handshake churn) with a single worker and crawling back up
+        // under the scaler's cooldowns. The pids in it are dead; only the count
+        // matters, and the scaler corrects from there. Best-effort: a fresh box
+        // has no prior file → 0. It's a hint, not source-of-truth — losing it just
+        // falls back to starting at one worker.
+        #[cfg(target_os = "linux")]
+        let warm_start_extras =
+            crate::children::PersistedChildren::load(&crate::children::state_dir())
+                .map(|prior| {
+                    PGB_EXTRA_NAMES
+                        .iter()
+                        .filter(|&&name| prior.get(name).is_some())
+                        .count()
+                })
+                .unwrap_or(0);
+        #[cfg(not(target_os = "linux"))]
+        let warm_start_extras = 0usize;
+
         boot::do_boot(&cfg).await?;
 
         let mut pg = ChildState::new("postgres");
@@ -550,8 +582,28 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
         #[cfg(target_os = "linux")]
         persist_child(&mut persisted, &pgb)?;
         pgb_state = pgb;
-        // Start with ONE pooler. The PgbScaler grows pgb_extra reactively under load
-        // (so_reuseport) and reaps it back down — see the scaler tick in the run loop.
+        // Warm-start the extra so_reuseport workers to the pre-restart size (clamped
+        // to the current max_workers in case the box was resized smaller). They share
+        // :5432 with worker 0, so a reconnect storm is absorbed across cores from the
+        // first second; the scaler reaps any excess within minutes if load doesn't
+        // justify it. Without this, a busy box drops to ONE pooler at exactly the
+        // moment of peak handshake churn and climbs back only under the up-cooldown.
+        let want_extras = warm_start_extra_count(warm_start_extras, cfg.vcpus);
+        for &name in PGB_EXTRA_NAMES.iter().take(want_extras) {
+            let mut w = ChildState::new(name);
+            match spawn_pgbouncer(&mut w, &log_tx) {
+                Ok(()) => {
+                    #[cfg(target_os = "linux")]
+                    persist_child(&mut persisted, &w)?;
+                    pgb_extra.push(w);
+                }
+                Err(e) => warn!("warm-start: failed to spawn pooler worker '{name}': {e}"),
+            }
+        }
+        if want_extras > 0 {
+            info!("warm-start: restored {want_extras} extra pooler worker(s) to pre-restart size");
+        }
+        // The PgbScaler grows/shrinks pgb_extra reactively from here (so_reuseport).
 
         cdc_state = if cfg.pg_tier != PgTier::Replica && cfg.cdc_enabled {
             let mut s = ChildState::new("beyond-pg-cdc");
@@ -1734,6 +1786,11 @@ async fn setup_pgbouncer_auth() -> Result<(), crate::pg::PgError> {
     )
     .await?;
 
+    // USAGE on the schema is REQUIRED for the pgbouncer role to call get_auth at
+    // all — without it auth_query fails with "permission denied for schema
+    // pgbouncer" for every client, and no one can connect through the pooler.
+    // (EXECUTE on the function is not enough; the caller also needs schema USAGE.)
+    pg::psql("GRANT USAGE ON SCHEMA pgbouncer TO pgbouncer").await?;
     pg::psql("GRANT EXECUTE ON FUNCTION pgbouncer.get_auth(text) TO pgbouncer").await?;
 
     Ok(())
@@ -2010,6 +2067,18 @@ mod tests {
     }
 
     // --- apply_scale_action: spawn/reap mutation with injected process I/O ---
+
+    #[test]
+    fn warm_start_clamps_to_current_max_workers() {
+        // Same-size box: restore exactly what was live (max_workers(64)=8 → cap 7).
+        assert_eq!(warm_start_extra_count(4, 64), 4);
+        // Downsized during restart (now 8 vCPU → max_workers 2 → ≤1 extra): clamp down.
+        assert_eq!(warm_start_extra_count(7, 8), 1);
+        // Tiny box (max_workers 1 → 0 extras): never warm-start past a single pooler.
+        assert_eq!(warm_start_extra_count(3, 2), 0);
+        // Fresh box / nothing prior: start at one worker.
+        assert_eq!(warm_start_extra_count(0, 64), 0);
+    }
 
     #[test]
     fn apply_up_spawns_workers_in_name_order() {
