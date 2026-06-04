@@ -235,6 +235,43 @@ impl RunningContainer {
         self.wait_for(&["pgrep", "-x", "pgbouncer"], timeout)
     }
 
+    /// Number of live pgbouncer processes (worker 0 + scaled/warm-started extras).
+    fn pgbouncer_count(&self) -> u32 {
+        let out = self.exec(&["pgrep", "-c", "-x", "pgbouncer"]);
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    /// Poll until exactly `target` pgbouncer processes are live (or timeout).
+    fn wait_pgbouncer_count(&self, target: u32, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if self.pgbouncer_count() == target {
+                return true;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        false
+    }
+
+    /// `docker restart` — SIGTERM the supervisor, then re-run the entrypoint
+    /// (a fresh cold start in the SAME container, so the writable layer —
+    /// children.json, PGDATA — persists, exactly like a real reboot).
+    fn restart(&self, timeout: Duration) {
+        let secs = timeout.as_secs().to_string();
+        let out = std::process::Command::new("docker")
+            .args(["restart", "-t", &secs, &self.id])
+            .output()
+            .expect("docker restart");
+        assert!(
+            out.status.success(),
+            "docker restart failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// Poll until the pgbouncer role exists — proxy for post_start completion.
     fn wait_post_start_done(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
@@ -628,6 +665,79 @@ fn supervisor_lifecycle_primary() {
     assert!(
         code == 0 || code == 143,
         "supervisor did not exit cleanly on SIGTERM: exit code {code}\nlogs:\n{}",
+        container.logs()
+    );
+}
+
+/// Warm-start: a busy box that cold-restarts must come back at its pre-restart
+/// pooler size, not a single worker — the post-restart reconnect storm is peak
+/// handshake churn, the worst moment to be under-provisioned. children.json is
+/// durable across reboots (GlideFS-backed rootfs) and records the extra workers;
+/// cold start respawns that many.
+///
+/// CI-only (like the sibling supervisor lifecycle tests): uses the standard
+/// unprivileged harness. Assumes a CI runner with >= 8 cores so `read_vcpus` →
+/// `pgbouncer_max_workers >= 2` (so a warm-started extra is within the cap).
+/// NOTE: do NOT run this with `--privileged` on the shared homelab host — the
+/// supervisor's boot reserves host hugepages and writes host sysctls, mutating
+/// kernel state shared with production. That's exactly why the harness is
+/// unprivileged; the trade-off is this test can only boot in CI's permissive
+/// Docker, not on a host with a restrictive seccomp profile.
+#[test]
+#[ignore = "requires Docker + musl target + beyond-pg-test:latest image (>= 8 cores)"]
+fn supervisor_warm_starts_pooler_after_restart() {
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(harness) = SupervisorHarness::new() else {
+        return;
+    };
+    let container = harness.start(&[]);
+
+    assert!(
+        container.wait_postgres_ready(Duration::from_secs(90)),
+        "postgres not ready\n{}",
+        container.logs()
+    );
+    assert!(
+        container.wait_post_start_done(Duration::from_secs(30)),
+        "post_start did not complete\n{}",
+        container.logs()
+    );
+    assert!(
+        container.wait_pgbouncer_up(Duration::from_secs(30)),
+        "pgbouncer not up\n{}",
+        container.logs()
+    );
+    assert_eq!(
+        container.pgbouncer_count(),
+        1,
+        "expected a single pooler at idle before the restart"
+    );
+
+    // Simulate a box that had scaled up to 2 workers before the restart: record an
+    // extra worker in the durable children.json the scaler would have persisted.
+    let inject = container.exec(&[
+        "sh",
+        "-c",
+        "echo '{\"version\":1,\"pgbouncer-1\":{\"pid\":424242,\"starttime\":1}}' \
+         > /var/lib/beyond-pg/state/children.json",
+    ]);
+    assert!(
+        inject.status.success(),
+        "failed to inject children.json: {}",
+        String::from_utf8_lossy(&inject.stderr)
+    );
+
+    // Cold-restart the supervisor; warm-start must restore the extra worker.
+    container.restart(Duration::from_secs(30));
+    assert!(
+        container.wait_postgres_ready(Duration::from_secs(90)),
+        "postgres not ready after restart\n{}",
+        container.logs()
+    );
+    assert!(
+        container.wait_pgbouncer_count(2, Duration::from_secs(45)),
+        "warm-start should restore 2 pooler workers after restart, saw {}\n{}",
+        container.pgbouncer_count(),
         container.logs()
     );
 }

@@ -17,7 +17,7 @@ Forks boot in seconds against a CoW snapshot of `/var/lib/postgresql`. Postgres 
 ## What it does
 
 - **Forks with the substrate.** Every byte under `/var/lib/postgresql` snapshots atomically; the new box boots on a CoW copy. No `pg_dump`, no replication topology, no wait.
-- **PgBouncer on the front.** Transaction pooling on `:5432`; Postgres itself listens on the loopback only.
+- **PgBouncer on the front, sized to load.** Transaction pooling and TLS termination on `:5432`; Postgres listens on the loopback only. The pooler runs one worker when idle and adds `so_reuseport` workers across cores as connection-handshake load rises, then reaps them when it falls. The worker count survives restarts.
 - **Logical decoding from day one.** `wal_level = logical`, `max_wal_senders = 10`, `max_replication_slots = 10`. No primary restart to enable CDC later.
 - **Standard extensions, pinned.** pgvector, pgvectorscale, PostGIS, pg_cron, pg_partman, pg_jsonschema, hypopg, pg_repack, pg_search, pg_stat_statements, pg_trgm, auto_explain.
 - **Beyond extensions on the same volume.** `beyond-auth` and `beyond-queue` ship in the image and live under their own schemas in your database. Forking your DB forks their state automatically.

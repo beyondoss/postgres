@@ -154,6 +154,32 @@ pub fn read_starttime(pid: u32) -> std::io::Result<u64> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// Read `/proc/<pid>/stat` CPU time = field 14 (utime) + field 15 (stime), in
+/// clock ticks. Used by the PgBouncer scaler to sample per-worker CPU: sample
+/// twice, delta / SC_CLK_TCK / elapsed_secs = cores consumed.
+///
+/// Same robust parse as [`read_starttime`]: split after the last `)` so a comm
+/// with spaces/parens can't shift the field indices. After `") "`, field 3
+/// (state) is idx 0, so utime (field 14) is idx 11 and stime (field 15) is idx 12.
+pub fn read_proc_cpu_ticks(pid: u32) -> std::io::Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let close = stat
+        .rfind(')')
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no `)` in stat"))?;
+    let after = stat
+        .get(close + 2..)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "stat truncated"))?;
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    let parse = |idx: usize| -> std::io::Result<u64> {
+        fields
+            .get(idx)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "stat too short"))?
+            .parse::<u64>()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    };
+    Ok(parse(11)? + parse(12)?)
+}
+
 #[allow(dead_code)] // exercised via tests + phase 5b adopt path
 fn pidfd_open(pid: i32) -> std::io::Result<OwnedFd> {
     // SAFETY: SYS_pidfd_open with flags=0 returns either a new owned fd or
@@ -186,6 +212,30 @@ pub fn state_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_proc_cpu_ticks_for_self_increases_under_load() {
+        let me = std::process::id();
+        let before = read_proc_cpu_ticks(me).expect("read self cpu ticks");
+        // Burn CPU so utime/stime advance (≥ a few ticks at 100 Hz over 300 ms).
+        let mut x: u64 = 1;
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(300) {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+        }
+        std::hint::black_box(x);
+        let after = read_proc_cpu_ticks(me).expect("read self cpu ticks again");
+        assert!(
+            after > before,
+            "300ms of CPU burn must add ≥1 tick: {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn read_proc_cpu_ticks_missing_pid_errors() {
+        // No /proc/<u32::MAX>/stat — the read must surface an error, not 0.
+        assert!(read_proc_cpu_ticks(u32::MAX).is_err());
+    }
 
     #[test]
     fn round_trip_save_load() {

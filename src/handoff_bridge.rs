@@ -26,16 +26,54 @@
 //! Linux-only (handoff crate). Module-level gating done at the
 //! `mod handoff_bridge;` declaration sites in `main.rs` and `lib.rs`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use handoff::{DrainReport, Drainable, SealReport, StateSnapshot};
+
+/// Snapshot of the PgBouncer pooler tier, published by the supervisor's scaler
+/// every tick and served over the `pooler` RPC command. This is the production
+/// signal for "does a real box ever saturate a pooler": `at_ceiling` sustained
+/// means even the maxed-out worker set is CPU-bound; `live_workers` stuck at 1
+/// forever means the scaler was never needed.
+///
+/// Lives here (rather than in `rpc`) because `rpc`/`supervisor` are binary-only
+/// modules while `handoff_bridge` is in the library — `SharedState` carries the
+/// handle, so the type must be library-visible.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct PoolerStats {
+    /// Currently-running pooler processes (worker 0 + scaled-up extras).
+    pub live_workers: u32,
+    /// Ceiling the scaler may grow to (`config::pgbouncer_max_workers`).
+    pub max_workers: u32,
+    /// Total pooler CPU across all live workers, in cores, over the last tick.
+    pub aggregate_cpu_cores: f64,
+    /// `aggregate_cpu_cores / live_workers` — the per-worker saturation signal.
+    pub per_worker_cores: f64,
+    /// `live == max` AND per-worker near-saturated: the box wants more pooler
+    /// capacity than the cap allows.
+    pub at_ceiling: bool,
+    /// Last scaling action the scaler took: "up", "down", or "" (none yet).
+    pub last_action: String,
+}
+
+/// Shared handle: scaler writes, RPC reads. Lock is held only for a struct copy.
+pub type PoolerStatsHandle = Arc<Mutex<PoolerStats>>;
+
+/// Construct a fresh, zeroed pooler-stats handle.
+pub fn new_pooler_stats() -> PoolerStatsHandle {
+    Arc::new(Mutex::new(PoolerStats::default()))
+}
 
 #[derive(Clone, Default)]
 pub struct SharedState {
     pub accept_paused: Arc<AtomicBool>,
     pub in_flight: Arc<AtomicUsize>,
+    /// PgBouncer scaler telemetry, published by the supervisor and served over
+    /// the `pooler` RPC command. Shares the handle so the RPC handler reads what
+    /// the scaler last wrote. `Default` = a zeroed handle (Arc<Mutex<…>>).
+    pub pooler: PoolerStatsHandle,
 }
 
 impl SharedState {

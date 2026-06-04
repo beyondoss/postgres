@@ -172,6 +172,24 @@ set -euo pipefail
 exec packer/scripts/bless.sh --image "${image_path}" --name "${base_name}"
 '''
 
+[tasks."bench:substrate"]
+description = "GlideFS x Postgres substrate-tuning benchmark (measure-first rig)"
+usage = '''
+flag "--conf <conf>" help="Candidate postgresql.conf overlay" default="bench/glidefs-pg/conf/baseline.conf"
+flag "--label <label>" help="Run label" default="baseline"
+flag "--backend <backend>" help="Object store: file|memory|minio" default="file"
+flag "--scale <scale>" help="pgbench scale" default="25"
+flag "--duration <duration>" help="pgbench seconds" default="120"
+flag "--cooldown <cooldown>" help="GlideFS compaction_cooldown" default="0"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+exec bench/glidefs-pg/run.sh \
+  --conf "${conf}" --label "${label}" --backend "${backend}" \
+  --scale "${scale}" --duration "${duration}" --cooldown "${cooldown}"
+'''
+
 [tasks."publish:image"]
 description = "Publish Postgres rootfs image to S3"
 usage = '''
