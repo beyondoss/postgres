@@ -1,0 +1,3 @@
+2026-06-03 14:14:52.132 PDT [1239168] LOG:  invalid value for parameter "wal_compression": "lz4"
+2026-06-03 14:14:52.132 PDT [1239168] HINT:  Available values: pglz, on, off.
+2026-06-03 14:14:52.132 PDT [1239168] FATAL:  configuration file "/tmp/gfpg.AqPOOe/mnt/pgdata/harness.conf" contains errors

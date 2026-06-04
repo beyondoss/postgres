@@ -36,6 +36,238 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const STABLE_RUNTIME: Duration = Duration::from_secs(60);
 const MAX_BACKOFF_MS: u64 = 30_000;
 
+/// Stable, supervisor-persisted names for extra PgBouncer so_reuseport workers
+/// (worker 0 keeps the name "pgbouncer" for handoff compatibility). Capped at 7
+/// because `config::pgbouncer_workers` caps total workers at 8.
+const PGB_EXTRA_NAMES: [&str; 7] = [
+    "pgbouncer-1",
+    "pgbouncer-2",
+    "pgbouncer-3",
+    "pgbouncer-4",
+    "pgbouncer-5",
+    "pgbouncer-6",
+    "pgbouncer-7",
+];
+
+/// Wait for ANY child in the slice to exit; returns its exit code and index.
+/// Pends forever on an empty slice. Hand-rolled `select_all` (no `futures` dep):
+/// persistent per-child wait futures are built once and polled together, so no
+/// progress is lost between polls.
+async fn wait_any_child(workers: &mut [ChildState]) -> (std::io::Result<Option<i32>>, usize) {
+    if workers.is_empty() {
+        std::future::pending::<()>().await;
+        unreachable!();
+    }
+    let mut futs: Vec<_> = workers
+        .iter_mut()
+        .map(|w| {
+            let h = w.handle.as_mut();
+            Box::pin(async move {
+                match h {
+                    Some(h) => h.wait().await,
+                    None => std::future::pending::<std::io::Result<Option<i32>>>().await,
+                }
+            })
+        })
+        .collect();
+    std::future::poll_fn(|cx| {
+        for (i, f) in futs.iter_mut().enumerate() {
+            if let std::task::Poll::Ready(r) = f.as_mut().poll(cx) {
+                return std::task::Poll::Ready((r, i));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// PgBouncer reactive scaler
+// ---------------------------------------------------------------------------
+//
+// The single-threaded pooler saturates one core terminating TLS under
+// connection churn (~2.4k conns/s/core, measured in bench/glidefs-pg §F). When a
+// box is genuinely pooler-CPU-bound we add so_reuseport workers — the kernel
+// load-balances new connections across them (proven linear: pooler CPU 0.79→1.59
+// cores for 2 workers) — and reap them when load falls, so an idle/scaled-to-zero
+// box runs exactly ONE pooler and only a busy box spends extra cores.
+//
+// The decision is an inline select! arm (not a spawned task) because it mutates
+// pgb_state/pgb_extra to spawn and SIGINT workers.
+
+/// How often the scaler samples pooler CPU and reconsiders the worker count.
+const SCALER_TICK: Duration = Duration::from_secs(5);
+/// Per-worker CPU (cores) above which the tier is "hot". 0.75 ≈ nearly saturated
+/// (a single pooler tops ~0.79–1.0 cores in the rig).
+const SCALE_UP_CORES: f64 = 0.75;
+/// Low-water per-worker CPU (cores) the tier must stay UNDER — computed as if one
+/// worker were already removed — to be considered cold enough to reap.
+const SCALE_DOWN_CORES: f64 = 0.5;
+/// Consecutive hot ticks before scaling up (≈10s) — react fast.
+const SCALE_UP_TICKS: u32 = 2;
+/// Consecutive cold ticks before scaling down (≈30s) — react slow, to avoid
+/// thrash and minimize the ~0.03% reconnect blip a reap causes.
+const SCALE_DOWN_TICKS: u32 = 6;
+/// Minimum gap between scale-UP actions.
+const SCALE_UP_COOLDOWN: Duration = Duration::from_secs(30);
+/// Minimum gap between scale-DOWN actions.
+const SCALE_DOWN_COOLDOWN: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScaleAction {
+    Up,
+    Down,
+    Hold,
+}
+
+/// Linux USER_HZ (`sysconf(_SC_CLK_TCK)`): the ticks-per-second that
+/// /proc/<pid>/stat utime+stime are denominated in. Effectively always 100, but
+/// read it to be correct; fall back to 100.
+fn clk_tck() -> f64 {
+    #[cfg(unix)]
+    {
+        let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if v > 0 { v as f64 } else { 100.0 }
+    }
+    #[cfg(not(unix))]
+    {
+        100.0
+    }
+}
+
+/// Pure scaling decision: given current per-worker load + streak/cooldown state,
+/// return the action and the updated streak counters. Side-effect-free so it can
+/// be unit-tested without spawning processes; the caller stamps `last_action`
+/// and adopts the returned streaks.
+fn decide_scale(
+    per_worker_cores: f64,
+    aggregate_cores: f64,
+    live: usize,
+    max: usize,
+    up_streak: u32,
+    down_streak: u32,
+    since_last_action: Duration,
+) -> (ScaleAction, u32, u32) {
+    // Hot streak: per-worker is saturated.
+    let up_streak = if per_worker_cores > SCALE_UP_CORES {
+        up_streak.saturating_add(1)
+    } else {
+        0
+    };
+    // Cold streak: even after dropping one worker, the remaining set would stay
+    // under the low-water mark — so the extra worker is dead weight.
+    let cold = live > 1 && aggregate_cores / (live as f64 - 1.0) < SCALE_DOWN_CORES;
+    let down_streak = if cold {
+        down_streak.saturating_add(1)
+    } else {
+        0
+    };
+
+    if up_streak >= SCALE_UP_TICKS && live < max && since_last_action >= SCALE_UP_COOLDOWN {
+        return (ScaleAction::Up, 0, 0);
+    }
+    if down_streak >= SCALE_DOWN_TICKS && live > 1 && since_last_action >= SCALE_DOWN_COOLDOWN {
+        return (ScaleAction::Down, 0, 0);
+    }
+    (ScaleAction::Hold, up_streak, down_streak)
+}
+
+/// Sampling + decision state carried across ticks (impure half: reads /proc).
+struct PgbScaler {
+    clk_tck: f64,
+    max_workers: usize,
+    /// Per-pid cumulative CPU ticks from the previous sample, keyed by pid so a
+    /// worker added/reaped between ticks can't corrupt the aggregate delta (only
+    /// pids present in BOTH samples contribute).
+    prev_ticks: std::collections::HashMap<u32, u64>,
+    prev_at: Option<Instant>,
+    up_streak: u32,
+    down_streak: u32,
+    last_action_at: Option<Instant>,
+}
+
+impl PgbScaler {
+    fn new(max_workers: usize) -> Self {
+        Self {
+            clk_tck: clk_tck(),
+            max_workers,
+            prev_ticks: std::collections::HashMap::new(),
+            prev_at: None,
+            up_streak: 0,
+            down_streak: 0,
+            last_action_at: None,
+        }
+    }
+
+    /// Sample pooler CPU for `pids`, decide, publish telemetry to `stats`, and
+    /// return the action for the caller to enact. The first call only establishes
+    /// a CPU baseline (returns Hold).
+    fn tick(
+        &mut self,
+        pids: &[u32],
+        now: Instant,
+        stats: &crate::handoff_bridge::PoolerStatsHandle,
+    ) -> ScaleAction {
+        let live = pids.len();
+        let mut cur: std::collections::HashMap<u32, u64> =
+            std::collections::HashMap::with_capacity(live);
+        let mut delta_ticks: u64 = 0;
+        for &pid in pids {
+            let t = crate::children::read_proc_cpu_ticks(pid).unwrap_or(0);
+            if let Some(&prev) = self.prev_ticks.get(&pid) {
+                delta_ticks += t.saturating_sub(prev);
+            }
+            cur.insert(pid, t);
+        }
+        let elapsed = self
+            .prev_at
+            .map(|p| now.saturating_duration_since(p).as_secs_f64())
+            .unwrap_or(0.0);
+        self.prev_ticks = cur;
+        self.prev_at = Some(now);
+
+        if elapsed <= 0.0 || live == 0 {
+            return ScaleAction::Hold; // baseline tick (or no pooler live)
+        }
+
+        let aggregate_cores = (delta_ticks as f64 / self.clk_tck) / elapsed;
+        let per_worker = aggregate_cores / live as f64;
+        let since = self
+            .last_action_at
+            .map(|t| now.saturating_duration_since(t))
+            .unwrap_or(Duration::MAX);
+
+        let (action, up, down) = decide_scale(
+            per_worker,
+            aggregate_cores,
+            live,
+            self.max_workers,
+            self.up_streak,
+            self.down_streak,
+            since,
+        );
+        self.up_streak = up;
+        self.down_streak = down;
+        if action != ScaleAction::Hold {
+            self.last_action_at = Some(now);
+        }
+
+        if let Ok(mut s) = stats.lock() {
+            s.live_workers = live as u32;
+            s.max_workers = self.max_workers as u32;
+            s.aggregate_cpu_cores = (aggregate_cores * 100.0).round() / 100.0;
+            s.per_worker_cores = (per_worker * 100.0).round() / 100.0;
+            s.at_ceiling = live >= self.max_workers && per_worker > SCALE_UP_CORES;
+            match action {
+                ScaleAction::Up => s.last_action = "up".into(),
+                ScaleAction::Down => s.last_action = "down".into(),
+                ScaleAction::Hold => {}
+            }
+        }
+        action
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -138,6 +370,9 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
 
     let mut pg_state: ChildState;
     let mut pgb_state: ChildState;
+    // Extra PgBouncer so_reuseport workers (worker 0 is pgb_state). Empty on boxes
+    // ≤ 8 vCPU, so everything below is a no-op there and the common path is unchanged.
+    let mut pgb_extra: Vec<ChildState> = Vec::new();
     let mut cdc_state: Option<ChildState>;
     let cold_start_wal_handle: Option<tokio::task::JoinHandle<()>>;
 
@@ -163,6 +398,19 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
             let prior = crate::children::PersistedChildren::load(&crate::children::state_dir())?;
             pg_state = adopt_or_respawn_child("postgres", &prior, &log_tx, &mut persisted)?;
             pgb_state = adopt_or_respawn_child("pgbouncer", &prior, &log_tx, &mut persisted)?;
+            // Adopt exactly the extra workers the predecessor had live (a busy box keeps
+            // its scaled-up pooler across a zero-downtime upgrade). The scaler re-checks
+            // load on its next tick and adjusts; we don't pre-spawn up to the cap.
+            for &name in PGB_EXTRA_NAMES.iter() {
+                if prior.get(name).is_some() {
+                    pgb_extra.push(adopt_or_respawn_child(
+                        name,
+                        &prior,
+                        &log_tx,
+                        &mut persisted,
+                    )?);
+                }
+            }
 
             // CDC is configured per-MMDS; adopt only if both the prior
             // supervisor had it AND we still want it. If config flipped
@@ -232,6 +480,8 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
         #[cfg(target_os = "linux")]
         persist_child(&mut persisted, &pgb)?;
         pgb_state = pgb;
+        // Start with ONE pooler. The PgbScaler grows pgb_extra reactively under load
+        // (so_reuseport) and reaps it back down — see the scaler tick in the run loop.
 
         cdc_state = if cfg.pg_tier != PgTier::Replica && cfg.cdc_enabled {
             let mut s = ChildState::new("beyond-pg-cdc");
@@ -279,8 +529,16 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
     // (transparently dup'd into slot 3 by `beyond-pg-init`'s handoff
     // supervisor). Inheriting preserves the accept queue — clients see no
     // socket close.
+    // Pooler scaler telemetry handle — the scaler (run loop) writes it each tick,
+    // the RPC `pooler` command reads it. Created cross-platform so the scaler can
+    // populate it even where the (Linux-only) RPC server is a no-op.
+    let pooler_stats = crate::handoff_bridge::new_pooler_stats();
     #[cfg(target_os = "linux")]
-    let rpc_state = crate::handoff_bridge::SharedState::new();
+    let rpc_state = {
+        let mut s = crate::handoff_bridge::SharedState::new();
+        s.pooler = pooler_stats.clone();
+        s
+    };
     #[cfg(target_os = "linux")]
     let rpc_listener = if is_successor {
         take_inherited_rpc_listener(begun_successor.as_mut().expect("successor"))?
@@ -349,6 +607,14 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
         sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&set), None)?;
     }
 
+    // Reactive PgBouncer scaler: sample pooler CPU every tick and grow/shrink the
+    // so_reuseport worker set within [1, max_workers]. On boxes where max_workers
+    // == 1 it only ever publishes telemetry (the justification signal for raising
+    // the cap) and never acts.
+    let mut pgb_scaler = PgbScaler::new(crate::config::pgbouncer_max_workers(cfg.vcpus));
+    let mut scaler_tick = tokio::time::interval(SCALER_TICK);
+    scaler_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     info!("supervisor running");
 
     // Main supervision loop
@@ -360,14 +626,14 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
             _ = sigterm.recv() => {
                 info!("received SIGTERM, draining children");
                 abort_wal_forwarder(&mut wal_forwarder_handle).await;
-                drain_children(&mut pg_state, &mut pgb_state, cdc_state.as_mut()).await;
+                drain_children(&mut pg_state, &mut pgb_state, &mut pgb_extra, cdc_state.as_mut()).await;
                 shutdown_background_tasks(log_writer_handle, rpc_handle, memory_watcher_handle, cert_watcher_handle).await;
                 return Ok(());
             }
             _ = sigint.recv() => {
                 info!("received SIGINT, draining children");
                 abort_wal_forwarder(&mut wal_forwarder_handle).await;
-                drain_children(&mut pg_state, &mut pgb_state, cdc_state.as_mut()).await;
+                drain_children(&mut pg_state, &mut pgb_state, &mut pgb_extra, cdc_state.as_mut()).await;
                 shutdown_background_tasks(log_writer_handle, rpc_handle, memory_watcher_handle, cert_watcher_handle).await;
                 return Ok(());
             }
@@ -397,6 +663,21 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
                 #[cfg(target_os = "linux")]
                 persist_child(&mut persisted, &pgb_state)?;
             }
+            // Extra so_reuseport pgbouncer workers (disabled when there are none).
+            (res, idx) = wait_any_child(&mut pgb_extra), if !pgb_extra.is_empty() => {
+                let _ = res?; // propagate I/O errors; exit code irrelevant for extras
+                // Extra pooler workers are never individually restarted — the scaler
+                // owns the live count. Whether this was a crash or a scale-down reap,
+                // drop it from the set; the scaler re-adds on its next tick if load
+                // still demands it (the kernel rebalances connections meanwhile).
+                let gone = pgb_extra.remove(idx);
+                info!("pooler worker '{}' exited; removed (scaler owns count)", gone.name);
+                #[cfg(target_os = "linux")]
+                {
+                    persisted.remove(gone.name);
+                    persisted.save(&crate::children::state_dir())?;
+                }
+            }
             code = async {
                 match cdc_state.as_mut().and_then(|s| s.handle.as_mut()) {
                     Some(handle) => handle.wait().await,
@@ -417,6 +698,63 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
                     warn!("pg_ctl reload after cert rotation failed: {e}");
                 }
                 sighup_pgbouncer(&pgb_state);
+                for w in &pgb_extra {
+                    sighup_pgbouncer(w);
+                }
+            }
+            // Reactive pooler scaling: sample CPU, grow/shrink so_reuseport workers.
+            _ = scaler_tick.tick() => {
+                let now = Instant::now();
+                let mut pids: Vec<u32> = Vec::with_capacity(1 + pgb_extra.len());
+                if let Some(p) = pgb_state.pid() {
+                    pids.push(p);
+                }
+                for w in &pgb_extra {
+                    if let Some(p) = w.pid() {
+                        pids.push(p);
+                    }
+                }
+                match pgb_scaler.tick(&pids, now, &pooler_stats) {
+                    ScaleAction::Up => {
+                        // index into PGB_EXTRA_NAMES == current extra count (worker 0
+                        // is pgb_state). decide_scale guarantees live < max ≤ 8, so the
+                        // index is in range; the guard is belt-and-suspenders.
+                        let idx = pgb_extra.len();
+                        if idx < PGB_EXTRA_NAMES.len() {
+                            let name = PGB_EXTRA_NAMES[idx];
+                            let mut w = ChildState::new(name);
+                            match spawn_pgbouncer(&mut w, &log_tx) {
+                                Ok(()) => {
+                                    info!(
+                                        "pooler scaler: UP to {} workers (per-worker CPU saturated; spawned '{name}')",
+                                        pids.len() + 1
+                                    );
+                                    #[cfg(target_os = "linux")]
+                                    if let Err(e) = persist_child(&mut persisted, &w) {
+                                        warn!("pooler scaler: persist of '{name}' failed: {e}");
+                                    }
+                                    pgb_extra.push(w);
+                                }
+                                Err(e) => {
+                                    warn!("pooler scaler: failed to spawn '{name}': {e}");
+                                }
+                            }
+                        }
+                    }
+                    ScaleAction::Down => {
+                        // Graceful: SIGINT drains in-flight txns then exits; the
+                        // wait_any_child arm reaps it from pgb_extra + persisted.
+                        if let Some(w) = pgb_extra.last() {
+                            info!(
+                                "pooler scaler: DOWN from {} workers (SIGINT graceful drain of '{}')",
+                                pids.len(),
+                                w.name
+                            );
+                            sigint_pgbouncer(w);
+                        }
+                    }
+                    ScaleAction::Hold => {}
+                }
             }
         }
     }
@@ -443,6 +781,31 @@ fn sighup_pgbouncer(state: &ChildState) {
     {
         let _ = pid; // suppress unused warning on non-Linux dev hosts
         info!("pgbouncer: SIGHUP skipped (non-Linux build)");
+    }
+}
+
+/// Send SIGINT to a PgBouncer worker for a *graceful* shutdown ("safe shutdown":
+/// finish in-flight transactions, then exit). Used by the scaler to reap an extra
+/// so_reuseport worker — measured ~0.03% reconnect blip as the kernel re-routes
+/// its clients to the survivors. Best-effort: a missing pid means it's already gone.
+fn sigint_pgbouncer(state: &ChildState) {
+    let Some(pid) = state.pid() else {
+        info!("pgbouncer reap: no live child, SIGINT skipped");
+        return;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        match kill(Pid::from_raw(pid as i32), Signal::SIGINT) {
+            Ok(()) => info!("pgbouncer reap: SIGINT sent (pid={pid})"),
+            Err(e) => warn!("pgbouncer reap: SIGINT failed (pid={pid}): {e}"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        info!("pgbouncer reap: SIGINT skipped (non-Linux build)");
     }
 }
 
@@ -1032,16 +1395,23 @@ fn drop_to_postgres_user(
 async fn drain_children(
     pg: &mut ChildState,
     pgb: &mut ChildState,
+    pgb_extra: &mut [ChildState],
     mut cdc: Option<&mut ChildState>,
 ) {
     // Send SIGTERM to all live children (not kill() which is SIGKILL)
     sigterm_child(pg);
     sigterm_child(pgb);
+    for w in pgb_extra.iter_mut() {
+        sigterm_child(w);
+    }
     if let Some(c) = cdc.as_deref_mut() {
         sigterm_child(c);
     }
 
     let mut all: Vec<&mut ChildState> = vec![pg, pgb];
+    for w in pgb_extra.iter_mut() {
+        all.push(w);
+    }
     if let Some(c) = cdc {
         all.push(c);
     }
@@ -1372,6 +1742,72 @@ fn parse_memtotal_kib(content: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- PgBouncer scaler decision (pure) ---
+
+    const COOL: Duration = Duration::from_secs(3600); // past every cooldown
+    const HOT: f64 = 0.9; // per-worker cores, above SCALE_UP_CORES
+    const COLD_AGG: f64 = 0.4; // aggregate cores: removing a worker stays < 0.5
+
+    #[test]
+    fn scaler_holds_until_up_streak_met() {
+        // One hot tick is not enough (needs SCALE_UP_TICKS = 2).
+        let (a, up, _down) = decide_scale(HOT, HOT, 1, 4, 0, 0, COOL);
+        assert_eq!(a, ScaleAction::Hold);
+        assert_eq!(up, 1);
+        // Second consecutive hot tick → Up, streak reset.
+        let (a, up, _down) = decide_scale(HOT, HOT, 1, 4, up, 0, COOL);
+        assert_eq!(a, ScaleAction::Up);
+        assert_eq!(up, 0);
+    }
+
+    #[test]
+    fn scaler_never_scales_past_ceiling() {
+        // live == max: stay put no matter how hot or how long.
+        let (a, _u, _d) = decide_scale(HOT, HOT * 4.0, 4, 4, 99, 0, COOL);
+        assert_eq!(a, ScaleAction::Hold);
+    }
+
+    #[test]
+    fn scaler_respects_up_cooldown() {
+        // Hot streak met but action happened 1s ago → Hold.
+        let (a, _u, _d) = decide_scale(HOT, HOT, 1, 4, 99, 0, Duration::from_secs(1));
+        assert_eq!(a, ScaleAction::Hold);
+    }
+
+    #[test]
+    fn scaler_scales_down_when_cold_and_streak_met() {
+        // 2 live workers, aggregate so low that one worker would suffice.
+        let (a, _u, down) = decide_scale(COLD_AGG / 2.0, COLD_AGG, 2, 4, 0, 0, COOL);
+        assert_eq!(a, ScaleAction::Hold); // first cold tick
+        assert_eq!(down, 1);
+        // After SCALE_DOWN_TICKS consecutive cold ticks → Down.
+        let (a, _u, _d) = decide_scale(
+            COLD_AGG / 2.0,
+            COLD_AGG,
+            2,
+            4,
+            0,
+            SCALE_DOWN_TICKS - 1,
+            COOL,
+        );
+        assert_eq!(a, ScaleAction::Down);
+    }
+
+    #[test]
+    fn scaler_never_scales_below_one() {
+        // Single worker, ice cold, long streak → still Hold (never reap worker 0).
+        let (a, _u, _d) = decide_scale(0.0, 0.0, 1, 4, 0, 99, COOL);
+        assert_eq!(a, ScaleAction::Hold);
+    }
+
+    #[test]
+    fn scaler_down_streak_resets_when_warm() {
+        // 2 workers but each near-busy: removing one would overload → not cold.
+        let (a, _u, down) = decide_scale(0.7, 1.4, 2, 4, 0, 5, COOL);
+        assert_eq!(a, ScaleAction::Hold);
+        assert_eq!(down, 0, "warm tick resets the down streak");
+    }
 
     #[test]
     fn parse_memtotal_standard_format() {

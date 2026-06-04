@@ -10,9 +10,13 @@
 //!   health     → pg_isready
 //!   reload     → pg_ctl reload
 //!   promote    → pg_ctl promote -w (blocks until standby exits recovery; ok:true = primary)
+//!   pooler     → PgBouncer scaler telemetry (live/max workers, CPU, at_ceiling)
 //!   backup     → stub (not implemented)
 //!
-//! Only available on Linux.
+//! The RPC server is Linux-only. The pooler telemetry types
+//! ([`crate::handoff_bridge::PoolerStats`]) live in the library (next to
+//! `SharedState`, which carries the handle) so the supervisor's scaler can
+//! populate them on any host.
 
 #[cfg(target_os = "linux")]
 mod inner {
@@ -70,6 +74,8 @@ mod inner {
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pooler: Option<crate::handoff_bridge::PoolerStats>,
     }
 
     impl RpcResponse {
@@ -77,12 +83,21 @@ mod inner {
             Self {
                 ok: true,
                 error: None,
+                pooler: None,
             }
         }
         fn err(msg: impl Into<String>) -> Self {
             Self {
                 ok: false,
                 error: Some(msg.into()),
+                pooler: None,
+            }
+        }
+        fn pooler(stats: crate::handoff_bridge::PoolerStats) -> Self {
+            Self {
+                ok: true,
+                error: None,
+                pooler: Some(stats),
             }
         }
     }
@@ -109,9 +124,11 @@ mod inner {
             match listener.accept().await {
                 Ok(stream) => {
                     let in_flight = Arc::clone(&state.in_flight);
+                    let pooler = Arc::clone(&state.pooler);
                     in_flight.fetch_add(1, Ordering::SeqCst);
                     tokio::spawn(async move {
-                        let result = tokio::time::timeout(RPC_TIMEOUT, handle_stream(stream)).await;
+                        let result =
+                            tokio::time::timeout(RPC_TIMEOUT, handle_stream(stream, pooler)).await;
                         match result {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => warn!("rpc: connection error: {e}"),
@@ -142,14 +159,20 @@ mod inner {
         Ok(RpcListener::Vsock(v))
     }
 
-    async fn handle_stream(stream: RpcStream) -> std::io::Result<()> {
+    async fn handle_stream(
+        stream: RpcStream,
+        pooler: crate::handoff_bridge::PoolerStatsHandle,
+    ) -> std::io::Result<()> {
         match stream {
-            RpcStream::Vsock(s) => handle(s).await,
-            RpcStream::Unix(s) => handle(s).await,
+            RpcStream::Vsock(s) => handle(s, pooler).await,
+            RpcStream::Unix(s) => handle(s, pooler).await,
         }
     }
 
-    async fn handle<S>(mut stream: S) -> std::io::Result<()>
+    async fn handle<S>(
+        mut stream: S,
+        pooler: crate::handoff_bridge::PoolerStatsHandle,
+    ) -> std::io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -167,7 +190,7 @@ mod inner {
 
         let response = match rmp_serde::from_slice::<RpcRequest>(&body) {
             Err(e) => RpcResponse::err(format!("invalid request: {e}")),
-            Ok(req) => dispatch(&req.cmd).await,
+            Ok(req) => dispatch(&req.cmd, &pooler).await,
         };
 
         let encoded =
@@ -180,11 +203,15 @@ mod inner {
         Ok(())
     }
 
-    async fn dispatch(cmd: &str) -> RpcResponse {
+    async fn dispatch(cmd: &str, pooler: &crate::handoff_bridge::PoolerStatsHandle) -> RpcResponse {
         match cmd {
             "checkpoint" => match crate::pg::psql("CHECKPOINT").await {
                 Ok(()) => RpcResponse::ok(),
                 Err(e) => RpcResponse::err(e.to_string()),
+            },
+            "pooler" => match pooler.lock() {
+                Ok(stats) => RpcResponse::pooler(stats.clone()),
+                Err(_) => RpcResponse::err("pooler stats lock poisoned"),
             },
             "health" => {
                 if crate::pg::is_ready().await {

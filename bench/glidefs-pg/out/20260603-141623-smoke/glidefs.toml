@@ -1,0 +1,20 @@
+[cache]
+dir = "/tmp/gfpg.Kz2A8C/cache"
+disk_size_gb = 20.0
+memory_size_gb = 2.0
+
+[storage]
+url = "file:///tmp/gfpg.Kz2A8C/objstore"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10899"]
+unix_socket = "/tmp/gfpg.Kz2A8C/gf.nbd.sock"
+api_address = "127.0.0.1:18080"
+block_size = 131072
+flush_threshold = 500
+
+[[servers.nbd.exports]]
+name = "pgdata"
+size_gb = 10
+transport = "nbd"
+compaction_cooldown = 0

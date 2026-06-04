@@ -771,7 +771,10 @@ fn write_config_files(cfg: &MmdsConfig, tls: &crate::tls::TlsConfig) -> Result<(
     if let Some(parent) = Path::new(PGBOUNCER_INI_PATH).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    write_atomic(Path::new(PGBOUNCER_INI_PATH), &config::pgbouncer_ini(tls))?;
+    write_atomic(
+        Path::new(PGBOUNCER_INI_PATH),
+        &config::pgbouncer_ini(tls, cfg.ram_bytes, cfg.vcpus),
+    )?;
 
     Ok(())
 }
