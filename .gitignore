@@ -13,5 +13,6 @@ dist/
 .wiki
 node_modules/
 bench/out/
+bench/glidefs-pg/out/
 .mcp.json
 .claude
