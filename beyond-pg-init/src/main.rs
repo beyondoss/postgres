@@ -10,7 +10,11 @@
 #[cfg(target_os = "linux")]
 mod bootsetup;
 #[cfg(target_os = "linux")]
+mod substrate;
+#[cfg(target_os = "linux")]
 mod supervise;
+#[cfg(target_os = "linux")]
+mod volumes;
 
 #[cfg(target_os = "linux")]
 fn main() -> ! {
@@ -22,6 +26,11 @@ fn main() -> ! {
         std::process::exit(1);
     }
     bootsetup::run();
+    // Report "guest ready" to the host substrate over vsock and keep the
+    // connection alive for the VM's lifetime. instd waits for this handshake
+    // before considering the create successful. Spawned after boot setup (so
+    // the network/MMDS are up) and before the supervise loop takes over.
+    substrate::spawn_handshake();
     supervise::run();
 }
 

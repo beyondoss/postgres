@@ -222,6 +222,9 @@ fn now_secs() -> u64 {
 // ---------------------------------------------------------------------------
 
 fn generate_cert(cert_path: &Path, key_path: &Path) -> Result<(), TlsError> {
+    // Ed25519: fast signing on every TLS handshake (the reason we picked it over
+    // P-256). The rootfs must ship an OpenSSL that can load Ed25519 keys — see
+    // the image build; Postgres loads the server key through OpenSSL.
     let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)?;
 
     let mut params = CertificateParams::default();
@@ -246,13 +249,47 @@ fn generate_cert(cert_path: &Path, key_path: &Path) -> Result<(), TlsError> {
     // Key is written with mode 0o600 set *before* content. This closes the
     // window in which a chmod-after-write approach would leave the private
     // key briefly readable under a wider umask.
-    crate::config::write_atomic_bytes_with_mode(
-        key_path,
-        key_pair.serialize_pem().as_bytes(),
-        0o600,
-    )?;
+    //
+    // rcgen (aws-lc-rs) serializes Ed25519 keys as PKCS#8 *v2* (OneAsymmetricKey
+    // with the trailing public-key field). OpenSSL 3.0.13 — the version on the
+    // ubuntu-noble base image, which Postgres links against — cannot decode v2
+    // Ed25519 keys and rejects them with `unsupported`, so Postgres can't load
+    // its server key. Re-emit as standard PKCS#8 *v1* (identical Ed25519 key and
+    // performance; v2 only appends the public key, which the cert already
+    // carries). Falls back to rcgen's PEM if the key isn't the expected Ed25519
+    // shape (e.g. a future algorithm change).
+    let key_pem = ed25519_pkcs8_v1_pem(&key_pair.serialize_der())
+        .unwrap_or_else(|| key_pair.serialize_pem());
+    crate::config::write_atomic_bytes_with_mode(key_path, key_pem.as_bytes(), 0o600)?;
 
     Ok(())
+}
+
+/// Re-encode an Ed25519 private key from rcgen's PKCS#8 v2 DER to the
+/// universally-accepted PKCS#8 v1 PEM. Returns `None` if `der_v2` is not a
+/// recognizable Ed25519 PKCS#8 (so the caller keeps rcgen's own encoding).
+fn ed25519_pkcs8_v1_pem(der_v2: &[u8]) -> Option<String> {
+    use base64::Engine as _;
+    // The privateKey field encodes the 32-byte seed identically in v1 and v2 as
+    // the byte run `04 22 04 20 <seed>` (OCTET STRING { OCTET STRING(32) }).
+    const PRIV_PREFIX: [u8; 4] = [0x04, 0x22, 0x04, 0x20];
+    let pos = der_v2.windows(4).position(|w| w == PRIV_PREFIX)?;
+    let seed = der_v2.get(pos + 4..pos + 4 + 32)?;
+    // Canonical 48-byte Ed25519 PKCS#8 v1:
+    //   SEQ { INTEGER 0, SEQ { OID 1.3.101.112 }, OCTET STRING { OCTET STRING(32) seed } }
+    let mut der_v1 = vec![
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
+    ];
+    der_v1.extend_from_slice(seed);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&der_v1);
+    let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        pem.push('\n');
+    }
+    pem.push_str("-----END PRIVATE KEY-----\n");
+    Some(pem)
 }
 
 /// Hostname for the cert CN. Reads `/etc/hostname` (written by `init::run()`

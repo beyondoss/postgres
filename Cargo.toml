@@ -20,6 +20,7 @@ name = "beyond-pg"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 beyond-pg-core = { path = "./beyond-pg-core" }
 clap = { version = "4", features = ["derive"] }
 quinn = "0.11"

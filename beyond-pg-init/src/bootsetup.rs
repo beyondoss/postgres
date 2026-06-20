@@ -15,8 +15,13 @@ use std::time::Duration;
 
 const MMDS_ADDR: &str = "169.254.169.254:80";
 const MMDS_MAX_ATTEMPTS: u32 = 30;
-const MMDS_RETRY: Duration = Duration::from_millis(10);
-const HTTP_TIMEOUT: Duration = Duration::from_millis(200);
+const MMDS_RETRY: Duration = Duration::from_millis(200);
+// Firecracker's MMDS can take up to ~1–2s to answer the first request after
+// boot on this substrate; a 200ms read timeout raced that and every attempt
+// died with EAGAIN (the connect succeeds — it's the response that's slow), so
+// the whole loop fell back to "POSTGRES_PASSWORD not set" and panicked. guest-
+// init happens to win the race with its smaller VM; we must not depend on luck.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
 /// Run the full PID 1 boot sequence. Bails (exit 1) on fatal failures.
@@ -41,6 +46,11 @@ pub fn run() {
     mount_essential_filesystems();
     setup_network();
     fetch_mmds();
+    // instd records attached data volumes in MMDS; mount them (as root, before
+    // the supervisor child spawns) so postgres finds its data dir at
+    // /var/lib/postgresql. Tolerant: no volumes → no-op; a missing device is
+    // logged FATAL but never aborts the VM.
+    crate::volumes::mount_from_mmds();
     setup_zram();
 }
 
@@ -293,13 +303,17 @@ fn write_mmds_file(json: &serde_json::Value) {
 fn poll_mmds() -> Result<serde_json::Value, ()> {
     let token = get_mmds_token();
     for attempt in 1..=MMDS_MAX_ATTEMPTS {
+        let t0 = std::time::Instant::now();
         match fetch_mmds_metadata(token.as_deref()) {
             Ok(Some(data)) => {
                 eprintln!("[init] MMDS data available (attempt {attempt})");
                 return Ok(data);
             }
             Ok(None) => {}
-            Err(e) => eprintln!("[init] MMDS fetch attempt {attempt} failed: {e}"),
+            Err(e) => eprintln!(
+                "[init] MMDS fetch attempt {attempt} failed after {}ms: {e}",
+                t0.elapsed().as_millis()
+            ),
         }
         std::thread::sleep(MMDS_RETRY);
     }
@@ -361,18 +375,54 @@ fn fetch_mmds_metadata(
 }
 
 fn http_roundtrip(request: &[u8]) -> std::io::Result<Vec<u8>> {
-    // Infallible: MMDS_ADDR is a compile-time-known SocketAddr literal.
-    let addr: std::net::SocketAddr = MMDS_ADDR.parse().unwrap();
+    // connect_timeout (non-blocking connect + poll) handles the post-boot window
+    // where the eth0 link-local neighbor isn't resolved yet.
+    let addr: std::net::SocketAddr = MMDS_ADDR.parse().expect("MMDS_ADDR is a literal");
     let mut stream = TcpStream::connect_timeout(&addr, HTTP_TIMEOUT)?;
     stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
     stream.set_read_timeout(Some(HTTP_TIMEOUT))?;
     stream.write_all(request)?;
+
+    // Read headers, then exactly `Content-Length` body bytes — do NOT read to
+    // EOF. Firecracker's MMDS keeps the TCP connection OPEN after the response
+    // (it ignores `Connection: close`), so there is no EOF; `read_to_end` blocks
+    // for the full read timeout on every request and surfaces as EAGAIN. This is
+    // the same Content-Length-bounded read guest-init's MMDS client uses.
     let mut buf = Vec::new();
-    // Propagate read errors (e.g. timeout mid-response) so the retry loop
-    // logs the underlying I/O failure instead of a downstream JSON parse
-    // error on a truncated body.
-    stream.take(MAX_RESPONSE_BYTES).read_to_end(&mut buf)?;
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(end) = find_headers_end(&buf) {
+            if let Some(len) = content_length(&buf[..end]) {
+                if buf.len() >= end + len {
+                    buf.truncate(end + len);
+                    break;
+                }
+            }
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break, // EOF (Connection: close honored)
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(e), // timeout / error — surface to the retry loop
+        }
+        if buf.len() as u64 > MAX_RESPONSE_BYTES {
+            break;
+        }
+    }
     Ok(buf)
+}
+
+/// Byte offset just past the `\r\n\r\n` header terminator, if fully buffered.
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+/// Parse the `Content-Length` header (case-insensitive) from a header block.
+fn content_length(headers: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(headers).ok()?;
+    text.split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse().ok())
 }
 
 fn http_status(response: &[u8]) -> Option<u16> {

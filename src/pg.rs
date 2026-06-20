@@ -159,20 +159,24 @@ pub async fn reload() -> Result<(), PgError> {
 /// password (created by the caller as a `tempfile::NamedTempFile`).
 pub async fn initdb(pgdata: &str, pwfile_path: &str) -> Result<(), PgError> {
     debug!("running initdb in {pgdata}");
-    let out = Command::new("initdb")
-        .args([
-            "-D",
-            pgdata,
-            "--waldir",
-            "/var/lib/postgresql/18/wal",
-            "--auth=scram-sha-256",
-            "--encoding=UTF8",
-            "--locale=en_US.UTF-8",
-            &format!("--pwfile={pwfile_path}"),
-        ])
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await?;
+    let mut cmd = Command::new("initdb");
+    cmd.args([
+        "-D",
+        pgdata,
+        "--waldir",
+        "/var/lib/postgresql/18/wal",
+        "--auth=scram-sha-256",
+        "--encoding=UTF8",
+        "--locale=en_US.UTF-8",
+        &format!("--pwfile={pwfile_path}"),
+    ])
+    .stderr(std::process::Stdio::piped());
+    // initdb refuses to run as root; run it as the postgres OS user (the same
+    // user that will own the cluster and that postgres/psql drop to). Required
+    // when PGDATA is a fresh durable volume initialized at runtime (not baked
+    // into the image as ephemeral data). The caller chowns the tree first.
+    drop_to_postgres_user(&mut cmd);
+    let out = cmd.output().await?;
 
     if out.status.success() {
         debug!("initdb complete");
