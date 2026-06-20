@@ -166,6 +166,10 @@ async fn do_boot_replica(cfg: &MmdsConfig) -> Result<(), BootError> {
     config::write_atomic(Path::new(&config::replica_conf_path()), &replica_conf)?;
     info!("wrote {}", config::replica_conf_path());
 
+    // pg_basebackup runs as root, so PGDATA + everything we just wrote is
+    // root-owned; postgres refuses to start on a non-postgres-owned data dir.
+    chown_data_tree();
+
     let shared_buffers_mb = (cfg.ram_bytes / (1024 * 1024) / 4).max(128);
     apply_kernel_settings(shared_buffers_mb);
 
@@ -210,10 +214,18 @@ async fn maybe_initdb(cfg: &MmdsConfig) -> Result<(), BootError> {
         std::fs::create_dir_all(PGDATA)?;
     }
 
-    // A fresh durable volume mounts root-owned and empty over the image's
-    // /var/lib/postgresql; chown the tree to postgres so the postgres-user
-    // initdb (and the cluster it creates) can write it. Idempotent / harmless
-    // when already postgres-owned (the image-baked ephemeral case).
+    chown_data_tree();
+
+    run_initdb(&cfg.postgres_password).await?;
+    Ok(())
+}
+
+/// chown `/var/lib/postgresql` → postgres recursively. A fresh durable volume
+/// mounts root-owned over the image dir, and a root-run `pg_basebackup` (replica
+/// seeding) writes a root-owned PGDATA — either way postgres dies at startup with
+/// `could not access directory "…/main": Permission denied` unless the data dir
+/// is postgres-owned. Idempotent / harmless when already postgres-owned.
+fn chown_data_tree() {
     match std::process::Command::new("chown")
         .args(["-R", "postgres:postgres", "/var/lib/postgresql"])
         .status()
@@ -222,9 +234,6 @@ async fn maybe_initdb(cfg: &MmdsConfig) -> Result<(), BootError> {
         Ok(s) => warn!("chown /var/lib/postgresql exited {s}; continuing"),
         Err(e) => warn!("chown /var/lib/postgresql failed to spawn: {e}; continuing"),
     }
-
-    run_initdb(&cfg.postgres_password).await?;
-    Ok(())
 }
 
 async fn run_initdb(password: &str) -> Result<(), BootError> {
