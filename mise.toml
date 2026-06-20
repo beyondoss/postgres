@@ -101,14 +101,12 @@ AUTH_TAG=$(_toml "['beyond']['auth']['tag']")
 QUEUE_GIT=$(_toml "['beyond']['queue']['git']")
 QUEUE_TAG=$(_toml "['beyond']['queue']['tag']")
 PGVECTOR_VER=$(_toml "['pgdg']['pgvector']")
-PGVECTORSCALE_VER=$(_toml "['pgdg']['pgvectorscale']")
 POSTGIS_VER=$(_toml "['pgdg']['postgis']")
 PG_CRON_VER=$(_toml "['pgdg']['pg_cron']")
 PG_PARTMAN_VER=$(_toml "['pgdg']['pg_partman']")
-PG_JSONSCHEMA_VER=$(_toml "['pgdg']['pg_jsonschema']")
 HYPOPG_VER=$(_toml "['pgdg']['hypopg']")
 PG_REPACK_VER=$(_toml "['pgdg']['pg_repack']")
-PG_SEARCH_VER=$(_toml "['paradedb']['pg_search']")
+# pgvectorscale / pg_jsonschema / pg_search dropped for noble+pg18 (see extensions.toml)
 
 # Cross-compile musl static binaries for the target arch.
 case "${ARCH}" in
@@ -139,14 +137,11 @@ packer build \
   -var "queue_ext_git=${QUEUE_GIT}" \
   -var "queue_ext_tag=${QUEUE_TAG}" \
   -var "pgvector_version=${PGVECTOR_VER}" \
-  -var "pgvectorscale_version=${PGVECTORSCALE_VER}" \
   -var "postgis_version=${POSTGIS_VER}" \
   -var "pg_cron_version=${PG_CRON_VER}" \
   -var "pg_partman_version=${PG_PARTMAN_VER}" \
-  -var "pg_jsonschema_version=${PG_JSONSCHEMA_VER}" \
   -var "hypopg_version=${HYPOPG_VER}" \
   -var "pg_repack_version=${PG_REPACK_VER}" \
-  -var "pg_search_version=${PG_SEARCH_VER}" \
   packer/templates/postgres-rootfs.pkr.hcl
 
 if [[ "${bless:-}" == "true" ]]; then

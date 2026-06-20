@@ -31,25 +31,16 @@ pin_install() {
 echo "==> Installing PGDG extensions..."
 
 pin_install "postgresql-${POSTGRES_VERSION}-pgvector"      "${PGVECTOR_VERSION}"
-pin_install "postgresql-${POSTGRES_VERSION}-pgvectorscale" "${PGVECTORSCALE_VERSION}"
 pin_install "postgresql-${POSTGRES_VERSION}-postgis-3"     "${POSTGIS_VERSION}"
 pin_install "postgresql-${POSTGRES_VERSION}-cron"          "${PG_CRON_VERSION}"
 pin_install "postgresql-${POSTGRES_VERSION}-partman"       "${PG_PARTMAN_VERSION}"
-pin_install "postgresql-${POSTGRES_VERSION}-pg-jsonschema" "${PG_JSONSCHEMA_VERSION}"
 pin_install "postgresql-${POSTGRES_VERSION}-hypopg"        "${HYPOPG_VERSION}"
 pin_install "postgresql-${POSTGRES_VERSION}-repack"        "${PG_REPACK_VERSION}"
 
-echo "==> Adding ParadeDB apt repository (pg_search)..."
-# ParadeDB publishes pg_search to packagecloud.
-# TODO: verify this URL against ParadeDB's current repo path before shipping.
-# Fallback option: download .deb directly from their GitHub releases.
-curl -fsSL https://packagecloud.io/paradedb/paradedb/gpgkey \
-  | gpg --dearmor -o /etc/apt/trusted.gpg.d/paradedb.gpg
-echo "deb [signed-by=/etc/apt/trusted.gpg.d/paradedb.gpg] \
-https://packagecloud.io/paradedb/paradedb/ubuntu/ ${UBUNTU_VERSION} main" \
-  > /etc/apt/sources.list.d/paradedb.list
-apt-get update -qq
-
-pin_install "postgresql-${POSTGRES_VERSION}-pg-search" "${PG_SEARCH_VERSION}"
+# Dropped (no PGDG build for noble+pg18 as of 2026-06; see extensions.toml):
+#   pgvectorscale, pg_jsonschema
+# ParadeDB pg_search: packagecloud repo is now paywalled (HTTP 402); ParadeDB
+# ships pg18 via GitHub Releases. Re-add via a GitHub-release install (like
+# 04-beyond-extensions.sh) once needed.
 
 echo "==> 03-pgdg-extensions done"

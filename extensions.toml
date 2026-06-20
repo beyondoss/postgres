@@ -26,31 +26,44 @@ pg_trgm = "1.6"
 # `apt install postgresql-18-<name>=<version>` is exact; build fails on miss.
 # ---------------------------------------------------------------------------
 [pgdg]
-pgvector = "0.8.0"
-pgvectorscale = "0.4.0"
-postgis = "3.5.0"
-pg_cron = "1.6.4"
-pg_partman = "5.1.0"
-pg_jsonschema = "0.3.3"
-hypopg = "1.4.1"
-pg_repack = "1.5.2"
+# Refreshed to versions currently resolvable for noble + pg18 (K-003 drift fix,
+# 2026-06; verified via `apt-cache madison postgresql-18-<name>` against
+# apt.postgresql.org noble-pgdg). pg_cron + pg_partman are non-negotiable
+# (pg_cron: REQUIRED + shared_preload; pg_partman: queue partitioned queues).
+pgvector = "0.8.2"
+postgis = "3.6.4"
+pg_cron = "1.6.7"
+pg_partman = "5.4.3"
+hypopg = "1.4.2"
+pg_repack = "1.5.3"
+# Dropped — no PGDG build for noble+pg18 as of 2026-06 (re-add a pin once PGDG
+# ships one): pgvectorscale (no postgresql-18-pgvectorscale), pg_jsonschema (no
+# postgresql-18-pg-jsonschema). They are OPTIONAL_EXTENSIONS in the beyond-pg
+# supervisor, so absence is a boot warning, not a failure.
 
 # ---------------------------------------------------------------------------
-# ParadeDB apt
+# ParadeDB apt — DISABLED. The packagecloud repo is now paywalled (HTTP 402),
+# and ParadeDB ships pg18 via GitHub Releases. pg_search can be re-added later
+# via the GitHub-release install path (same mechanism as [beyond.*]).
 # ---------------------------------------------------------------------------
-[paradedb]
-pg_search = "0.15.0"
+# [paradedb]
+# pg_search = "..."
 
 # ---------------------------------------------------------------------------
-# Beyond sibling repos — cloned from public git and built in-container (J-004a).
-# Set `tag` to a release tag (e.g. "v0.1.0") or use `sha` for a commit pin.
-# Build fails if the tag/SHA is absent in the remote.
-# TODO: confirm public git URLs with auth/queue repo owners before first build.
+# Beyond sibling repos — cloned from public git at `tag` and built from source
+# (J-004a). build-beyond-extensions.sh clones `git` @ `tag` into a tmpdir, builds
+# the pgrx extension for the target PG/arch, and stages a canonical tarball.
+# `tag` may be any buildable git ref (branch, tag, or sha).
+#
+# Dev/homelab override: to build from a local checkout (e.g. a branch not yet
+# pushed), export AUTH_EXT_GIT / AUTH_EXT_REF (and QUEUE_EXT_GIT / QUEUE_EXT_REF)
+# before the build — the script prefers those over the pins below. This keeps the
+# canonical pins here clean and the build clone-based (no hardcoded local paths).
 # ---------------------------------------------------------------------------
 [beyond.auth]
 git = "https://github.com/beyondoss/auth"
-tag = "server/v0.1.0" # placeholder — bump when first release is cut
+tag = "main" # bump to a release tag (server/vX.Y.Z) once cut
 
 [beyond.queue]
 git = "https://github.com/beyondoss/queue"
-tag = "ext-v0.1.0" # placeholder — bump when first release is cut
+tag = "main" # bump to a release tag (ext-vX.Y.Z) once cut
