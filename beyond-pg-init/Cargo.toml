@@ -22,6 +22,6 @@ handoff = { version = "0.1", package = "beyond-handoff" }
 # Beyond workspace, so this repo builds standalone in CI. The wire contract is
 # pinned by a fixture test.
 nix = { version = "0.31", features = ["mount"] }
-tokio = { version = "1", features = ["rt", "macros", "net", "time", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "io-util", "sync"] }
 tokio-vsock = "0.7"
 rmp-serde = "1"

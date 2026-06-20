@@ -30,7 +30,7 @@ use crate::mmds::{MmdsConfig, PgTier};
 use crate::pg;
 use crate::vsock::ExecStream;
 #[cfg(target_os = "linux")]
-use crate::vsock::{HOST_CID, UserProcessStreamDataPayload, VSOCK_PORT, encode_log_frame};
+use crate::vsock::{LOG_SINK_UNIX_PATH, UserProcessStreamDataPayload, encode_log_frame};
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const STABLE_RUNTIME: Duration = Duration::from_secs(60);
@@ -2296,19 +2296,27 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Log forwarding to host vsock
+// Log forwarding to the host platform pipeline
 // ---------------------------------------------------------------------------
 
+/// Forward supervised-process log lines toward the host's `service.log` pipeline.
+///
+/// Lines are encoded as substrate `AppMessage` (`0x20`) frames and written to
+/// PID 1 (`beyond-pg-init`) over the in-VM unix socket `LOG_SINK_UNIX_PATH`.
+/// PID 1 then relays them, verbatim, onto the single substrate vsock connection
+/// it owns — see `LOG_SINK_UNIX_PATH`'s docs for *why* the supervisor cannot
+/// write port 52 directly (instd accepts one connection per VM, held by PID 1).
+///
+/// Reconnects on failure: a supervisor handoff or a transient socket error just
+/// re-dials. PID 1's sink accepts sequential supervisor connections.
 #[cfg(target_os = "linux")]
 async fn log_writer_task(mut log_rx: mpsc::Receiver<LogFrame>) {
     use tokio::io::AsyncWriteExt;
 
     loop {
-        match tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(HOST_CID, VSOCK_PORT))
-            .await
-        {
+        match tokio::net::UnixStream::connect(LOG_SINK_UNIX_PATH).await {
             Ok(mut stream) => {
-                info!("log forwarder connected to vsock {HOST_CID}:{VSOCK_PORT}");
+                info!("log forwarder connected to host log sink {LOG_SINK_UNIX_PATH}");
                 while let Some(frame) = log_rx.recv().await {
                     let payload = UserProcessStreamDataPayload {
                         stream: frame.stream,
@@ -2318,13 +2326,14 @@ async fn log_writer_task(mut log_rx: mpsc::Receiver<LogFrame>) {
                     };
                     let encoded = encode_log_frame(&payload);
                     if stream.write_all(&encoded).await.is_err() {
-                        warn!("log vsock write failed, reconnecting");
+                        warn!("log sink write failed, reconnecting");
                         break;
                     }
                 }
             }
             Err(e) => {
-                warn!("log vsock connect failed: {e}, retrying in 1s");
+                // PID 1 may not have bound the sink yet during early boot; retry.
+                warn!("log sink connect failed: {e}, retrying in 1s");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }

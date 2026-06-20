@@ -96,7 +96,7 @@ fn run() {
 }
 
 async fn handshake() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio_vsock::{VsockAddr, VsockStream};
 
     let payload = ReadyPayload {
@@ -130,47 +130,159 @@ async fn handshake() {
     let _ = conn.flush().await;
     eprintln!("[init] substrate vsock handshake complete; guest reported ready");
 
-    // Keep the connection alive for the VM's lifetime AND answer instd's
-    // heartbeats — instd pings every 10s and marks the VM `Degraded (guest
-    // disconnected)` after 30s of silence, which disrupts VPC routing to the
-    // guest. We parse frames and reply HeartbeatResp to each Heartbeat; other
-    // messages (ReadyAck, admin/session — we don't serve those here) are
-    // ignored; Shutdown ends the loop (beyond-pg-init's supervise owns the
-    // actual poweroff via signalfd). EOF/err → thread exits.
+    keep_alive(conn).await;
+}
+
+/// Bytes received from the supervisor's log sink: one already-framed substrate
+/// `AppMessage` wire frame (`[len][0x20][payload]`) to relay onto the vsock.
+type LogFrameBytes = Vec<u8>;
+
+/// Own the single substrate connection for the VM's lifetime: answer instd's
+/// heartbeats AND relay workload log frames the supervisor hands us over
+/// [`LOG_SINK_UNIX_PATH`], multiplexed onto this one connection.
+///
+/// Why multiplex here: instd accepts exactly one vsock connection per VM (PID 1
+/// holds it). The supervisor cannot open its own connection to port 52 — it
+/// would never be `accept()`ed and its frames would be dropped. So the
+/// supervisor forwards frames to us; we are the only writer to the vsock.
+///
+/// instd pings every ~10s and marks the VM `Degraded (guest disconnected)`
+/// after 30s of silence, so heartbeat replies must never be starved. The
+/// `select!` keeps both inbound-vsock and inbound-logs serviced; all vsock
+/// writes happen on this one task so there's no write interleaving.
+async fn keep_alive<S>(mut conn: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Bounded so a log storm can never grow memory without bound; the supervisor
+    // already rate-limits + drops upstream, and a full channel here just applies
+    // backpressure onto the supervisor's relay write (its problem to shed, not
+    // ours to buffer). Heartbeats are never affected — they're read straight off
+    // the vsock in the same select.
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<LogFrameBytes>(1024);
+    spawn_log_sink(log_tx);
+
     let mut len_buf = [0u8; 4];
     loop {
-        if conn.read_exact(&mut len_buf).await.is_err() {
-            break;
-        }
-        let len = u32::from_be_bytes(len_buf);
-        if len == 0 || len > MAX_FRAME {
-            eprintln!("[init] substrate vsock: bad frame length {len}; closing");
-            break;
-        }
-        let mut frame = vec![0u8; len as usize];
-        if conn.read_exact(&mut frame).await.is_err() {
-            break;
-        }
-        match frame[0] {
-            MSG_HEARTBEAT => {
-                let body =
-                    rmp_serde::to_vec_named(&HeartbeatPayload { timestamp: 0 }).unwrap_or_default();
-                if conn
-                    .write_all(&encode_frame(MSG_HEARTBEAT_RESP, &body))
-                    .await
-                    .is_err()
-                {
+        tokio::select! {
+            // Inbound substrate frames (heartbeat / shutdown / ignored).
+            read = conn.read_exact(&mut len_buf) => {
+                if read.is_err() {
+                    break; // EOF / error → thread exits.
+                }
+                let len = u32::from_be_bytes(len_buf);
+                if len == 0 || len > MAX_FRAME {
+                    eprintln!("[init] substrate vsock: bad frame length {len}; closing");
                     break;
                 }
-                let _ = conn.flush().await;
+                let mut frame = vec![0u8; len as usize];
+                if conn.read_exact(&mut frame).await.is_err() {
+                    break;
+                }
+                match frame[0] {
+                    MSG_HEARTBEAT => {
+                        let body = rmp_serde::to_vec_named(&HeartbeatPayload { timestamp: 0 })
+                            .unwrap_or_default();
+                        if conn.write_all(&encode_frame(MSG_HEARTBEAT_RESP, &body)).await.is_err() {
+                            break;
+                        }
+                        let _ = conn.flush().await;
+                    }
+                    MSG_SHUTDOWN => {
+                        eprintln!("[init] substrate requested shutdown; vsock loop exiting");
+                        break;
+                    }
+                    _ => {} // ReadyAck etc. — nothing to do here.
+                }
             }
-            MSG_SHUTDOWN => {
-                eprintln!("[init] substrate requested shutdown; vsock loop exiting");
-                break;
+            // Workload log frames relayed from the supervisor. Already a complete
+            // substrate frame; write verbatim. `None` = sink task ended (only on
+            // listener bind failure); we simply stop relaying and keep heartbeats.
+            maybe_frame = log_rx.recv() => {
+                match maybe_frame {
+                    Some(bytes) => {
+                        if conn.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                        let _ = conn.flush().await;
+                    }
+                    None => {
+                        // Drain side closed; nothing more to relay. Keep the
+                        // connection alive purely for heartbeats by parking this
+                        // arm — re-loop and let the vsock read drive liveness.
+                        std::future::pending::<()>().await;
+                    }
+                }
             }
-            _ => {} // ReadyAck etc. — nothing to do here.
         }
     }
+}
+
+/// Bind [`LOG_SINK_UNIX_PATH`] and forward every framed message a connecting
+/// supervisor writes into `log_tx`. Multiple sequential supervisor connections
+/// are supported (a handoff swaps the supervisor process); each is drained until
+/// it closes, then we accept the next. Soft-fail: a bind error logs and ends the
+/// task (heartbeats keep working; logs just won't flow until next boot).
+fn spawn_log_sink(log_tx: tokio::sync::mpsc::Sender<LogFrameBytes>) {
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixListener;
+
+        let path = beyond_pg_core::vsock::LOG_SINK_UNIX_PATH;
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Remove any stale socket from a prior boot so bind() succeeds.
+        let _ = std::fs::remove_file(path);
+        let listener = match UnixListener::bind(path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[init] WARNING: log sink bind {path} failed: {e}; workload logs disabled");
+                return;
+            }
+        };
+        eprintln!("[init] log sink listening on {path}");
+
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("[init] log sink accept failed: {e}");
+                    continue;
+                }
+            };
+            // Drain one supervisor connection: read complete substrate frames
+            // (`[len: u32 BE][type][payload]`) and relay them verbatim. On EOF or
+            // error, loop back to accept the next supervisor (post-handoff).
+            let mut len_buf = [0u8; 4];
+            loop {
+                if stream.read_exact(&mut len_buf).await.is_err() {
+                    break;
+                }
+                let len = u32::from_be_bytes(len_buf);
+                if len == 0 || len > MAX_FRAME {
+                    eprintln!("[init] log sink: bad frame length {len}; dropping connection");
+                    break;
+                }
+                let mut frame = Vec::with_capacity(4 + len as usize);
+                frame.extend_from_slice(&len_buf);
+                let start = frame.len();
+                frame.resize(start + len as usize, 0);
+                if stream.read_exact(&mut frame[start..]).await.is_err() {
+                    break;
+                }
+                // Drop on a full channel rather than block the reader — the
+                // supervisor rate-limits upstream and a dropped line is
+                // acceptable; stalling the relay is not.
+                if log_tx.try_send(frame).is_err() {
+                    // Channel full or closed: shed this line, keep reading.
+                    continue;
+                }
+            }
+        }
+    });
 }
 
 /// Milliseconds since kernel boot, from `/proc/uptime`. Best-effort (0 on any
