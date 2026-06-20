@@ -17,8 +17,11 @@ serde_json = "1"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 handoff = { version = "0.1", package = "beyond-handoff" }
-# Shared substrate SDK: the guest-ready vsock handshake instd waits for, plus
-# the admin exec/ping channel. Path dep into the beyond workspace.
-guest-runtime = { path = "../../beyond/rustlib/guest-runtime" }
+# The guest-ready handshake instd waits for is a single self-described vsock
+# frame; we speak it directly (see src/substrate.rs) rather than depend on the
+# Beyond workspace, so this repo builds standalone in CI. The wire contract is
+# pinned by a fixture test.
 nix = { version = "0.31", features = ["mount"] }
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "io-util"] }
+tokio-vsock = "0.7"
+rmp-serde = "1"
