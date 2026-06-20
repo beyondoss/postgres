@@ -21,12 +21,13 @@ pub struct MmdsConfig {
     /// Required. `beyond-pg` fails closed if absent.
     pub postgres_password: String,
     pub postgres_database: String,
-    pub archive_target: Option<String>,
-    /// HTTP base URL of the WAL sink (e.g. `http://10.0.0.5:9000`).
+    /// HTTP base URL of the WAL sink (e.g. `http://10.0.0.5:9000`). The single
+    /// PITR redo source: a recovering node replays WAL fetched from here.
     pub wal_sink: Option<String>,
     /// When true, a `cdc` logical replication slot and empty publication are created on boot.
     pub cdc_enabled: bool,
-    /// Postgres timestamp string for point-in-time recovery. Requires `archive_target`.
+    /// Postgres timestamp string for point-in-time recovery. Requires `wal_sink`
+    /// (the WAL source to replay from).
     pub recovery_target_time: Option<String>,
     /// libpq conninfo to the primary. Required when `pg_tier = Replica`.
     pub primary_conninfo: Option<String>,
@@ -56,6 +57,8 @@ pub enum MmdsError {
     InvalidPassword,
     #[error("BEYOND_PG_PRIMARY_CONNINFO is required when BEYOND_PG_TIER=replica")]
     MissingPrimaryConninfo,
+    #[error("BEYOND_PG_RECOVERY_TARGET_TIME requires BEYOND_PG_WAL_SINK (the WAL source to replay from)")]
+    RecoveryTargetWithoutWalSource,
     #[error("MMDS metadata not available: {0}")]
     Unavailable(String),
 }
@@ -91,11 +94,6 @@ pub fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         .unwrap_or("postgres")
         .to_owned();
 
-    let archive_target = meta["BEYOND_PG_ARCHIVE_TARGET"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_owned());
-
     let wal_sink = meta["BEYOND_PG_WAL_SINK"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -125,6 +123,12 @@ pub fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         return Err(MmdsError::MissingPrimaryConninfo);
     }
 
+    // PITR replays WAL from the sink; a recovery target without a WAL source is
+    // a misconfiguration (would silently never reach the target).
+    if recovery_target_time.is_some() && wal_sink.is_none() {
+        return Err(MmdsError::RecoveryTargetWithoutWalSource);
+    }
+
     let ram_bytes = read_ram_bytes();
     let vcpus = read_vcpus();
 
@@ -133,7 +137,6 @@ pub fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         ephemeral,
         postgres_password,
         postgres_database,
-        archive_target,
         wal_sink,
         cdc_enabled,
         recovery_target_time,

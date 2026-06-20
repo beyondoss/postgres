@@ -1,4 +1,3 @@
-mod archive;
 mod boot;
 mod cert_watcher;
 #[cfg(target_os = "linux")]
@@ -24,13 +23,6 @@ enum Cmd {
     Supervisor,
     /// Run idempotent boot setup and exit
     Boot,
-    /// Archive a WAL segment (called by archive_command)
-    Archive {
-        /// WAL segment path (%p)
-        path: String,
-        /// WAL segment filename (%f)
-        filename: String,
-    },
 }
 
 fn main() {
@@ -38,9 +30,6 @@ fn main() {
     let cmd = Cmd::parse();
 
     match cmd {
-        Cmd::Archive { path, filename } => {
-            archive::run(&path, &filename);
-        }
         Cmd::Supervisor => {
             init::run();
             // handoff::detect_role mutates env vars (LISTEN_FDS, HANDOFF_ROLE,

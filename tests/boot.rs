@@ -500,7 +500,7 @@ fn boot_with_platform_cert() {
     );
 }
 
-/// Boot with BEYOND_PG_ARCHIVE_TARGET + BEYOND_PG_RECOVERY_TARGET_TIME writes
+/// Boot with BEYOND_PG_WAL_SINK + BEYOND_PG_RECOVERY_TARGET_TIME writes
 /// exactly `config::pitr_conf(...)` and creates recovery.signal.
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
@@ -514,7 +514,7 @@ fn boot_writes_pitr_config() {
         &binary,
         platform,
         &mmds(&[
-            ("BEYOND_PG_ARCHIVE_TARGET", "s3://test-bucket/wal"),
+            ("BEYOND_PG_WAL_SINK", "http://10.0.0.5:9000"),
             ("BEYOND_PG_RECOVERY_TARGET_TIME", "2026-05-14 03:00:00"),
         ]),
     );
@@ -525,7 +525,7 @@ fn boot_writes_pitr_config() {
     assert!(pitr_path.exists(), "05-pitr.conf not written");
     assert_eq!(
         std::fs::read_to_string(&pitr_path).unwrap(),
-        beyond_pg::config::pitr_conf("s3://test-bucket/wal", Some("2026-05-14 03:00:00")),
+        beyond_pg::config::pitr_conf("http://10.0.0.5:9000", Some("2026-05-14 03:00:00")),
         "05-pitr.conf content mismatch — binary diverged from pitr_conf()"
     );
 
@@ -555,7 +555,7 @@ fn boot_clears_pitr_state_on_second_boot() {
         &binary,
         platform,
         &mmds(&[
-            ("BEYOND_PG_ARCHIVE_TARGET", "s3://test-bucket/wal"),
+            ("BEYOND_PG_WAL_SINK", "http://10.0.0.5:9000"),
             ("BEYOND_PG_RECOVERY_TARGET_TIME", "2026-05-14 03:00:00"),
         ]),
     );
