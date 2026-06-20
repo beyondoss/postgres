@@ -29,8 +29,13 @@ use serde::Serialize;
 const HOST_CID: u32 = 2;
 /// Substrate vsock port instd listens on (`vsock_protocol::VSOCK_PORT`).
 const SUBSTRATE_PORT: u32 = 52;
-/// `Ready` message discriminator (`vsock_protocol::MessageType::Ready`).
-const MSG_READY: u8 = 0x81;
+/// Message discriminators (`vsock_protocol::MessageType`).
+const MSG_READY: u8 = 0x81; // Agent → host: ready after boot.
+const MSG_HEARTBEAT: u8 = 0x02; // Host → agent: liveness probe.
+const MSG_HEARTBEAT_RESP: u8 = 0x82; // Agent → host: heartbeat reply.
+const MSG_SHUTDOWN: u8 = 0x04; // Host → agent: shutdown requested.
+/// Frame length ceiling — sanity bound so a corrupt length can't allocate wild.
+const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
 /// Agent → host "ready after boot" payload. A field-compatible subset of
 /// `vsock_protocol::ReadyPayload` — only the always-present fields; the rest are
@@ -42,14 +47,23 @@ struct ReadyPayload {
     reconnect: bool,
 }
 
-/// Encode the `Ready` frame: `[len: u32 BE][type][MessagePack payload]`.
-/// Length covers the type byte + payload (not the 4 length bytes themselves).
-fn encode_ready_frame(payload: &ReadyPayload) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    let body = rmp_serde::to_vec_named(payload)?;
+/// `vsock_protocol::HeartbeatPayload` — echoed back in our heartbeat reply.
+#[derive(Serialize)]
+struct HeartbeatPayload {
+    timestamp: u64,
+}
+
+/// Frame a message: `[len: u32 BE = 1 + payload][type][MessagePack payload]`.
+fn encode_frame(msg_type: u8, body: &[u8]) -> Vec<u8> {
     let mut frame = ((body.len() as u32) + 1).to_be_bytes().to_vec();
-    frame.push(MSG_READY);
-    frame.extend_from_slice(&body);
-    Ok(frame)
+    frame.push(msg_type);
+    frame.extend_from_slice(body);
+    frame
+}
+
+/// Encode the `Ready` frame.
+fn encode_ready_frame(payload: &ReadyPayload) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    Ok(encode_frame(MSG_READY, &rmp_serde::to_vec_named(payload)?))
 }
 
 /// Spawn the dedicated `substrate-vsock` thread that performs the guest-ready
@@ -116,16 +130,45 @@ async fn handshake() {
     let _ = conn.flush().await;
     eprintln!("[init] substrate vsock handshake complete; guest reported ready");
 
-    // Hold the connection open for the VM's lifetime so the host keeps seeing
-    // the guest as present. We don't serve admin exec/ping here (the Postgres VM
-    // is reached over the VPC via pgbouncer, not the admin channel); inbound
-    // bytes (ReadyAck, heartbeats) are read and ignored. EOF/err → thread exits.
-    let mut buf = [0u8; 512];
+    // Keep the connection alive for the VM's lifetime AND answer instd's
+    // heartbeats — instd pings every 10s and marks the VM `Degraded (guest
+    // disconnected)` after 30s of silence, which disrupts VPC routing to the
+    // guest. We parse frames and reply HeartbeatResp to each Heartbeat; other
+    // messages (ReadyAck, admin/session — we don't serve those here) are
+    // ignored; Shutdown ends the loop (beyond-pg-init's supervise owns the
+    // actual poweroff via signalfd). EOF/err → thread exits.
+    let mut len_buf = [0u8; 4];
     loop {
-        match conn.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
+        if conn.read_exact(&mut len_buf).await.is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes(len_buf);
+        if len == 0 || len > MAX_FRAME {
+            eprintln!("[init] substrate vsock: bad frame length {len}; closing");
+            break;
+        }
+        let mut frame = vec![0u8; len as usize];
+        if conn.read_exact(&mut frame).await.is_err() {
+            break;
+        }
+        match frame[0] {
+            MSG_HEARTBEAT => {
+                let body =
+                    rmp_serde::to_vec_named(&HeartbeatPayload { timestamp: 0 }).unwrap_or_default();
+                if conn
+                    .write_all(&encode_frame(MSG_HEARTBEAT_RESP, &body))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let _ = conn.flush().await;
+            }
+            MSG_SHUTDOWN => {
+                eprintln!("[init] substrate requested shutdown; vsock loop exiting");
+                break;
+            }
+            _ => {} // ReadyAck etc. — nothing to do here.
         }
     }
 }
