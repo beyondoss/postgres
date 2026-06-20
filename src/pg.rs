@@ -119,11 +119,18 @@ pub async fn psql_env(sql: &str, env: &[(&str, &str)]) -> Result<(), PgError> {
 /// Dollar-quoting avoids single-quote injection. The password is MMDS-controlled
 /// but correct quoting is still the right habit.
 pub async fn set_superuser_password(pw: &str) -> Result<(), PgError> {
-    // Dollar-quote tag chosen to be unlikely to appear in a password.
-    // If the password itself contains `$_beyond_$`, this breaks — document that
-    // as an unsupported edge case in the MMDS field.
+    set_role_password("postgres", pw).await
+}
+
+/// Set a role's password using dollar-quoting (same injection guard as
+/// `set_superuser_password`). `role` is a fixed internal identifier (never user
+/// input); `pw` is MMDS-controlled and dollar-quoted.
+pub async fn set_role_password(role: &str, pw: &str) -> Result<(), PgError> {
+    // Dollar-quote tag chosen to be unlikely to appear in a password. If the
+    // password itself contains `$_beyond_$`, this breaks — documented as an
+    // unsupported edge case in the MMDS field.
     psql(&format!(
-        "ALTER ROLE postgres WITH PASSWORD $_beyond_${pw}$_beyond_$"
+        "ALTER ROLE {role} WITH PASSWORD $_beyond_${pw}$_beyond_$"
     ))
     .await
 }

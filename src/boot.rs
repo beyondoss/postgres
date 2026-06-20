@@ -360,6 +360,7 @@ mod tests {
             cdc_enabled: false,
             recovery_target_time: recovery_target_time.map(str::to_owned),
             primary_conninfo: None,
+            replication_password: None,
             ram_bytes: 4 * 1024 * 1024 * 1024,
             vcpus: 2,
         }

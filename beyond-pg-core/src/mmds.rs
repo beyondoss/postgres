@@ -30,6 +30,11 @@ pub struct MmdsConfig {
     pub recovery_target_time: Option<String>,
     /// libpq conninfo to the primary. Required when `pg_tier = Replica`.
     pub primary_conninfo: Option<String>,
+    /// Password for the `replicator` role. When set on a primary/single, the
+    /// `replicator` role is created with this password so remote replicas and
+    /// WAL sinks can authenticate via scram. Replicas put the matching password
+    /// in their `primary_conninfo`.
+    pub replication_password: Option<String>,
     /// Host RAM in bytes (cgroup-aware).
     pub ram_bytes: u64,
     /// Logical CPU count (cgroup-aware).
@@ -111,6 +116,11 @@ pub fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned());
 
+    let replication_password = meta["BEYOND_PG_REPLICATION_PASSWORD"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+
     if pg_tier == PgTier::Replica && primary_conninfo.is_none() {
         return Err(MmdsError::MissingPrimaryConninfo);
     }
@@ -128,6 +138,7 @@ pub fn parse(json: Value) -> Result<MmdsConfig, MmdsError> {
         cdc_enabled,
         recovery_target_time,
         primary_conninfo,
+        replication_password,
         ram_bytes,
         vcpus,
     })
@@ -229,6 +240,18 @@ mod tests {
         let cfg = parse(json).expect("should parse");
         assert_eq!(cfg.pg_tier, PgTier::Single);
         assert!(cfg.primary_conninfo.is_none());
+        assert!(cfg.replication_password.is_none());
+    }
+
+    #[test]
+    fn replication_password_parses() {
+        let cfg = parse(base_meta(&[("BEYOND_PG_REPLICATION_PASSWORD", "replpw")]))
+            .expect("should parse");
+        assert_eq!(cfg.replication_password.as_deref(), Some("replpw"));
+        // Empty string is treated as absent (same as the other optional keys).
+        let cfg2 = parse(base_meta(&[("BEYOND_PG_REPLICATION_PASSWORD", "")]))
+            .expect("should parse");
+        assert!(cfg2.replication_password.is_none());
     }
 
     #[test]

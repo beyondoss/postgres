@@ -1751,10 +1751,20 @@ async fn post_start(cfg: &MmdsConfig) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
-    if cfg.wal_sink.is_some() || cfg.cdc_enabled {
+    // Create the `replicator` role when anything needs to stream WAL from us: a
+    // remote replica (replication_password set), a WAL sink, or CDC. Remote
+    // consumers authenticate via scram (pg_hba `host replication replicator`),
+    // so when a replication password is configured we set it — without it the
+    // role is PASSWORD NULL and scram can't succeed.
+    if cfg.replication_password.is_some() || cfg.wal_sink.is_some() || cfg.cdc_enabled {
         pg::psql(crate::sql::REPLICATOR_ROLE_SQL)
             .await
             .map_err(|e| format!("failed to create replicator role: {e}"))?;
+        if let Some(pw) = &cfg.replication_password {
+            pg::set_role_password("replicator", pw)
+                .await
+                .map_err(|e| format!("failed to set replicator password: {e}"))?;
+        }
     }
 
     if cfg.cdc_enabled {
