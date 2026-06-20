@@ -1826,7 +1826,11 @@ async fn setup_pgbouncer_auth() -> Result<(), crate::pg::PgError> {
     Ok(())
 }
 
-const REQUIRED_EXTENSIONS: &[&str] = &["beyond_auth", "beyond_queue", "pg_cron"];
+// beyond_auth is NOT auto-created here: the beyond-auth service installs its
+// authz_check* C functions itself via a raw `CREATE FUNCTION ... AS 'beyond_auth'`
+// migration (loading the shipped beyond_auth.so on demand). Auto-creating it as
+// an extension would collide with that migration ("function already exists").
+const REQUIRED_EXTENSIONS: &[&str] = &["beyond_queue", "pg_cron"];
 
 /// Directory holding PostgreSQL extension shared objects (PG18 Debian layout,
 /// `pg_config --pkglibdir`). Mirrors `config`'s PKGLIBDIR.
