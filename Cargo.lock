@@ -275,6 +275,7 @@ dependencies = [
 name = "beyond-pg"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "beyond-handoff",
  "beyond-pg-core",
  "clap",
@@ -327,8 +328,12 @@ dependencies = [
  "beyond-handoff",
  "beyond-pg-core",
  "libc",
+ "nix 0.31.2",
+ "rmp-serde",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-vsock",
 ]
 
 [[package]]

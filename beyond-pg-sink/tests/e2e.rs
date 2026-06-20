@@ -2857,7 +2857,14 @@ fn wal_gap_stalls_replica() {
     };
     wait_http_ready(sink_port);
 
-    for _ in 0..60 {
+    // The sink streams from the consistent point it captures the moment it
+    // connects.  We MUST confirm it is streaming (appears in
+    // pg_stat_replication) before writing the pre-backup rows below — otherwise
+    // a slow connect under CI load leaves the sink starting from a later LSN
+    // and the pre-backup segment is never archived.  This wait is therefore
+    // fatal, and long enough (60s) to absorb a loaded runner.
+    let mut streaming = false;
+    for _ in 0..120 {
         if primary_client
             .query_opt(
                 "SELECT 1 FROM pg_stat_replication WHERE application_name='wal_sink_gap'",
@@ -2866,10 +2873,15 @@ fn wal_gap_stalls_replica() {
             .unwrap()
             .is_some()
         {
+            streaming = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+    assert!(
+        streaming,
+        "sink never connected as a streaming standby (application_name='wal_sink_gap')"
+    );
 
     // ── 3. pre-backup rows — archived ────────────────────────────────────────
     primary_client
@@ -2878,12 +2890,16 @@ fn wal_gap_stalls_replica() {
              INSERT INTO gap_test (v) SELECT 'pre-' || g FROM generate_series(1,50) g;",
         )
         .unwrap();
+    // pg_switch_wal pads the current segment to the boundary; the walsender
+    // streams the full padded segment to the (already-streaming) sink, which
+    // seals it once the write reaches 16 MiB.
     primary_client
         .execute("SELECT pg_switch_wal()", &[])
         .unwrap();
 
-    // Wait for the pre-backup segment to land in the sink.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Wait for the pre-backup segment to land in the sink (60s to match the
+    // sibling crash test and absorb CI load).
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let count = std::fs::read_dir(&sink_dir)
             .unwrap()

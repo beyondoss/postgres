@@ -68,9 +68,33 @@ pub async fn run() {
 
 /// Idempotent boot-time setup. Called by `supervisor` before spawning Postgres.
 pub async fn do_boot(cfg: &MmdsConfig) -> Result<(), BootError> {
+    ensure_socket_dir();
     match cfg.pg_tier {
         PgTier::Single | PgTier::Primary => do_boot_primary(cfg).await,
         PgTier::Replica => do_boot_replica(cfg).await,
+    }
+}
+
+/// Ensure the Postgres unix-socket directory exists and is owned by postgres.
+///
+/// `/run/postgresql` (= `/var/run/postgresql`, [`pg::PG_SOCKET_DIR`]) is normally
+/// materialized by systemd-tmpfiles, but the Beyond VM has no systemd — PID 1 is
+/// `beyond-pg-init`. Without it, Postgres dies at startup with
+/// `could not create lock file "/var/run/postgresql/.s.PGSQL.<port>.lock"`.
+/// Idempotent: a no-op when the dir already exists with the right owner.
+fn ensure_socket_dir() {
+    let dir = pg::PG_SOCKET_DIR;
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        warn!("ensure_socket_dir: create {dir}: {e}");
+        return;
+    }
+    match std::process::Command::new("chown")
+        .args(["postgres:postgres", dir])
+        .status()
+    {
+        Ok(s) if s.success() => info!("socket dir {dir} ready (owner postgres)"),
+        Ok(s) => warn!("chown {dir} exited {s}; continuing"),
+        Err(e) => warn!("chown {dir} failed to spawn: {e}; continuing"),
     }
 }
 
@@ -186,6 +210,19 @@ async fn maybe_initdb(cfg: &MmdsConfig) -> Result<(), BootError> {
         std::fs::create_dir_all(PGDATA)?;
     }
 
+    // A fresh durable volume mounts root-owned and empty over the image's
+    // /var/lib/postgresql; chown the tree to postgres so the postgres-user
+    // initdb (and the cluster it creates) can write it. Idempotent / harmless
+    // when already postgres-owned (the image-baked ephemeral case).
+    match std::process::Command::new("chown")
+        .args(["-R", "postgres:postgres", "/var/lib/postgresql"])
+        .status()
+    {
+        Ok(s) if s.success() => info!("chowned /var/lib/postgresql → postgres"),
+        Ok(s) => warn!("chown /var/lib/postgresql exited {s}; continuing"),
+        Err(e) => warn!("chown /var/lib/postgresql failed to spawn: {e}; continuing"),
+    }
+
     run_initdb(&cfg.postgres_password).await?;
     Ok(())
 }
@@ -201,6 +238,11 @@ async fn run_initdb(password: &str) -> Result<(), BootError> {
     // Set 0600 before writing the password.
     std::fs::set_permissions(pwfile.path(), std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(pwfile.path(), password)?;
+    // initdb runs as the postgres user (see pg::initdb); the pwfile is created
+    // root-owned 0600, so chown it to postgres so initdb can read it.
+    let _ = std::process::Command::new("chown")
+        .args(["postgres:postgres", pwfile.path().to_str().unwrap_or("")])
+        .status();
 
     let path_str = pwfile
         .path()
@@ -707,8 +749,14 @@ async fn http_get(url: &str) -> Result<Vec<u8>, String> {
 fn write_config_files(cfg: &MmdsConfig, tls: &crate::tls::TlsConfig) -> Result<(), BootError> {
     use config::write_atomic;
 
-    // 00-beyond.conf — image opinions, overwritten every boot
-    write_atomic(Path::new(&config::beyond_conf_path()), config::BEYOND_CONF)?;
+    // 00-beyond.conf — image opinions, overwritten every boot. The
+    // shared_preload_libraries list is filtered to the extensions actually
+    // installed in this image so a missing module can't crash postgres at
+    // startup (see config::beyond_conf).
+    write_atomic(
+        Path::new(&config::beyond_conf_path()),
+        &config::beyond_conf(),
+    )?;
 
     // 05-tls.conf — resolved cert paths, overrides 00-beyond.conf's defaults
     // via alpha order under conf.d/. Numbered 05 so it lands after 04-replica.

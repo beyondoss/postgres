@@ -24,6 +24,80 @@ use crate::pg::PGDATA;
 
 pub const BEYOND_CONF: &str = include_str!("../packer/files/postgresql/00-beyond.conf");
 
+/// Directory holding the PostgreSQL shared-object extension modules. Matches
+/// the PG18 Debian-derived layout (`pg_config --pkglibdir`) used everywhere in
+/// this image — sibling to the `/var/lib/postgresql/18/...` paths in `pg.rs`.
+const PKGLIBDIR: &str = "/usr/lib/postgresql/18/lib";
+
+/// `00-beyond.conf` with `shared_preload_libraries` filtered down to the
+/// libraries actually installed in this image.
+///
+/// `00-beyond.conf` lists every extension the platform *wants* preloaded, but
+/// the standalone postgres primitive ships without the auth/queue milestone
+/// (`beyond_auth`, `beyond_queue`) or pgdg's `pg_cron` (dropped on a version
+/// pin). preloading a missing module makes postgres die at startup with
+/// `FATAL: could not access file "<lib>": No such file or directory`.
+///
+/// This makes the supervisor self-adapting: with the extensions installed it
+/// preloads them; without, it drops them and postgres boots. `pg_stat_statements`
+/// and `auto_explain` ship with core postgres so they always survive the filter.
+pub fn beyond_conf() -> String {
+    filter_shared_preload_libraries(BEYOND_CONF, PKGLIBDIR)
+}
+
+/// Returns true iff `{pkglibdir}/{lib}.so` exists. Core-postgres libraries
+/// (`pg_stat_statements`, `auto_explain`) are present in any standard install.
+fn library_installed(pkglibdir: &str, lib: &str) -> bool {
+    Path::new(pkglibdir).join(format!("{lib}.so")).exists()
+}
+
+/// Post-process a `postgresql.conf` body: rewrite the
+/// `shared_preload_libraries = '...'` line, keeping only libraries whose shared
+/// object exists under `pkglibdir`. Lines without that key pass through
+/// untouched. If every listed library is missing, the key is emitted empty
+/// (`shared_preload_libraries = ''`) rather than dropped, so an operator can
+/// still see the (now-empty) setting.
+fn filter_shared_preload_libraries(conf: &str, pkglibdir: &str) -> String {
+    const KEY: &str = "shared_preload_libraries";
+    let mut out = String::with_capacity(conf.len());
+    for line in conf.lines() {
+        if let Some(filtered) = filter_preload_line(line, KEY, pkglibdir) {
+            out.push_str(&filtered);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// If `line` is a `shared_preload_libraries = '...'` assignment, return the
+/// rewritten line with only installed libraries kept; otherwise `None`.
+fn filter_preload_line(line: &str, key: &str, pkglibdir: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    // Don't touch comments.
+    if trimmed.starts_with('#') {
+        return None;
+    }
+    let rest = trimmed.strip_prefix(key)?;
+    // The next non-space char after the key must be '=' (avoid matching e.g.
+    // `shared_preload_libraries.foo`).
+    let after_key = rest.trim_start();
+    let value_part = after_key.strip_prefix('=')?;
+    // Extract the single-quoted list value.
+    let value = value_part.trim();
+    let inner = value.strip_prefix('\'')?.strip_suffix('\'')?;
+
+    let kept: Vec<&str> = inner
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter(|lib| library_installed(pkglibdir, lib))
+        .collect();
+
+    Some(format!("{key} = '{}'", kept.join(",")))
+}
+
 pub const PG_HBA_CONF: &str = include_str!("../packer/files/postgresql/pg_hba.conf");
 
 pub const PGBOUNCER_INI_BASE: &str = include_str!("../packer/files/pgbouncer/pgbouncer.ini");
@@ -452,6 +526,76 @@ mod tests {
 
     use super::*;
     use crate::tls::{TlsConfig, TlsSource};
+
+    #[test]
+    fn filter_preload_keeps_only_installed_libs() {
+        // Fake pkglibdir with only pg_stat_statements + auto_explain present.
+        let dir = tempfile::tempdir().unwrap();
+        for lib in ["pg_stat_statements", "auto_explain"] {
+            std::fs::write(dir.path().join(format!("{lib}.so")), b"").unwrap();
+        }
+        let pkglibdir = dir.path().to_str().unwrap();
+        let conf = "shared_preload_libraries = 'pg_stat_statements,auto_explain,pg_cron,beyond_auth,beyond_queue'\nfoo = 1\n";
+        let out = filter_shared_preload_libraries(conf, pkglibdir);
+        assert!(
+            out.contains("shared_preload_libraries = 'pg_stat_statements,auto_explain'"),
+            "missing libs should be dropped: {out}"
+        );
+        assert!(!out.contains("pg_cron"), "pg_cron not installed: {out}");
+        assert!(!out.contains("beyond_auth"), "beyond_auth not installed: {out}");
+        assert!(!out.contains("beyond_queue"), "beyond_queue not installed: {out}");
+        // Other lines untouched.
+        assert!(out.contains("foo = 1"));
+    }
+
+    #[test]
+    fn filter_preload_all_present_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        for lib in ["pg_stat_statements", "auto_explain", "pg_cron"] {
+            std::fs::write(dir.path().join(format!("{lib}.so")), b"").unwrap();
+        }
+        let pkglibdir = dir.path().to_str().unwrap();
+        let conf = "shared_preload_libraries = 'pg_stat_statements,auto_explain,pg_cron'\n";
+        let out = filter_shared_preload_libraries(conf, pkglibdir);
+        assert!(out.contains("shared_preload_libraries = 'pg_stat_statements,auto_explain,pg_cron'"));
+    }
+
+    #[test]
+    fn filter_preload_all_missing_emits_empty_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkglibdir = dir.path().to_str().unwrap();
+        let conf = "shared_preload_libraries = 'pg_cron,beyond_auth'\n";
+        let out = filter_shared_preload_libraries(conf, pkglibdir);
+        assert!(
+            out.contains("shared_preload_libraries = ''"),
+            "all missing → empty value (key retained): {out}"
+        );
+    }
+
+    #[test]
+    fn filter_preload_ignores_comments_and_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkglibdir = dir.path().to_str().unwrap();
+        let conf = "# shared_preload_libraries = 'pg_cron'\nshared_preload_libraries.foo = 'bar'\n";
+        let out = filter_shared_preload_libraries(conf, pkglibdir);
+        // Commented line passes through verbatim.
+        assert!(out.contains("# shared_preload_libraries = 'pg_cron'"));
+        // A different key (dotted) is not the assignment we rewrite.
+        assert!(out.contains("shared_preload_libraries.foo = 'bar'"));
+    }
+
+    #[test]
+    fn filter_preload_handles_real_embedded_conf() {
+        // The embedded 00-beyond.conf must contain the key; filtering against a
+        // dir with only core libs must drop the milestone extensions.
+        let dir = tempfile::tempdir().unwrap();
+        for lib in ["pg_stat_statements", "auto_explain"] {
+            std::fs::write(dir.path().join(format!("{lib}.so")), b"").unwrap();
+        }
+        let out = filter_shared_preload_libraries(BEYOND_CONF, dir.path().to_str().unwrap());
+        assert!(out.contains("shared_preload_libraries = 'pg_stat_statements,auto_explain'"));
+        assert!(!out.contains("'pg_stat_statements,auto_explain,pg_cron"));
+    }
 
     #[test]
     fn tls_conf_platform_includes_ca() {

@@ -1722,9 +1722,24 @@ async fn post_start(cfg: &MmdsConfig) -> Result<(), Box<dyn std::error::Error>> 
         .await
         .map_err(|e| format!("failed to set up pgbouncer auth: {e}"))?;
 
-    // Required extensions — fail the supervisor if any are missing; the process
-    // manager will restart and retry rather than running in a degraded state.
+    // Required extensions — fail the supervisor if CREATE EXTENSION fails for
+    // an extension whose shared object IS installed; the process manager will
+    // restart and retry rather than running in a degraded state.
+    //
+    // But the standalone postgres primitive ships without the auth/queue
+    // milestone (beyond_auth/beyond_queue) and pgdg's pg_cron (version pin
+    // drift). When an extension's .so isn't installed, treat it as a warning,
+    // not a fatal — the same self-adapting posture as the
+    // shared_preload_libraries filter (see config::beyond_conf). With the
+    // extensions present, the behavior is unchanged (still hard-required).
     for ext in REQUIRED_EXTENSIONS {
+        if !extension_installed(ext) {
+            warn!(
+                "required extension {ext} not installed (no {ext}.so in {EXTENSION_PKGLIBDIR}); \
+                 skipping (auth/queue milestone not in this image)"
+            );
+            continue;
+        }
         pg::psql(&format!("CREATE EXTENSION IF NOT EXISTS {ext}"))
             .await
             .map_err(|e| format!("required extension {ext} failed: {e}"))?;
@@ -1797,6 +1812,20 @@ async fn setup_pgbouncer_auth() -> Result<(), crate::pg::PgError> {
 }
 
 const REQUIRED_EXTENSIONS: &[&str] = &["beyond_auth", "beyond_queue", "pg_cron"];
+
+/// Directory holding PostgreSQL extension shared objects (PG18 Debian layout,
+/// `pg_config --pkglibdir`). Mirrors `config`'s PKGLIBDIR.
+const EXTENSION_PKGLIBDIR: &str = "/usr/lib/postgresql/18/lib";
+
+/// True iff the extension's shared object is present in the image. An extension
+/// listed in [`REQUIRED_EXTENSIONS`] but with no installed `.so` (e.g. the
+/// future auth/queue milestone, or a dropped pgdg `pg_cron`) is downgraded from
+/// fatal to a warning so the standalone primitive still boots.
+fn extension_installed(ext: &str) -> bool {
+    std::path::Path::new(EXTENSION_PKGLIBDIR)
+        .join(format!("{ext}.so"))
+        .exists()
+}
 
 const OPTIONAL_EXTENSIONS: &[&str] = &[
     "pg_stat_statements",
