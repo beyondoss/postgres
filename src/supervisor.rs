@@ -558,8 +558,13 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
         // blocks until the 'wal_sink' streaming standby ACKs the WAL.  The
         // wal_forwarder connects to postgres with application_name='wal_sink',
         // making it that standby.  Spawning it after post_start causes a deadlock.
+        // Skip on a PITR restore node (recovery_target_time set): it has wal_sink
+        // only as the restore_command source, not as a sync sink it forwards to.
+        // Running the forwarder + sync wait would push its own WAL back at the
+        // sink and block on a standby that will never appear.
         let mut wfh: Option<tokio::task::JoinHandle<()>> = None;
         if cfg.pg_tier != PgTier::Replica
+            && cfg.recovery_target_time.is_none()
             && let Some(wal_sink) = &cfg.wal_sink
         {
             let sink_url = wal_sink.clone();

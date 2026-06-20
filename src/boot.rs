@@ -768,9 +768,14 @@ fn write_config_files(cfg: &MmdsConfig, tls: &crate::tls::TlsConfig) -> Result<(
         }
     }
 
-    // 03-wal-sink.conf — present only when BEYOND_PG_WAL_SINK is set
+    // 03-wal-sink.conf declares the sink as a SYNCHRONOUS standby
+    // (synchronous_standby_names='wal_sink') — only valid on a node whose WAL a
+    // sink consumes. A PITR restore node sets BEYOND_PG_WAL_SINK only as the
+    // restore_command source (05-pitr.conf); it has no sink consuming from it, so
+    // declaring a sync standby would hang its post-promote commits. Suppress it
+    // whenever recovering.
     let wal_sink_path = config::wal_sink_conf_path();
-    if cfg.wal_sink.is_some() {
+    if cfg.wal_sink.is_some() && cfg.recovery_target_time.is_none() {
         write_atomic(Path::new(&wal_sink_path), &config::wal_sink_conf())?;
     } else {
         match std::fs::remove_file(&wal_sink_path) {
