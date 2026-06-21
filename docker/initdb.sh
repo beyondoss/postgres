@@ -6,11 +6,12 @@
 #   - public : the app's own migrations
 set -euo pipefail
 
-# beyond_auth owns (creates) the `auth` schema, so let the extension make it
-# rather than pre-creating it (pre-creating triggers "schema auth is not a member
-# of extension"). The auth server's CREATE EXTENSION IF NOT EXISTS is then a no-op.
+# Create the schemas the primitives expect. The auth server manages the
+# beyond_auth extension itself in its own migrations (the extension is installed
+# in the image), so initdb must NOT create it here — doing so makes the auth
+# server's migration fail with "function authz_check already exists".
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
-CREATE EXTENSION IF NOT EXISTS beyond_auth;
+CREATE SCHEMA IF NOT EXISTS auth;
 CREATE SCHEMA IF NOT EXISTS queue;
 SQL
 
