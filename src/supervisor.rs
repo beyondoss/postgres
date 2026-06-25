@@ -30,7 +30,9 @@ use crate::mmds::{MmdsConfig, PgTier};
 use crate::pg;
 use crate::vsock::ExecStream;
 #[cfg(target_os = "linux")]
-use crate::vsock::{LOG_SINK_UNIX_PATH, UserProcessStreamDataPayload, encode_log_frame};
+use crate::vsock::{
+    LOG_SINK_UNIX_PATH, UserProcessStreamDataPayload, encode_log_frame, encode_ready_frame,
+};
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const STABLE_RUNTIME: Duration = Duration::from_secs(60);
@@ -413,6 +415,14 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
     // Bounded channel for log frames from all child pipes
     let (log_tx, log_rx) = mpsc::channel::<LogFrame>(1024);
 
+    // Readiness latch. Flips true once Postgres/pgbouncer is accepting; the log
+    // writer task (which owns the vsock connection to the host) reads it and
+    // emits one `ServiceKind::Ready` frame, which the host postgres-driver turns
+    // into `service.ready.{instance}`. A `watch` (not a one-shot) so the writer
+    // re-asserts readiness on every reconnect — a freshly-attached driver after
+    // an instd restart still needs to learn we're ready.
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+
     // PersistedChildren is the supervisor's record of who it spawned, so a
     // post-handoff or post-crash successor can adopt those PIDs via pidfd.
     // Written atomically (tmp + rename) after each spawn and on exit.
@@ -642,8 +652,19 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
         // were any holding-the-runtime DDL pending.
     }
 
-    // Background: forward logs to host vsock
-    let log_writer_handle = tokio::spawn(log_writer_task(log_rx));
+    // Background: forward logs to host vsock (and emit the readiness frame once
+    // `ready_tx` flips — see below).
+    let log_writer_handle = tokio::spawn(log_writer_task(log_rx, ready_rx));
+
+    // We're past the convergence of both startup paths: cold start has Postgres
+    // ready (`pg::wait_until_ready` above) + pgbouncer spawned, and the successor
+    // path adopted already-serving children. Signal readiness so the host driver
+    // publishes `service.ready` and the orchestrator's gate advances. `ready_tx`
+    // is held for the supervisor's lifetime (it lives in this function's scope)
+    // so the writer can re-assert on reconnect.
+    if ready_tx.send(true).is_err() {
+        warn!("readiness latch receiver gone; service.ready will not be emitted");
+    }
 
     // Background: serve control RPC.
     //
@@ -2314,24 +2335,65 @@ mod tests {
 /// Reconnects on failure: a supervisor handoff or a transient socket error just
 /// re-dials. PID 1's sink accepts sequential supervisor connections.
 #[cfg(target_os = "linux")]
-async fn log_writer_task(mut log_rx: mpsc::Receiver<LogFrame>) {
+async fn log_writer_task(
+    mut log_rx: mpsc::Receiver<LogFrame>,
+    mut ready_rx: tokio::sync::watch::Receiver<bool>,
+) {
     use tokio::io::AsyncWriteExt;
+
+    // True once we've observed readiness and emitted the frame. After that we
+    // stop selecting on the watch (reconnect re-assertion is handled by the
+    // borrow check below), so a dropped sender can't busy-spin the select.
+    let mut announced = false;
 
     loop {
         match tokio::net::UnixStream::connect(LOG_SINK_UNIX_PATH).await {
             Ok(mut stream) => {
                 info!("log forwarder connected to host log sink {LOG_SINK_UNIX_PATH}");
-                while let Some(frame) = log_rx.recv().await {
-                    let payload = UserProcessStreamDataPayload {
-                        stream: frame.stream,
-                        line: frame.line,
-                        truncated: frame.truncated,
-                        execution_id: frame.execution_id.to_string(),
-                    };
-                    let encoded = encode_log_frame(&payload);
-                    if stream.write_all(&encoded).await.is_err() {
-                        warn!("log sink write failed, reconnecting");
-                        break;
+                // (Re)assert readiness up front: on a reconnect, or when a fresh
+                // host-side driver attaches after an instd restart, it still needs
+                // to learn we're ready. Idempotent downstream (the driver dedups).
+                if *ready_rx.borrow() {
+                    announced = true;
+                    if stream.write_all(&encode_ready_frame()).await.is_err() {
+                        warn!("log sink ready-frame write failed, reconnecting");
+                        continue;
+                    }
+                    info!("signaled postgres readiness to host driver (service.ready)");
+                }
+                loop {
+                    tokio::select! {
+                        maybe = log_rx.recv() => {
+                            // Sender dropped → supervisor shutting down; stop.
+                            let Some(frame) = maybe else { return };
+                            let payload = UserProcessStreamDataPayload {
+                                stream: frame.stream,
+                                line: frame.line,
+                                truncated: frame.truncated,
+                                execution_id: frame.execution_id.to_string(),
+                            };
+                            let encoded = encode_log_frame(&payload);
+                            if stream.write_all(&encoded).await.is_err() {
+                                warn!("log sink write failed, reconnecting");
+                                break;
+                            }
+                        }
+                        // Catch the readiness flip while connected + idle. Guarded
+                        // off once announced so a closed watch can't busy-spin.
+                        res = ready_rx.changed(), if !announced => {
+                            match res {
+                                Ok(()) if *ready_rx.borrow() => {
+                                    announced = true;
+                                    if stream.write_all(&encode_ready_frame()).await.is_err() {
+                                        warn!("log sink ready-frame write failed, reconnecting");
+                                        break;
+                                    }
+                                    info!("signaled postgres readiness to host driver (service.ready)");
+                                }
+                                Ok(()) => {}
+                                Err(_) => announced = true, // sender gone; stop polling
+                            }
+                        }
                     }
                 }
             }
@@ -2345,7 +2407,10 @@ async fn log_writer_task(mut log_rx: mpsc::Receiver<LogFrame>) {
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn log_writer_task(mut log_rx: mpsc::Receiver<LogFrame>) {
+async fn log_writer_task(
+    mut log_rx: mpsc::Receiver<LogFrame>,
+    _ready_rx: tokio::sync::watch::Receiver<bool>,
+) {
     // Drain without forwarding — vsock unavailable on this platform.
     while log_rx.recv().await.is_some() {}
 }
