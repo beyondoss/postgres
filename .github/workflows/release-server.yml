@@ -29,6 +29,8 @@ jobs:
       - name: Resolve version
         id: meta
         run: echo "version=${GITHUB_REF_NAME#server/v}" >> "$GITHUB_OUTPUT"
+      - name: Install rust target
+        run: rustup target add ${{ matrix.target }}
       - name: Build musl static binaries
         run: cargo zigbuild --release --target ${{ matrix.target }} -p beyond-pg -p beyond-pg-init
       - name: Package assets
