@@ -5,6 +5,10 @@ on:
       - server/v*
 permissions:
   contents: write
+# The `postgres` dev tool (vfox plugin) isn't needed to compile the binaries and
+# its PostInstall hook fails on the arm64 runner — skip it for the release build.
+env:
+  MISE_DISABLE_TOOLS: postgres
 jobs:
   build:
     strategy:
