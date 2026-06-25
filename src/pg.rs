@@ -69,6 +69,37 @@ pub async fn wait_until_ready(timeout: Duration) -> bool {
     false
 }
 
+/// PgBouncer's client-facing TCP port. Clients (and wave-1 services like
+/// auth/queue dialing `postgres.<vpc>.internal:5432`) connect here, NOT to
+/// Postgres direct (`PG_PORT` = 5433). PgBouncer is a separate process the
+/// supervisor spawns after Postgres is ready.
+pub const PGBOUNCER_PORT: u16 = 5432;
+
+/// Returns `true` if PgBouncer is accepting TCP connections on its client port.
+/// A successful connect means the pooler's listener is up — which is what
+/// "ready for traffic" means for clients. Postgres-direct readiness
+/// (`is_ready`, unix socket :5433) is necessary but not sufficient: a client
+/// that sees `service.ready` and dials :5432 before PgBouncer binds gets
+/// connection-refused.
+pub async fn pgbouncer_accepting() -> bool {
+    tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, PGBOUNCER_PORT))
+        .await
+        .is_ok()
+}
+
+/// Poll `pgbouncer_accepting()` every 100 ms until it returns `true` or
+/// `timeout` elapses.
+pub async fn wait_until_pgbouncer_ready(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if pgbouncer_accepting().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // psql
 // ---------------------------------------------------------------------------

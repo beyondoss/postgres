@@ -658,10 +658,22 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
 
     // We're past the convergence of both startup paths: cold start has Postgres
     // ready (`pg::wait_until_ready` above) + pgbouncer spawned, and the successor
-    // path adopted already-serving children. Signal readiness so the host driver
-    // publishes `service.ready` and the orchestrator's gate advances. `ready_tx`
-    // is held for the supervisor's lifetime (it lives in this function's scope)
-    // so the writer can re-assert on reconnect.
+    // path adopted already-serving children. Before signaling readiness, wait for
+    // PgBouncer (:5432) to actually accept — that's the port clients dial
+    // (`postgres.<vpc>.internal:5432`), and it's a separate process that binds a
+    // beat after spawn. Without this, wave-1 services (auth/queue) can win the
+    // race and get connection-refused. On the successor path the adopted pooler
+    // is already listening, so this returns immediately. Time-box it: if the
+    // pooler somehow isn't up in 30s the supervisor's child-restart logic owns
+    // recovery — signal anyway rather than strand the whole deploy at the gate.
+    if !pg::wait_until_pgbouncer_ready(Duration::from_secs(30)).await {
+        warn!("pgbouncer not accepting on :5432 within 30s; signaling ready anyway");
+    }
+
+    // Signal readiness so the host driver publishes `service.ready` and the
+    // orchestrator's gate advances. `ready_tx` is held for the supervisor's
+    // lifetime (it lives in this function's scope) so the writer can re-assert
+    // on reconnect.
     if ready_tx.send(true).is_err() {
         warn!("readiness latch receiver gone; service.ready will not be emitted");
     }
