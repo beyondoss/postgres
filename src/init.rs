@@ -98,6 +98,10 @@ mod linux {
 
         let ipv6 = read_cmdline_ipv6();
         if let Some((ref addr, prefix_len, ref gw)) = ipv6 {
+            // `nodad`: address is unique per VM by construction, so DAD only
+            // costs ~2.5s of tentative state during which the IPv6 gateway
+            // (also the primary resolver) is unreachable — stalling early
+            // dependents ~5s. See beyond-pg-init/src/bootsetup.rs.
             run_ip_cmd(
                 &[
                     "-6",
@@ -106,6 +110,7 @@ mod linux {
                     &format!("{addr}/{prefix_len}"),
                     "dev",
                     "eth0",
+                    "nodad",
                 ],
                 "add IPv6 address",
             );
@@ -116,7 +121,7 @@ mod linux {
         }
         if let Some(ref gua) = read_cmdline_ipv6_ext() {
             run_ip_cmd(
-                &["-6", "addr", "add", &format!("{gua}/128"), "dev", "eth0"],
+                &["-6", "addr", "add", &format!("{gua}/128"), "dev", "eth0", "nodad"],
                 "add IPv6 GUA address",
             );
         }

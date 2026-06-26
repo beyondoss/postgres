@@ -170,6 +170,12 @@ fn setup_network() {
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let ipv6 = parse_cmdline_ipv6(&cmdline);
     if let Some((ref addr, prefix_len, ref gw)) = ipv6 {
+        // `nodad`: the address is unique per VM by construction, so Duplicate
+        // Address Detection can never find a conflict — it only adds ~2.5s of
+        // "tentative" state during which the kernel won't source packets from
+        // the address. Since the IPv6 gateway is also the primary resolver
+        // (resolv.conf below), DAD makes internal DNS unreachable for that
+        // whole window, stalling early dependents by ~5s. Skip it.
         run_ip(
             &[
                 "-6",
@@ -178,6 +184,7 @@ fn setup_network() {
                 &format!("{addr}/{prefix_len}"),
                 "dev",
                 "eth0",
+                "nodad",
             ],
             &format!("add IPv6 address {addr}/{prefix_len}"),
         );
@@ -188,7 +195,7 @@ fn setup_network() {
     }
     if let Some(ref gua) = parse_cmdline_ipv6_ext(&cmdline) {
         run_ip(
-            &["-6", "addr", "add", &format!("{gua}/128"), "dev", "eth0"],
+            &["-6", "addr", "add", &format!("{gua}/128"), "dev", "eth0", "nodad"],
             &format!("add IPv6 GUA {gua}/128"),
         );
     }
