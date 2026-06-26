@@ -18,7 +18,7 @@ use crate::mmds::{MmdsConfig, MmdsError, PgTier};
 use crate::pg::{self, PGDATA};
 
 const PG_WAL_LINK: &str = "/var/lib/postgresql/18/main/pg_wal";
-const PG_WAL_TARGET: &str = "/var/lib/postgresql/18/wal";
+const PG_WAL_TARGET: &str = crate::pg::PG_WALDIR;
 const HOOKS_PRE_START: &str = "/etc/postgresql/18/hooks/pre-start.d";
 
 #[derive(Debug, thiserror::Error)]
@@ -216,9 +216,145 @@ async fn maybe_initdb(cfg: &MmdsConfig) -> Result<(), BootError> {
 
     chown_data_tree();
 
+    // Fast path: a pre-baked PGDATA template shipped in the rootfs (image build
+    // ran `beyond-pg build-template`). Copy it onto the fresh volume instead of
+    // running initdb (+ first-boot CREATE EXTENSION) in the guest — both come off
+    // the cold-boot critical path. The supervisor's `post_start` still resets the
+    // per-instance superuser password and runs idempotent `CREATE EXTENSION IF NOT
+    // EXISTS` (no-ops against the baked extensions), so the result is identical to
+    // a runtime initdb.
+    if template_available() {
+        info!("materializing PGDATA from template, skipping initdb");
+        materialize_template()?;
+        return Ok(());
+    }
+
     run_initdb(&cfg.postgres_password).await?;
     Ok(())
 }
+
+/// True iff a complete pre-baked PGDATA template is present in the rootfs.
+fn template_available() -> bool {
+    template_available_in(crate::template::TEMPLATE_DIR)
+}
+
+fn template_available_in(template_dir: &str) -> bool {
+    Path::new(&format!("{template_dir}/main/PG_VERSION")).exists()
+}
+
+/// Copy the baked PGDATA template onto the fresh data volume, then chown it.
+fn materialize_template() -> Result<(), BootError> {
+    materialize_template_into(crate::template::TEMPLATE_DIR, PGDATA, PG_WAL_TARGET)?;
+    chown_data_tree();
+    info!("materialized PGDATA from template");
+    Ok(())
+}
+
+/// Copy the template at `template_dir` (`main/` + `wal/`) onto `pgdata` + `wal_target`.
+///
+/// Atomic + idempotent (per CLAUDE.md): the template is copied into staging dirs
+/// alongside the destinations, the `pg_wal` symlink is repointed to `wal_target`,
+/// the staged data is flushed, and only then are the staging dirs renamed into
+/// place. `pgdata/PG_VERSION` therefore becomes visible only once a complete,
+/// correct PGDATA is published — so `maybe_initdb`'s skip-on-`PG_VERSION` is safe
+/// and an interrupted materialize is simply redone on the next boot.
+fn materialize_template_into(
+    template_dir: &str,
+    pgdata: &str,
+    wal_target: &str,
+) -> Result<(), BootError> {
+    let tmpl_main = format!("{template_dir}/main");
+    let tmpl_wal = format!("{template_dir}/wal");
+    let main_staging = format!("{pgdata}.staging");
+    let wal_staging = format!("{wal_target}.staging");
+
+    // Idempotent clean slate. `pgdata` may exist empty (partial-PGDATA cleanup
+    // recreated it above); a prior interrupted materialize may have left a wal
+    // dir or *.staging dirs.
+    for p in [&main_staging, &wal_staging, &pgdata.to_string(), &wal_target.to_string()] {
+        rm_rf(p)?;
+    }
+
+    // `cp -a` preserves the pg_wal symlink, file modes, and postgres ownership.
+    cp_a(&tmpl_wal, &wal_staging)?;
+    cp_a(&tmpl_main, &main_staging)?;
+
+    // Repoint the baked `pg_wal` symlink (template-relative) to the runtime WAL
+    // dir BEFORE publishing, so a crash after the rename never leaves a wrong
+    // target that `verify_wal_symlink` would reject.
+    let staged_link = format!("{main_staging}/pg_wal");
+    match std::fs::symlink_metadata(&staged_link) {
+        Ok(_) => std::fs::remove_file(&staged_link)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(BootError::Io(e)),
+    }
+    std::os::unix::fs::symlink(wal_target, &staged_link)?;
+
+    // Flush the staged tree (file contents + dir entries) so the data is durable
+    // BEFORE it is published. Then rename atomically — WAL first, then PGDATA, so
+    // `PG_VERSION` only appears once `main` is renamed, by which point both the
+    // symlink and the data are correct and durable. Finally fsync the parent dir
+    // to make the renames themselves durable. Targeted fsync (not a global
+    // sync(2)) keeps this fast and non-blocking under concurrent I/O.
+    fsync_tree(Path::new(&wal_staging))?;
+    fsync_tree(Path::new(&main_staging))?;
+    std::fs::rename(&wal_staging, wal_target)?;
+    std::fs::rename(&main_staging, pgdata)?;
+    if let Some(parent) = Path::new(pgdata).parent() {
+        fsync_dir(parent)?;
+    }
+
+    Ok(())
+}
+
+/// Recursively fsync every file and directory under `path` (depth-first, so each
+/// directory is fsynced after its entries). Symlinks are not followed — the
+/// containing directory's fsync makes the symlink entry durable.
+fn fsync_tree(path: &Path) -> Result<(), BootError> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            fsync_tree(&entry?.path())?;
+        }
+        fsync_dir(path)?;
+    } else if meta.is_file() {
+        std::fs::File::open(path)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// fsync a directory (durably commit its entries). On Linux a directory can be
+/// opened read-only and `fsync`'d via `sync_all`.
+fn fsync_dir(path: &Path) -> Result<(), BootError> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+/// `rm -rf` a path (file, symlink, or directory). Idempotent — a missing path is
+/// not an error.
+fn rm_rf(path: &str) -> Result<(), BootError> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(BootError::Io(e)),
+        Ok(meta) if meta.is_dir() => Ok(std::fs::remove_dir_all(path)?),
+        Ok(_) => Ok(std::fs::remove_file(path)?),
+    }
+}
+
+/// `cp -a src dst` — recursive copy preserving symlinks, modes, and ownership.
+fn cp_a(src: &str, dst: &str) -> Result<(), BootError> {
+    let status = std::process::Command::new("cp")
+        .args(["-a", src, dst])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(BootError::Io(std::io::Error::other(format!(
+            "cp -a {src} {dst} failed: {status}"
+        ))))
+    }
+}
+
 
 /// chown `/var/lib/postgresql` → postgres recursively. A fresh durable volume
 /// mounts root-owned over the image dir, and a root-run `pg_basebackup` (replica
@@ -258,7 +394,7 @@ async fn run_initdb(password: &str) -> Result<(), BootError> {
         .to_str()
         .ok_or_else(|| BootError::Io(std::io::Error::other("tempfile path is not UTF-8")))?;
     info!("running initdb");
-    pg::initdb(PGDATA, path_str)
+    pg::initdb(PGDATA, PG_WAL_TARGET, path_str)
         .await
         .map_err(|e| BootError::InitDb(e.to_string()))
     // pwfile is dropped here — tempfile removes it from disk
@@ -463,6 +599,128 @@ mod tests {
             !pgdata.path().join("recovery.signal").exists(),
             "recovery.signal should be removed when not in PITR mode"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PGDATA template materialize unit tests
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal fake template at `dir`: `main/` with PG_VERSION + a
+    /// template-relative `pg_wal` symlink, and `wal/` with a segment file.
+    fn make_fake_template(dir: &Path) {
+        let tmain = dir.join("main");
+        let twal = dir.join("wal");
+        std::fs::create_dir_all(&tmain).unwrap();
+        std::fs::create_dir_all(&twal).unwrap();
+        std::fs::write(tmain.join("PG_VERSION"), "18\n").unwrap();
+        std::fs::write(tmain.join("postgresql.conf"), "# initdb default\n").unwrap();
+        std::fs::write(twal.join("000000010000000000000001"), b"wal-seg").unwrap();
+        // Baked symlink points template-relative — WRONG for runtime; the
+        // materialize must repoint it to the real wal target.
+        std::os::unix::fs::symlink(&twal, tmain.join("pg_wal")).unwrap();
+    }
+
+    #[test]
+    fn template_available_detects_pg_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("template");
+        assert!(!template_available_in(dir.to_str().unwrap()));
+        std::fs::create_dir_all(dir.join("main")).unwrap();
+        assert!(
+            !template_available_in(dir.to_str().unwrap()),
+            "empty main/ is not a usable template"
+        );
+        std::fs::write(dir.join("main/PG_VERSION"), "18").unwrap();
+        assert!(template_available_in(dir.to_str().unwrap()));
+    }
+
+    #[test]
+    fn materialize_copies_template_and_repoints_wal_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let template = tmp.path().join("template");
+        make_fake_template(&template);
+
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let pgdata = data.join("main");
+        let wal_target = data.join("wal");
+
+        materialize_template_into(
+            template.to_str().unwrap(),
+            pgdata.to_str().unwrap(),
+            wal_target.to_str().unwrap(),
+        )
+        .unwrap();
+
+        // PGDATA + WAL contents present.
+        assert!(pgdata.join("PG_VERSION").exists());
+        assert!(pgdata.join("postgresql.conf").exists());
+        assert!(wal_target.join("000000010000000000000001").exists());
+        // pg_wal repointed to the absolute runtime WAL target (what
+        // verify_wal_symlink expects), not the template-relative path.
+        assert_eq!(
+            std::fs::read_link(pgdata.join("pg_wal")).unwrap(),
+            wal_target
+        );
+        // No staging dirs left behind.
+        assert!(!data.join("main.staging").exists());
+        assert!(!data.join("wal.staging").exists());
+    }
+
+    #[test]
+    fn materialize_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let template = tmp.path().join("template");
+        make_fake_template(&template);
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let pgdata = data.join("main");
+        let wal_target = data.join("wal");
+
+        let run = || {
+            materialize_template_into(
+                template.to_str().unwrap(),
+                pgdata.to_str().unwrap(),
+                wal_target.to_str().unwrap(),
+            )
+        };
+        run().unwrap();
+        // A second materialize over a published PGDATA succeeds (clean-slate
+        // removes the prior copy) and yields the same correct layout.
+        run().unwrap();
+        assert!(pgdata.join("PG_VERSION").exists());
+        assert_eq!(
+            std::fs::read_link(pgdata.join("pg_wal")).unwrap(),
+            wal_target
+        );
+    }
+
+    #[test]
+    fn materialize_recovers_from_leftover_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let template = tmp.path().join("template");
+        make_fake_template(&template);
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let pgdata = data.join("main");
+        let wal_target = data.join("wal");
+
+        // Simulate an interrupted prior run: stale staging dirs + an empty PGDATA
+        // (as partial-PGDATA cleanup would have recreated).
+        std::fs::create_dir_all(data.join("main.staging")).unwrap();
+        std::fs::write(data.join("main.staging/garbage"), b"x").unwrap();
+        std::fs::create_dir_all(data.join("wal.staging")).unwrap();
+        std::fs::create_dir_all(&pgdata).unwrap();
+
+        materialize_template_into(
+            template.to_str().unwrap(),
+            pgdata.to_str().unwrap(),
+            wal_target.to_str().unwrap(),
+        )
+        .unwrap();
+
+        assert!(pgdata.join("PG_VERSION").exists());
+        assert!(!pgdata.join("garbage").exists(), "stale staging must not leak in");
     }
 
     // -----------------------------------------------------------------------

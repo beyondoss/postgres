@@ -45,6 +45,26 @@ pub fn beyond_conf() -> String {
     filter_shared_preload_libraries(BEYOND_CONF, PKGLIBDIR)
 }
 
+/// The `shared_preload_libraries` value (bare comma list, no quotes) from
+/// `00-beyond.conf`, filtered to the libraries actually installed. The template
+/// builder passes this to a build-time postgres (`-c shared_preload_libraries=…`)
+/// so `CREATE EXTENSION pg_cron` / `beyond_queue` — which refuse to load unless
+/// preloaded — succeed against the same set the runtime preloads. Empty string
+/// if `00-beyond.conf` lists no installed preload libraries.
+pub fn preload_libraries() -> String {
+    for line in BEYOND_CONF.lines() {
+        if let Some(rewritten) = filter_preload_line(line, "shared_preload_libraries", PKGLIBDIR) {
+            // `rewritten` is `shared_preload_libraries = '...'` — pull out the
+            // single-quoted value.
+            return rewritten
+                .split_once('=')
+                .map(|(_, v)| v.trim().trim_matches('\'').to_string())
+                .unwrap_or_default();
+        }
+    }
+    String::new()
+}
+
 /// Returns true iff `{pkglibdir}/{lib}.so` exists. Core-postgres libraries
 /// (`pg_stat_statements`, `auto_explain`) are present in any standard install.
 fn library_installed(pkglibdir: &str, lib: &str) -> bool {
