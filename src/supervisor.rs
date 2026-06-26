@@ -1752,69 +1752,36 @@ async fn wait_for_sync_standby(name: &str, timeout: std::time::Duration) {
 // ---------------------------------------------------------------------------
 
 async fn post_start(cfg: &MmdsConfig) -> Result<(), Box<dyn std::error::Error>> {
-    pg::set_superuser_password(&cfg.postgres_password)
-        .await
-        .map_err(|e| format!("failed to set postgres password: {e}"))?;
-
-    setup_pgbouncer_auth()
-        .await
-        .map_err(|e| format!("failed to set up pgbouncer auth: {e}"))?;
-
-    // Required extensions — fail the supervisor if CREATE EXTENSION fails for
-    // an extension whose shared object IS installed; the process manager will
-    // restart and retry rather than running in a degraded state.
-    //
-    // But the standalone postgres primitive ships without the auth/queue
-    // milestone (beyond_auth/beyond_queue) and pgdg's pg_cron (version pin
-    // drift). When an extension's .so isn't installed, treat it as a warning,
-    // not a fatal — the same self-adapting posture as the
-    // shared_preload_libraries filter (see config::beyond_conf). With the
-    // extensions present, the behavior is unchanged (still hard-required).
+    // Resolve the extensions to (idempotently) create: required + optional,
+    // filtered to those whose control file is present. A REQUIRED extension
+    // missing its control file is downgraded to a warning (the standalone image
+    // may ship without the auth/queue milestone) and dropped from the batch.
+    // Same filter the build-time bake (template.rs) uses ⇒ every CREATE EXTENSION
+    // is a no-op against the pre-baked cluster.
+    let mut extensions: Vec<&str> = Vec::new();
     for ext in REQUIRED_EXTENSIONS {
-        if !extension_installed(ext) {
+        if extension_installed(ext) {
+            extensions.push(ext);
+        } else {
             warn!(
-                "required extension {ext} not installed (no {ext}.so in {EXTENSION_PKGLIBDIR}); \
-                 skipping (auth/queue milestone not in this image)"
+                "required extension {ext} not installed (no {ext}.control in \
+                 {EXTENSION_CONTROL_DIR}); skipping (auth/queue milestone not in this image)"
             );
-            continue;
-        }
-        pg::psql(&format!("CREATE EXTENSION IF NOT EXISTS {ext}"))
-            .await
-            .map_err(|e| format!("required extension {ext} failed: {e}"))?;
-    }
-
-    for ext in OPTIONAL_EXTENSIONS {
-        if let Err(e) = pg::psql(&format!("CREATE EXTENSION IF NOT EXISTS {ext}")).await {
-            warn!("optional extension {ext} failed: {e}");
         }
     }
-
-    // Create the `replicator` role when anything needs to stream WAL from us: a
-    // remote replica (replication_password set), a WAL sink, or CDC. Remote
-    // consumers authenticate via scram (pg_hba `host replication replicator`),
-    // so when a replication password is configured we set it — without it the
-    // role is PASSWORD NULL and scram can't succeed.
-    if cfg.replication_password.is_some() || cfg.wal_sink.is_some() || cfg.cdc_enabled {
-        pg::psql(crate::sql::REPLICATOR_ROLE_SQL)
-            .await
-            .map_err(|e| format!("failed to create replicator role: {e}"))?;
-        if let Some(pw) = &cfg.replication_password {
-            pg::set_role_password("replicator", pw)
-                .await
-                .map_err(|e| format!("failed to set replicator password: {e}"))?;
-        }
-    }
+    extensions.extend(OPTIONAL_EXTENSIONS.iter().copied().filter(|e| extension_installed(e)));
 
     if cfg.cdc_enabled {
         warn!("CDC enabled: replication slot 'cdc' will accumulate WAL until a consumer connects");
-        pg::psql(crate::sql::CDC_SLOT_SQL)
-            .await
-            .map_err(|e| format!("failed to create CDC replication slot: {e}"))?;
-
-        pg::psql(crate::sql::CDC_PUBLICATION_SQL)
-            .await
-            .map_err(|e| format!("failed to create CDC publication: {e}"))?;
     }
+
+    // ONE psql invocation for the whole batch (ON_ERROR_STOP) instead of ~15
+    // process spawns + reconnects. Every statement is idempotent and, on a
+    // well-formed image, a no-op or fast role op — so a failure is a real problem
+    // and rightly aborts post_start (→ restart).
+    pg::psql_script(&build_post_start_script(cfg, &extensions))
+        .await
+        .map_err(|e| format!("post-start setup failed: {e}"))?;
 
     boot::run_hook_scripts("/etc/postgresql/18/hooks/post-start.d")
         .await
@@ -1824,39 +1791,49 @@ async fn post_start(cfg: &MmdsConfig) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-async fn setup_pgbouncer_auth() -> Result<(), crate::pg::PgError> {
-    // Create the pgbouncer role and the SECURITY DEFINER auth lookup function.
-    // Idempotent: CREATE IF NOT EXISTS / CREATE OR REPLACE.
-    pg::psql(
-        "DO $$
-         BEGIN
-           IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'pgbouncer') THEN
-             CREATE ROLE pgbouncer LOGIN PASSWORD NULL;
-           END IF;
-         END
-         $$",
-    )
-    .await?;
+/// Build the single post-start SQL script (pure — no I/O, so it's unit-testable).
+/// Order: superuser password → pgbouncer auth → `CREATE EXTENSION IF NOT EXISTS`
+/// per `extensions` → (when WAL consumers exist) replicator role + password →
+/// (when CDC enabled) slot + publication. Every statement is `;`-terminated so
+/// the whole thing runs as one `psql -f -` with `ON_ERROR_STOP=1`.
+fn build_post_start_script(cfg: &MmdsConfig, extensions: &[&str]) -> String {
+    let mut s = String::new();
 
-    pg::psql("CREATE SCHEMA IF NOT EXISTS pgbouncer").await?;
+    // 1. Reset the superuser password from the per-instance MMDS secret.
+    s.push_str(&pg::alter_role_password_sql("postgres", &cfg.postgres_password));
+    s.push_str(";\n");
 
-    pg::psql(
-        "CREATE OR REPLACE FUNCTION pgbouncer.get_auth(p_user text)
-         RETURNS TABLE(username text, password text)
-         SECURITY DEFINER LANGUAGE sql AS $$
-           SELECT usename::text, passwd::text FROM pg_shadow WHERE usename = p_user
-         $$",
-    )
-    .await?;
+    // 2. pgbouncer auth (role + SECURITY DEFINER lookup function + grants).
+    s.push_str(crate::sql::PGBOUNCER_AUTH_SQL);
+    s.push('\n');
 
-    // USAGE on the schema is REQUIRED for the pgbouncer role to call get_auth at
-    // all — without it auth_query fails with "permission denied for schema
-    // pgbouncer" for every client, and no one can connect through the pooler.
-    // (EXECUTE on the function is not enough; the caller also needs schema USAGE.)
-    pg::psql("GRANT USAGE ON SCHEMA pgbouncer TO pgbouncer").await?;
-    pg::psql("GRANT EXECUTE ON FUNCTION pgbouncer.get_auth(text) TO pgbouncer").await?;
+    // 3. Extensions (already filtered to installable by the caller).
+    for ext in extensions {
+        s.push_str(&format!("CREATE EXTENSION IF NOT EXISTS {ext};\n"));
+    }
 
-    Ok(())
+    // 4. replicator role (+ password) when a replica / WAL sink / CDC will stream
+    //    from us. Remote consumers scram-auth (pg_hba `host replication
+    //    replicator`); without a password the role is PASSWORD NULL and scram
+    //    can't succeed.
+    if cfg.replication_password.is_some() || cfg.wal_sink.is_some() || cfg.cdc_enabled {
+        s.push_str(crate::sql::REPLICATOR_ROLE_SQL);
+        s.push_str(";\n");
+        if let Some(pw) = &cfg.replication_password {
+            s.push_str(&pg::alter_role_password_sql("replicator", pw));
+            s.push_str(";\n");
+        }
+    }
+
+    // 5. CDC slot + publication.
+    if cfg.cdc_enabled {
+        s.push_str(crate::sql::CDC_SLOT_SQL);
+        s.push_str(";\n");
+        s.push_str(crate::sql::CDC_PUBLICATION_SQL);
+        s.push_str(";\n");
+    }
+
+    s
 }
 
 // beyond_auth is NOT auto-created here: the beyond-auth service installs its
@@ -1865,32 +1842,43 @@ async fn setup_pgbouncer_auth() -> Result<(), crate::pg::PgError> {
 // an extension would collide with that migration ("function already exists").
 pub(crate) const REQUIRED_EXTENSIONS: &[&str] = &["beyond_queue", "pg_cron"];
 
-/// Directory holding PostgreSQL extension shared objects (PG18 Debian layout,
-/// `pg_config --pkglibdir`). Mirrors `config`'s PKGLIBDIR.
-pub(crate) const EXTENSION_PKGLIBDIR: &str = "/usr/lib/postgresql/18/lib";
+/// Directory holding PostgreSQL extension control files (PG18 Debian layout,
+/// `pg_config --sharedir` + `/extension`). `CREATE EXTENSION <name>` resolves
+/// `{name}.control` here.
+pub(crate) const EXTENSION_CONTROL_DIR: &str = "/usr/share/postgresql/18/extension";
 
-/// True iff the extension's shared object is present in the image. An extension
-/// listed in [`REQUIRED_EXTENSIONS`] but with no installed `.so` (e.g. the
-/// future auth/queue milestone, or a dropped pgdg `pg_cron`) is downgraded from
-/// fatal to a warning so the standalone primitive still boots.
+/// True iff `CREATE EXTENSION {ext}` can find it — i.e. its control file is
+/// present. This is the CORRECT installability test, not the bare `.so`:
+/// preload-only modules (`auto_explain`) ship a `.so` but NO control file, and
+/// `postgis` ships `postgis-3.so` but `postgis.control`. Filtering on the control
+/// file (vs the lib) is what lets the build-time bake (`template.rs`) and runtime
+/// `post_start` agree on the SAME installable set, so every runtime CREATE
+/// EXTENSION is a no-op against the pre-baked cluster. A REQUIRED extension whose
+/// control file is absent is downgraded from fatal to a warning so the standalone
+/// primitive still boots.
 pub(crate) fn extension_installed(ext: &str) -> bool {
-    std::path::Path::new(EXTENSION_PKGLIBDIR)
-        .join(format!("{ext}.so"))
+    std::path::Path::new(EXTENSION_CONTROL_DIR)
+        .join(format!("{ext}.control"))
         .exists()
 }
 
+/// Extensions auto-created on boot when present (no-ops against the pre-baked
+/// cluster). Every entry must be the extension's REAL name (the `.control`
+/// basename) — e.g. pgvector's extension is `vector`. Entries that aren't built
+/// for this image (no control file) are filtered out by [`extension_installed`];
+/// they're omitted here too so the list reflects what actually ships. Preload-only
+/// modules (`auto_explain`, also `pg_stat_statements`) are loaded via
+/// `shared_preload_libraries`, not `CREATE EXTENSION` — `pg_stat_statements` is
+/// kept because it ALSO ships a control file (it exposes a view), but it's the
+/// only such dual case.
 pub(crate) const OPTIONAL_EXTENSIONS: &[&str] = &[
     "pg_stat_statements",
-    "auto_explain",
     "pg_trgm",
-    "pgvector",
-    "pgvectorscale",
+    "vector", // pgvector — the extension is named `vector`
     "pg_partman",
-    "pg_jsonschema",
     "hypopg",
     "pg_repack",
     "postgis",
-    "pg_search",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1950,6 +1938,60 @@ fn parse_memtotal_kib(content: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- post_start batch script (pure) ---
+
+    fn pg_cfg(replication_password: Option<&str>, wal_sink: Option<&str>, cdc: bool) -> MmdsConfig {
+        MmdsConfig {
+            pg_tier: crate::mmds::PgTier::Single,
+            ephemeral: false,
+            postgres_password: "s3cr3t".into(),
+            postgres_database: "postgres".into(),
+            wal_sink: wal_sink.map(str::to_owned),
+            cdc_enabled: cdc,
+            recovery_target_time: None,
+            primary_conninfo: None,
+            replication_password: replication_password.map(str::to_owned),
+            ram_bytes: 4 * 1024 * 1024 * 1024,
+            vcpus: 2,
+        }
+    }
+
+    #[test]
+    fn post_start_script_is_one_terminated_batch() {
+        let s = build_post_start_script(&pg_cfg(None, None, false), &["vector", "postgis"]);
+        // superuser password (dollar-quoted) + pgbouncer auth, each terminated.
+        assert!(s.contains("ALTER ROLE postgres WITH PASSWORD $_beyond_$s3cr3t$_beyond_$;"));
+        assert!(s.contains("CREATE SCHEMA IF NOT EXISTS pgbouncer;"));
+        assert!(s.contains("GRANT EXECUTE ON FUNCTION pgbouncer.get_auth(text) TO pgbouncer;"));
+        // each filtered extension, semicolon-terminated.
+        assert!(s.contains("CREATE EXTENSION IF NOT EXISTS vector;"));
+        assert!(s.contains("CREATE EXTENSION IF NOT EXISTS postgis;"));
+        // nothing replication/CDC when not configured.
+        assert!(!s.contains("replicator"));
+        assert!(!s.contains("PUBLICATION cdc"));
+        // every statement is terminated: no trailing un-`;`d fragment.
+        assert!(s.trim_end().ends_with(';'));
+    }
+
+    #[test]
+    fn post_start_script_adds_replicator_and_cdc_when_enabled() {
+        // WAL sink ⇒ replicator role (no password set); CDC ⇒ slot + publication.
+        let s = build_post_start_script(&pg_cfg(Some("rpw"), Some("http://sink:9000"), true), &[]);
+        assert!(s.contains("CREATE ROLE replicator LOGIN REPLICATION PASSWORD NULL"));
+        assert!(s.contains("ALTER ROLE replicator WITH PASSWORD $_beyond_$rpw$_beyond_$;"));
+        assert!(s.contains("pg_create_logical_replication_slot('cdc'"));
+        assert!(s.contains("CREATE PUBLICATION cdc"));
+        assert!(s.trim_end().ends_with(';'));
+    }
+
+    #[test]
+    fn post_start_script_replicator_without_password_when_only_sink() {
+        // wal_sink alone creates the role but sets NO password (PASSWORD NULL).
+        let s = build_post_start_script(&pg_cfg(None, Some("http://sink:9000"), false), &[]);
+        assert!(s.contains("CREATE ROLE replicator"));
+        assert!(!s.contains("ALTER ROLE replicator WITH PASSWORD"));
+    }
 
     // --- PgBouncer scaler decision (pure) ---
 

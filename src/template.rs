@@ -35,7 +35,7 @@ pub const TEMPLATE_DIR: &str = "/usr/local/share/beyond-pg/pgdata-template";
 
 /// Throwaway superuser password used only while building the template. The
 /// runtime resets the superuser password from the MMDS secret on every boot
-/// (`supervisor::post_start` → `pg::set_superuser_password`), so this value
+/// (`supervisor::post_start` → the post_start password reset), so this value
 /// never reaches a running instance.
 const BUILD_PASSWORD: &str = "beyond-build-template";
 
