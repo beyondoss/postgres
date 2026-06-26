@@ -149,25 +149,57 @@ pub async fn psql_env(sql: &str, env: &[(&str, &str)]) -> Result<(), PgError> {
     Err(PgError::NonZeroExit { code, stderr })
 }
 
-/// Set the superuser password using dollar-quoting to avoid SQL injection.
-///
-/// Dollar-quoting avoids single-quote injection. The password is MMDS-controlled
-/// but correct quoting is still the right habit.
-pub async fn set_superuser_password(pw: &str) -> Result<(), PgError> {
-    set_role_password("postgres", pw).await
+/// Build the dollar-quoted `ALTER ROLE … WITH PASSWORD` statement (no trailing
+/// semicolon, so it composes into a larger script). Dollar-quoting guards against
+/// single-quote injection; the `$_beyond_$` tag is unlikely to appear in a
+/// password (if it does, this breaks — a documented unsupported MMDS edge case).
+pub fn alter_role_password_sql(role: &str, pw: &str) -> String {
+    format!("ALTER ROLE {role} WITH PASSWORD $_beyond_${pw}$_beyond_$")
 }
 
-/// Set a role's password using dollar-quoting (same injection guard as
-/// `set_superuser_password`). `role` is a fixed internal identifier (never user
-/// input); `pw` is MMDS-controlled and dollar-quoted.
-pub async fn set_role_password(role: &str, pw: &str) -> Result<(), PgError> {
-    // Dollar-quote tag chosen to be unlikely to appear in a password. If the
-    // password itself contains `$_beyond_$`, this breaks — documented as an
-    // unsupported edge case in the MMDS field.
-    psql(&format!(
-        "ALTER ROLE {role} WITH PASSWORD $_beyond_${pw}$_beyond_$"
-    ))
-    .await
+/// Run a multi-statement SQL script in a SINGLE `psql` invocation, aborting on
+/// the first error (`ON_ERROR_STOP=1`). Collapses the per-statement process
+/// spawn + reconnect overhead of calling [`psql`] once per statement — used by
+/// post-start setup, which is a fixed batch of idempotent statements.
+pub async fn psql_script(sql: &str) -> Result<(), PgError> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut cmd = Command::new("psql");
+    cmd.args([
+        "-U",
+        POSTGRES_USER,
+        "-h",
+        PG_SOCKET_DIR,
+        "-p",
+        &PG_PORT.to_string(),
+        "-d",
+        "postgres",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-f",
+        "-",
+    ])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::piped());
+    // Same peer-auth requirement as `psql`: drop to the postgres OS user.
+    drop_to_postgres_user(&mut cmd);
+
+    let mut child = cmd.spawn()?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| PgError::Io(std::io::Error::other("psql stdin unavailable")))?;
+        stdin.write_all(sql.as_bytes()).await?;
+        stdin.shutdown().await?;
+    }
+    let out = child.wait_with_output().await?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let code = out.status.code().ok_or(PgError::Signal)?;
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    Err(PgError::NonZeroExit { code, stderr })
 }
 
 // ---------------------------------------------------------------------------

@@ -31,3 +31,27 @@ BEGIN
   END IF;
 END
 $$";
+
+/// pgbouncer auth: the `pgbouncer` login role + the SECURITY DEFINER lookup
+/// function PgBouncer's `auth_query` calls, plus the schema USAGE the role needs
+/// to call it. Idempotent (CREATE IF NOT EXISTS / OR REPLACE), and every
+/// statement is `;`-terminated so it composes into the post-start batch script.
+///
+/// USAGE on the schema is REQUIRED — without it `auth_query` fails with
+/// "permission denied for schema pgbouncer" for every client and no one can
+/// connect through the pooler (EXECUTE on the function alone is not enough).
+pub const PGBOUNCER_AUTH_SQL: &str = "DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'pgbouncer') THEN
+    CREATE ROLE pgbouncer LOGIN PASSWORD NULL;
+  END IF;
+END
+$$;
+CREATE SCHEMA IF NOT EXISTS pgbouncer;
+CREATE OR REPLACE FUNCTION pgbouncer.get_auth(p_user text)
+  RETURNS TABLE(username text, password text)
+  SECURITY DEFINER LANGUAGE sql AS $$
+    SELECT usename::text, passwd::text FROM pg_shadow WHERE usename = p_user
+  $$;
+GRANT USAGE ON SCHEMA pgbouncer TO pgbouncer;
+GRANT EXECUTE ON FUNCTION pgbouncer.get_auth(text) TO pgbouncer;";
