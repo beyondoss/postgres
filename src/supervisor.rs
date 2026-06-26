@@ -1863,23 +1863,23 @@ async fn setup_pgbouncer_auth() -> Result<(), crate::pg::PgError> {
 // authz_check* C functions itself via a raw `CREATE FUNCTION ... AS 'beyond_auth'`
 // migration (loading the shipped beyond_auth.so on demand). Auto-creating it as
 // an extension would collide with that migration ("function already exists").
-const REQUIRED_EXTENSIONS: &[&str] = &["beyond_queue", "pg_cron"];
+pub(crate) const REQUIRED_EXTENSIONS: &[&str] = &["beyond_queue", "pg_cron"];
 
 /// Directory holding PostgreSQL extension shared objects (PG18 Debian layout,
 /// `pg_config --pkglibdir`). Mirrors `config`'s PKGLIBDIR.
-const EXTENSION_PKGLIBDIR: &str = "/usr/lib/postgresql/18/lib";
+pub(crate) const EXTENSION_PKGLIBDIR: &str = "/usr/lib/postgresql/18/lib";
 
 /// True iff the extension's shared object is present in the image. An extension
 /// listed in [`REQUIRED_EXTENSIONS`] but with no installed `.so` (e.g. the
 /// future auth/queue milestone, or a dropped pgdg `pg_cron`) is downgraded from
 /// fatal to a warning so the standalone primitive still boots.
-fn extension_installed(ext: &str) -> bool {
+pub(crate) fn extension_installed(ext: &str) -> bool {
     std::path::Path::new(EXTENSION_PKGLIBDIR)
         .join(format!("{ext}.so"))
         .exists()
 }
 
-const OPTIONAL_EXTENSIONS: &[&str] = &[
+pub(crate) const OPTIONAL_EXTENSIONS: &[&str] = &[
     "pg_stat_statements",
     "auto_explain",
     "pg_trgm",

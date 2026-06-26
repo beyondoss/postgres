@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 /// pg_hba.conf uses peer auth for Unix socket connections; all psql calls must
 /// run as the postgres OS user so peer auth matches the "postgres" database user.
 /// No-op on non-Linux (macOS dev uses host postgres which handles auth itself).
-fn drop_to_postgres_user(
+pub(crate) fn drop_to_postgres_user(
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] cmd: &mut Command,
 ) {
     #[cfg(target_os = "linux")]
@@ -27,6 +27,10 @@ fn drop_to_postgres_user(
 }
 
 pub const PGDATA: &str = "/var/lib/postgresql/18/main";
+/// Runtime WAL directory. `initdb --waldir` points here and the cluster's
+/// `main/pg_wal` symlink targets it. Kept off `PGDATA` so the WAL has its own
+/// path on the data volume (matched by `boot::PG_WAL_TARGET`).
+pub const PG_WALDIR: &str = "/var/lib/postgresql/18/wal";
 pub const PG_SOCKET_DIR: &str = "/var/run/postgresql";
 pub const PG_PORT: u16 = 5433; // Postgres direct; PgBouncer is 5432 (separate process)
 pub const POSTGRES_USER: &str = "postgres";
@@ -194,15 +198,21 @@ pub async fn reload() -> Result<(), PgError> {
 /// Run `initdb` to initialize a new database cluster.
 ///
 /// `pwfile_path` must point to a `0o600` file containing only the superuser
-/// password (created by the caller as a `tempfile::NamedTempFile`).
-pub async fn initdb(pgdata: &str, pwfile_path: &str) -> Result<(), PgError> {
-    debug!("running initdb in {pgdata}");
+/// password (created by the caller as a `tempfile::NamedTempFile`). `waldir` is
+/// where the WAL lives (runtime: [`PG_WALDIR`]; the template builder targets a
+/// template-relative dir so the baked `pg_wal` symlink is repointed on copy).
+///
+/// This is the single source of the canonical `initdb` flag set — both the
+/// runtime first-boot path and the build-time template builder call it, so the
+/// pre-baked cluster can never drift from what the runtime would have produced.
+pub async fn initdb(pgdata: &str, waldir: &str, pwfile_path: &str) -> Result<(), PgError> {
+    debug!("running initdb in {pgdata} (waldir {waldir})");
     let mut cmd = Command::new("initdb");
     cmd.args([
         "-D",
         pgdata,
         "--waldir",
-        "/var/lib/postgresql/18/wal",
+        waldir,
         "--auth=scram-sha-256",
         "--encoding=UTF8",
         "--locale=en_US.UTF-8",
