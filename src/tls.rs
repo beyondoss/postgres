@@ -258,8 +258,8 @@ fn generate_cert(cert_path: &Path, key_path: &Path) -> Result<(), TlsError> {
     // performance; v2 only appends the public key, which the cert already
     // carries). Falls back to rcgen's PEM if the key isn't the expected Ed25519
     // shape (e.g. a future algorithm change).
-    let key_pem = ed25519_pkcs8_v1_pem(&key_pair.serialize_der())
-        .unwrap_or_else(|| key_pair.serialize_pem());
+    let key_pem =
+        ed25519_pkcs8_v1_pem(&key_pair.serialize_der()).unwrap_or_else(|| key_pair.serialize_pem());
     crate::config::write_atomic_bytes_with_mode(key_path, key_pem.as_bytes(), 0o600)?;
 
     Ok(())

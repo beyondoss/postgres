@@ -123,8 +123,7 @@ mod tests {
             #[serde(with = "serde_bytes")]
             bytes: Vec<u8>,
         }
-        let outer: OuterIn =
-            rmp_serde::from_slice(&frame[5..]).expect("decode AppMessagePayload");
+        let outer: OuterIn = rmp_serde::from_slice(&frame[5..]).expect("decode AppMessagePayload");
 
         // 3. Inner workload envelope: [AppKind=46][msgpack_named(payload)].
         let (kind, rest) = outer.bytes.split_first().expect("non-empty inner bytes");
