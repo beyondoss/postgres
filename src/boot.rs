@@ -98,6 +98,26 @@ fn ensure_socket_dir() {
     }
 }
 
+/// Create a per-worker PgBouncer peer socket directory owned by `postgres`.
+/// Idempotent: create_dir_all is a no-op when it exists, and re-chowning is safe.
+/// The socket inside (`.s.PGSQL.5432`) is created by pgbouncer after it drops to
+/// the postgres user, so the directory must be writable by that user.
+fn ensure_peer_socket_dir(peer_id: usize) {
+    let dir = config::pgb_peer_socket_dir(peer_id);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!("ensure_peer_socket_dir: create {dir}: {e}");
+        return;
+    }
+    match std::process::Command::new("chown")
+        .args(["postgres:postgres", &dir])
+        .status()
+    {
+        Ok(s) if s.success() => info!("pgbouncer peer socket dir {dir} ready (owner postgres)"),
+        Ok(s) => warn!("chown {dir} exited {s}; continuing"),
+        Err(e) => warn!("chown {dir} failed to spawn: {e}; continuing"),
+    }
+}
+
 async fn do_boot_primary(cfg: &MmdsConfig) -> Result<(), BootError> {
     info!("boot: step 1/8 maybe_initdb");
     maybe_initdb(cfg).await?;
@@ -552,8 +572,7 @@ mod tests {
         let cfg = test_cfg(Some("http://10.0.0.5:9000"), Some("2026-05-14 03:00:00"));
         write_pitr_config_into(&cfg, pgdata.path()).unwrap();
 
-        let content =
-            std::fs::read_to_string(pgdata.path().join("conf.d/05-pitr.conf")).unwrap();
+        let content = std::fs::read_to_string(pgdata.path().join("conf.d/05-pitr.conf")).unwrap();
         assert!(
             content.contains("restore_command = 'curl -f -s http://10.0.0.5:9000/%f -o %p'"),
             "restore_command wrong: {content}"
@@ -1056,15 +1075,26 @@ fn write_config_files(cfg: &MmdsConfig, tls: &crate::tls::TlsConfig) -> Result<(
     };
     write_atomic(Path::new(PG_HBA_PATH), &hba)?;
 
-    // pgbouncer.ini — overwritten every boot, with client_tls_* keys pointing
-    // at the same cert Postgres uses.
+    // pgbouncer.ini — one config per possible so_reuseport worker, overwritten every
+    // boot, with client_tls_* keys pointing at the same cert Postgres uses. Workers
+    // are spawned lazily by the scaler, but all their configs (and peer socket dirs)
+    // are laid down up front so the shared [peers] map is stable and a scaled-up
+    // worker never waits on config. peer_id 1 keeps the canonical pgbouncer.ini.
     if let Some(parent) = Path::new(PGBOUNCER_INI_PATH).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    write_atomic(
-        Path::new(PGBOUNCER_INI_PATH),
-        &config::pgbouncer_ini(tls, cfg.ram_bytes, cfg.vcpus),
-    )?;
+    let max_workers = config::pgbouncer_max_workers(cfg.vcpus);
+    for peer_id in 1..=max_workers {
+        write_atomic(
+            Path::new(&config::pgbouncer_ini_path(peer_id)),
+            &config::pgbouncer_ini(tls, cfg.ram_bytes, cfg.vcpus, peer_id),
+        )?;
+        // Peer socket dir must exist and be writable by the postgres user pgbouncer
+        // drops to (only created when peering is active, i.e. max_workers > 1).
+        if max_workers > 1 {
+            ensure_peer_socket_dir(peer_id);
+        }
+    }
 
     Ok(())
 }

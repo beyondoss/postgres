@@ -41,7 +41,10 @@ pub fn mount_from_mmds() {
     if attachments.is_empty() {
         return;
     }
-    eprintln!("[init] mounting {} data volume(s) from MMDS", attachments.len());
+    eprintln!(
+        "[init] mounting {} data volume(s) from MMDS",
+        attachments.len()
+    );
     mount_data_volumes(&attachments);
 }
 
@@ -77,7 +80,10 @@ fn parse_attachments(val: &Value) -> Vec<AttachmentMeta> {
                 path: v["path"].as_str()?.to_string(),
                 fstype: v["fstype"].as_str().unwrap_or("ext4").to_string(),
                 readonly: v["readonly"].as_bool().unwrap_or(false),
-                storage_class: v["storage_class"].as_str().unwrap_or("standard").to_string(),
+                storage_class: v["storage_class"]
+                    .as_str()
+                    .unwrap_or("standard")
+                    .to_string(),
             })
         })
         .collect()
@@ -100,7 +106,10 @@ fn mount_data_volumes(attachments: &[AttachmentMeta]) {
 
 fn mount_one(a: &AttachmentMeta) -> Result<(), String> {
     if !wait_for_device(&a.device) {
-        return Err(format!("device {} not present after {DEVICE_WAIT:?}", a.device));
+        return Err(format!(
+            "device {} not present after {DEVICE_WAIT:?}",
+            a.device
+        ));
     }
 
     ensure_dir(&a.path)?;
@@ -182,7 +191,10 @@ fn is_mounted(path: &str, device: &str) -> Result<bool, String> {
 /// Return the device currently mounted at `path`, or `None` if nothing is.
 fn mounted_device(path: &str) -> Result<Option<String>, String> {
     let info = read_mountinfo()?;
-    Ok(info.into_iter().find(|(mp, _)| mp == path).map(|(_, dev)| dev))
+    Ok(info
+        .into_iter()
+        .find(|(mp, _)| mp == path)
+        .map(|(_, dev)| dev))
 }
 
 fn read_mountinfo() -> Result<Vec<(String, String)>, String> {
@@ -312,9 +324,13 @@ mod tests {
 
     #[test]
     fn parse_mountinfo_extracts_mountpoint_and_source() {
-        let line = "36 35 8:1 / /var/lib/postgresql rw,noatime shared:1 - ext4 /dev/vdb rw,data=ordered";
+        let line =
+            "36 35 8:1 / /var/lib/postgresql rw,noatime shared:1 - ext4 /dev/vdb rw,data=ordered";
         let entries = parse_mountinfo(line);
-        assert_eq!(entries, vec![("/var/lib/postgresql".to_string(), "/dev/vdb".to_string())]);
+        assert_eq!(
+            entries,
+            vec![("/var/lib/postgresql".to_string(), "/dev/vdb".to_string())]
+        );
     }
 
     #[test]

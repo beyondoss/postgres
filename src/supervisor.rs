@@ -1412,8 +1412,12 @@ fn spawn_pgbouncer(
     state: &mut ChildState,
     log_tx: &mpsc::Sender<LogFrame>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Each so_reuseport worker runs its own config (distinct peer_id + unix_socket_dir);
+    // the stable name maps to a fixed peer_id, so respawns/handoffs keep the same slot.
+    let peer_id = crate::config::pgb_peer_id(state.name);
+    let ini = crate::config::pgbouncer_ini_path(peer_id);
     let mut cmd = Command::new("pgbouncer");
-    cmd.arg("/etc/pgbouncer/pgbouncer.ini")
+    cmd.arg(&ini)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null());
@@ -1434,7 +1438,11 @@ fn spawn_pgbouncer(
     );
     spawn_async_reader_task(ExecStream::Stderr, stderr, log_tx.clone(), execution_id);
 
-    info!("pgbouncer spawned (pid={})", child.id().unwrap_or(0));
+    info!(
+        "pgbouncer '{}' spawned (pid={}, peer_id={peer_id}, ini={ini})",
+        state.name,
+        child.id().unwrap_or(0)
+    );
     state.record_start(child);
     Ok(())
 }

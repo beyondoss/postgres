@@ -57,7 +57,9 @@ pub enum MmdsError {
     InvalidPassword,
     #[error("BEYOND_PG_PRIMARY_CONNINFO is required when BEYOND_PG_TIER=replica")]
     MissingPrimaryConninfo,
-    #[error("BEYOND_PG_RECOVERY_TARGET_TIME requires BEYOND_PG_WAL_SINK (the WAL source to replay from)")]
+    #[error(
+        "BEYOND_PG_RECOVERY_TARGET_TIME requires BEYOND_PG_WAL_SINK (the WAL source to replay from)"
+    )]
     RecoveryTargetWithoutWalSource,
     #[error("MMDS metadata not available: {0}")]
     Unavailable(String),
@@ -252,8 +254,8 @@ mod tests {
             .expect("should parse");
         assert_eq!(cfg.replication_password.as_deref(), Some("replpw"));
         // Empty string is treated as absent (same as the other optional keys).
-        let cfg2 = parse(base_meta(&[("BEYOND_PG_REPLICATION_PASSWORD", "")]))
-            .expect("should parse");
+        let cfg2 =
+            parse(base_meta(&[("BEYOND_PG_REPLICATION_PASSWORD", "")])).expect("should parse");
         assert!(cfg2.replication_password.is_none());
     }
 
