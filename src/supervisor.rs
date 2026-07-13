@@ -1950,6 +1950,10 @@ pub(crate) const OPTIONAL_EXTENSIONS: &[&str] = &[
     "hypopg",
     "pg_repack",
     "postgis",
+    // pg_prewarm: the SQL side (manual `pg_prewarm('tbl')`). The part that
+    // actually matters — the autoprewarm background worker — comes from the
+    // `shared_preload_libraries` entry in 00-beyond.conf, not from this.
+    "pg_prewarm",
 ];
 
 // ---------------------------------------------------------------------------
