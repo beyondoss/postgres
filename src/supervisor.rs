@@ -740,11 +740,8 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
     // Depth 1: if a retune is already queued, a newer request is dropped and the
     // watcher re-evaluates on its next tick against whatever RAM we settle at.
     let (retune_tx, mut retune_rx) = mpsc::channel::<u64>(1);
-    let memory_watcher_handle = tokio::spawn(memory_watcher_task(
-        cfg.vcpus,
-        cfg.ram_bytes,
-        retune_tx,
-    ));
+    let memory_watcher_handle =
+        tokio::spawn(memory_watcher_task(cfg.vcpus, cfg.ram_bytes, retune_tx));
 
     // Background: watch the platform TLS cert for rotation, if applicable.
     // The guest agent atomically replaces /run/beyond/tls/cert.pem every ~22h.
@@ -1840,7 +1837,12 @@ async fn post_start(cfg: &MmdsConfig) -> Result<(), Box<dyn std::error::Error>> 
             );
         }
     }
-    extensions.extend(OPTIONAL_EXTENSIONS.iter().copied().filter(|e| extension_installed(e)));
+    extensions.extend(
+        OPTIONAL_EXTENSIONS
+            .iter()
+            .copied()
+            .filter(|e| extension_installed(e)),
+    );
 
     if cfg.cdc_enabled {
         warn!("CDC enabled: replication slot 'cdc' will accumulate WAL until a consumer connects");
@@ -1871,7 +1873,10 @@ fn build_post_start_script(cfg: &MmdsConfig, extensions: &[&str]) -> String {
     let mut s = String::new();
 
     // 1. Reset the superuser password from the per-instance MMDS secret.
-    s.push_str(&pg::alter_role_password_sql("postgres", &cfg.postgres_password));
+    s.push_str(&pg::alter_role_password_sql(
+        "postgres",
+        &cfg.postgres_password,
+    ));
     s.push_str(";\n");
 
     // 2. pgbouncer auth (role + SECURITY DEFINER lookup function + grants).

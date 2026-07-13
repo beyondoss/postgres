@@ -121,7 +121,15 @@ mod linux {
         }
         if let Some(ref gua) = read_cmdline_ipv6_ext() {
             run_ip_cmd(
-                &["-6", "addr", "add", &format!("{gua}/128"), "dev", "eth0", "nodad"],
+                &[
+                    "-6",
+                    "addr",
+                    "add",
+                    &format!("{gua}/128"),
+                    "dev",
+                    "eth0",
+                    "nodad",
+                ],
                 "add IPv6 GUA address",
             );
         }
