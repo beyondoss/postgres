@@ -70,6 +70,31 @@ struct GuestResourceStatsPayload {
     psi_mem_some_avg10: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     psi_mem_full_avg10: Option<f64>,
+    /// Cumulative `workingset_refault_file` from `/proc/vmstat`: file pages
+    /// evicted from the page cache and then read back in.
+    ///
+    /// Reported so the host can right-size this VM's memory. Postgres is
+    /// page-cache-bound and reads with `read()`, not `mmap`, so when its working
+    /// set outgrows RAM it does not swap, takes no major faults and never stalls
+    /// on reclaim — measured on a real VM (1.8 GB working set, 735 MiB RAM):
+    /// PSI 0.00, swap 0, major faults 0/tick. None of the usual memory-pressure
+    /// signals move. Refaults are the one counter that does: re-reading a page we
+    /// just evicted is precisely "the working set does not fit".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workingset_refault_file: Option<u64>,
+}
+
+/// Read cumulative `workingset_refault_file` from `/proc/vmstat`.
+fn read_workingset_refault_file() -> Option<u64> {
+    let raw = std::fs::read_to_string("/proc/vmstat").ok()?;
+    parse_workingset_refault_file(&raw)
+}
+
+/// Parse `workingset_refault_file` from `/proc/vmstat` text. Split out from the
+/// file read so it's testable without `/proc`.
+fn parse_workingset_refault_file(raw: &str) -> Option<u64> {
+    raw.lines()
+        .find_map(|l| l.strip_prefix("workingset_refault_file ")?.trim().parse().ok())
 }
 
 /// Read Linux PSI memory pressure `(some.avg10, full.avg10)` from
@@ -107,6 +132,7 @@ fn encode_resource_stats_frame() -> Option<Vec<u8>> {
         disk_used_bytes: 0,
         psi_mem_some_avg10: Some(some),
         psi_mem_full_avg10: Some(full),
+        workingset_refault_file: read_workingset_refault_file(),
     };
     let body = rmp_serde::to_vec_named(&payload).ok()?;
     Some(encode_frame(MSG_GUEST_RESOURCE_STATS, &body))
