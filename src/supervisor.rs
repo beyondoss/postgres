@@ -734,8 +734,17 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
         spawn_incumbent_thread(rpc_state.clone())?
     };
 
-    // Background: update reload-safe tuning params when virtio-mem changes RAM
-    let memory_watcher_handle = tokio::spawn(memory_watcher_task(cfg.vcpus, cfg.ram_bytes));
+    // Background: follow virtio-mem RAM changes. Reload-safe params the watcher
+    // applies itself; postmaster-context params (shared_buffers) need a restart,
+    // which only this loop can perform — the watcher asks for it over `retune_rx`.
+    // Depth 1: if a retune is already queued, a newer request is dropped and the
+    // watcher re-evaluates on its next tick against whatever RAM we settle at.
+    let (retune_tx, mut retune_rx) = mpsc::channel::<u64>(1);
+    let memory_watcher_handle = tokio::spawn(memory_watcher_task(
+        cfg.vcpus,
+        cfg.ram_bytes,
+        retune_tx,
+    ));
 
     // Background: watch the platform TLS cert for rotation, if applicable.
     // The guest agent atomically replaces /run/beyond/tls/cert.pem every ~22h.
@@ -776,6 +785,9 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
     scaler_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     info!("supervisor running");
+
+    // Set by the retune arm, drained after the select! ends (see there for why).
+    let mut pending_retune: Option<u64> = None;
 
     // Main supervision loop
     loop {
@@ -916,6 +928,31 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
                     ScaleOutcome::NoOp => {}
                 }
             }
+            // virtio-mem moved RAM far enough that shared_buffers must change.
+            // Only recorded here — the postgres-exit arm above holds `&mut pg_state`
+            // for the lifetime of this select!, so the restart runs once it ends.
+            Some(ram_bytes) = retune_rx.recv() => {
+                pending_retune = Some(ram_bytes);
+            }
+        }
+
+        if let Some(ram_bytes) = pending_retune.take() {
+            if let Err(e) = retune_postmaster(
+                ram_bytes,
+                cfg.vcpus,
+                &mut pg_state,
+                &pgb_state,
+                &pgb_extra,
+                &log_tx,
+            )
+            .await
+            {
+                // Postgres is either back up or in the normal crash-restart path;
+                // either way this loop stays alive and keeps supervising.
+                error!("retune failed: {e}");
+            }
+            #[cfg(target_os = "linux")]
+            persist_child(&mut persisted, &pg_state)?;
         }
     }
 }
@@ -942,6 +979,32 @@ fn sighup_pgbouncer(state: &ChildState) {
         let _ = pid; // suppress unused warning on non-Linux dev hosts
         info!("pgbouncer: SIGHUP skipped (non-Linux build)");
     }
+}
+
+/// PAUSE a PgBouncer worker (SIGUSR1 — "same as issuing PAUSE on the console").
+///
+/// PAUSE disconnects each server connection *after waiting for it to be released*
+/// per the pool mode, and new client queries then **queue** rather than error
+/// ("new client connections to a paused database will wait until RESUME"). That
+/// is what lets us restart the postmaster underneath live clients: they see a
+/// stall, not a dropped connection.
+fn pause_pgbouncer(state: &ChildState) {
+    signal_pgbouncer(state, libc::SIGUSR1, "PAUSE");
+}
+
+/// RESUME a paused PgBouncer worker (SIGUSR2). Must run on every path out of a
+/// retune — a pooler left paused is an outage.
+fn resume_pgbouncer(state: &ChildState) {
+    signal_pgbouncer(state, libc::SIGUSR2, "RESUME");
+}
+
+fn signal_pgbouncer(state: &ChildState, sig: i32, what: &str) {
+    let Some(pid) = state.pid() else {
+        info!("pgbouncer: no live child, {what} skipped");
+        return;
+    };
+    send_signal_to_pid(pid, sig);
+    info!("pgbouncer: {what} sent (pid={pid})");
 }
 
 /// Send SIGINT to a PgBouncer worker for a *graceful* shutdown ("safe shutdown":
@@ -1887,14 +1950,60 @@ pub(crate) const OPTIONAL_EXTENSIONS: &[&str] = &[
     "hypopg",
     "pg_repack",
     "postgis",
+    // pg_prewarm: the SQL side (manual `pg_prewarm('tbl')`). The part that
+    // actually matters — the autoprewarm background worker — comes from the
+    // `shared_preload_libraries` entry in 00-beyond.conf, not from this.
+    "pg_prewarm",
 ];
 
 // ---------------------------------------------------------------------------
-// Memory watcher — updates reload-safe tuning on virtio-mem hotplug
+// Memory watcher — follows virtio-mem RAM changes across BOTH tuning halves
 // ---------------------------------------------------------------------------
+//
+// The VM's memory is elastic: it boots with only part of its RAM online and the
+// rest is hot-plugged in as the guest comes under pressure. A guest that only
+// reads its RAM at boot is permanently mis-tuned for the size it ends up at.
+//
+// The tuning splits by *how* a parameter can change:
+//
+//   02-memory.conf  reload-safe (effective_cache_size, work_mem, ...) — a
+//                   SIGHUP is enough, so the watcher applies these in place.
+//   01-tuning.conf  postmaster-context (shared_buffers above all) — postgres
+//                   fixes these at startup and cannot be talked out of them.
+//                   The ONLY way to follow RAM here is to restart the postmaster,
+//                   which the watcher asks the supervisor loop to do.
+//
+// The restart is hidden behind a pgbouncer PAUSE, so clients stall rather than
+// see errors. It is gated by hysteresis, because it is not free.
 
-async fn memory_watcher_task(vcpus: u32, initial_ram_bytes: u64) {
+/// How far `shared_buffers` must move before a restart is worth it (±25%).
+const RETUNE_MIN_RATIO: f64 = 1.25;
+/// Floor on the interval between retune cycles, so a flapping balloon can't put
+/// the postmaster into a restart loop.
+const RETUNE_MIN_INTERVAL: Duration = Duration::from_secs(120);
+/// Grace for pgbouncer to finish draining server connections after PAUSE.
+const RETUNE_PAUSE_GRACE: Duration = Duration::from_secs(3);
+/// How long to wait for the restarted postmaster before resuming pgbouncer anyway.
+const RETUNE_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// True when RAM has moved enough to shift `shared_buffers` by >= `RETUNE_MIN_RATIO`
+/// in either direction — the test for "is this worth a postmaster restart?".
+fn shared_buffers_moved_enough(tuned_ram: u64, new_ram: u64) -> bool {
+    let old = config::shared_buffers_mb(tuned_ram) as f64;
+    let new = config::shared_buffers_mb(new_ram) as f64;
+    if old <= 0.0 {
+        return false;
+    }
+    let ratio = new / old;
+    ratio >= RETUNE_MIN_RATIO || ratio <= 1.0 / RETUNE_MIN_RATIO
+}
+
+async fn memory_watcher_task(vcpus: u32, initial_ram_bytes: u64, retune_tx: mpsc::Sender<u64>) {
     let mut last_ram_bytes = initial_ram_bytes;
+    // RAM that the *running postmaster's* postmaster-context params were derived
+    // from. Only a completed retune moves this.
+    let mut tuned_ram_bytes = initial_ram_bytes;
+    let mut last_retune: Option<Instant> = None;
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let ram_bytes = match read_memtotal_bytes().await {
@@ -1907,6 +2016,8 @@ async fn memory_watcher_task(vcpus: u32, initial_ram_bytes: u64) {
             continue;
         }
         last_ram_bytes = ram_bytes;
+
+        // --- reload-safe half: apply in place ---
         let content = config::tuning_conf_adaptive(ram_bytes, vcpus);
         match config::write_atomic(std::path::Path::new(&config::memory_conf_path()), &content) {
             Ok(()) => info!(
@@ -1922,7 +2033,114 @@ async fn memory_watcher_task(vcpus: u32, initial_ram_bytes: u64) {
             Ok(()) => info!("memory watcher: reloaded postgres config"),
             Err(e) => warn!("memory watcher: pg_reload_conf failed: {e}"),
         }
+
+        // --- postmaster-context half: needs a restart, so ask the loop for one ---
+        if !shared_buffers_moved_enough(tuned_ram_bytes, ram_bytes) {
+            continue;
+        }
+        if last_retune.is_some_and(|t| t.elapsed() < RETUNE_MIN_INTERVAL) {
+            info!("memory watcher: retune due but within cooldown; deferring");
+            continue;
+        }
+        info!(
+            "memory watcher: RAM {} MB -> shared_buffers would move {} MB -> {} MB; requesting retune",
+            ram_bytes / (1024 * 1024),
+            config::shared_buffers_mb(tuned_ram_bytes),
+            config::shared_buffers_mb(ram_bytes),
+        );
+        match retune_tx.try_send(ram_bytes) {
+            Ok(()) => {
+                tuned_ram_bytes = ram_bytes;
+                last_retune = Some(Instant::now());
+            }
+            // Full = a retune is already queued; dropping this one is correct,
+            // the next tick re-evaluates against the RAM we actually end up with.
+            Err(e) => warn!("memory watcher: could not queue retune: {e}"),
+        }
     }
+}
+
+/// Re-derive the postmaster-context tuning for `ram_bytes` and restart postgres
+/// into it, hiding the restart behind a pgbouncer PAUSE.
+///
+/// Ordering is load-bearing:
+///   1. write `01-tuning.conf` — what the postmaster will read on the way up
+///   2. resize the hugepage reservation — `huge_pages = on` means postgres will
+///      REFUSE TO START if the pages aren't there, so this must precede the stop
+///   3. PAUSE pgbouncer — drains in-flight transactions, queues new clients
+///   4. fast-shutdown + respawn the postmaster
+///   5. RESUME pgbouncer — on EVERY path out, including failure. A pooler left
+///      paused is an outage, which would be a worse bug than the one we're fixing.
+async fn retune_postmaster(
+    ram_bytes: u64,
+    vcpus: u32,
+    pg: &mut ChildState,
+    pgb: &ChildState,
+    pgb_extra: &[ChildState],
+    log_tx: &mpsc::Sender<LogFrame>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sb_mb = config::shared_buffers_mb(ram_bytes);
+    info!(
+        "retune: visible RAM {} MB -> shared_buffers {} MB",
+        ram_bytes / (1024 * 1024),
+        sb_mb
+    );
+
+    config::write_atomic(
+        std::path::Path::new(&config::tuning_conf_path()),
+        &config::tuning_conf_boot(ram_bytes, vcpus),
+    )?;
+    crate::boot::apply_hugepages(sb_mb);
+
+    // Postgres is down and in restart backoff: the config is on disk, so the
+    // pending respawn picks it up. Nothing to pause, nothing to restart.
+    if pg.handle.is_none() {
+        info!("retune: postgres not running; new config will apply on its next start");
+        return Ok(());
+    }
+
+    pause_pgbouncer(pgb);
+    for w in pgb_extra {
+        pause_pgbouncer(w);
+    }
+    tokio::time::sleep(RETUNE_PAUSE_GRACE).await;
+
+    let result = restart_postmaster(pg, log_tx).await;
+
+    resume_pgbouncer(pgb);
+    for w in pgb_extra {
+        resume_pgbouncer(w);
+    }
+
+    match &result {
+        Ok(()) => info!("retune: complete, shared_buffers now {sb_mb} MB"),
+        Err(e) => error!("retune: failed ({e}); pgbouncer resumed"),
+    }
+    result
+}
+
+/// Fast-shutdown postgres and bring it straight back up. No restart backoff: this
+/// is a deliberate restart, not a crash.
+async fn restart_postmaster(
+    pg: &mut ChildState,
+    log_tx: &mpsc::Sender<LogFrame>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SIGINT = fast shutdown. pgbouncer has already released the server
+    // connections, so there is no in-flight transaction left to abort.
+    if let Some(pid) = pg.pid() {
+        info!("retune: fast-shutdown postgres (pid={pid})");
+        send_signal_to_pid(pid, libc::SIGINT);
+    }
+    if let Some(ref mut handle) = pg.handle {
+        let code = handle.wait().await?;
+        pg.on_exit(code);
+    }
+
+    spawn_postgres(pg, log_tx)?;
+    if !pg::wait_until_ready(RETUNE_READY_TIMEOUT).await {
+        return Err("postgres did not become ready after retune".into());
+    }
+    Ok(())
 }
 
 async fn read_memtotal_bytes() -> Option<u64> {
@@ -1946,6 +2164,43 @@ fn parse_memtotal_kib(content: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- retune hysteresis (pure) ---
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn retune_fires_when_the_substrate_plugs_real_memory() {
+        // The case that matters: booted with a fraction of its RAM online, then
+        // grown. shared_buffers 183MB -> 512MB is worth a restart.
+        assert!(shared_buffers_moved_enough(735 * MIB, 2016 * MIB));
+    }
+
+    #[test]
+    fn retune_declines_a_move_too_small_to_pay_for_a_restart() {
+        // A single small hotplug step: 735 -> 880 MiB moves shared_buffers
+        // 183MB -> 220MB, only ~20%. Not worth bouncing the postmaster.
+        assert!(!shared_buffers_moved_enough(735 * MIB, 880 * MIB));
+    }
+
+    #[test]
+    fn retune_fires_on_shrink_too() {
+        // Memory unplugged back to base: shared_buffers must come down, or the
+        // postmaster is sized for RAM the guest no longer has.
+        assert!(shared_buffers_moved_enough(2016 * MIB, 735 * MIB));
+    }
+
+    #[test]
+    fn retune_ignores_noise() {
+        assert!(!shared_buffers_moved_enough(2016 * MIB, 2020 * MIB));
+    }
+
+    #[test]
+    fn retune_respects_the_shared_buffers_floor() {
+        // Below the 128MB floor both sides clamp equal, so there is nothing to do
+        // and we must not restart in a loop over it.
+        assert!(!shared_buffers_moved_enough(64 * MIB, 200 * MIB));
+    }
 
     // --- post_start batch script (pure) ---
 

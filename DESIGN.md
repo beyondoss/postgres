@@ -412,7 +412,14 @@ subcommand because there's no external invoker that needs a CLI surface.
    max_parallel_workers_per_gather = {clamp(vcpus / 2, 1, 4)}
    max_parallel_maintenance_workers = {clamp(vcpus / 2, 1, 4)}
    ```
-   Regenerated every boot so resized VMs pick up new defaults.
+   Regenerated every boot so resized VMs pick up new defaults — and, because
+   the VM's memory is elastic (it boots with only part of its RAM online and
+   the rest is hot-plugged in later), regenerated *again* whenever visible
+   RAM moves.
+   The reload-safe half (`02-memory.conf`) is applied with `pg_reload_conf()`;
+   the postmaster-context half (`01-tuning.conf` — `shared_buffers` above all)
+   requires a postmaster restart, which the supervisor performs behind a
+   PgBouncer `PAUSE` so clients stall instead of erroring. See DECISIONS F-011.
 
    **Why this `work_mem` formula** (instead of `ram * 0.01 / max_connections`):
    `work_mem` is allocated per sort/hash _node_ in the query plan, not per

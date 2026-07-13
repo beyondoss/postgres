@@ -291,8 +291,30 @@ pub fn pgbouncer_ini(
 // Generated: 01-tuning.conf  (postmaster-context — restart required)
 // ---------------------------------------------------------------------------
 
+/// `shared_buffers`, in MB, for a VM with `ram_bytes` of visible RAM.
+///
+/// 25% of RAM, floor 128MB. Single source of truth: the postmaster config, the
+/// hugepage reservation that must back it (`boot::apply_hugepages`), and the
+/// memory watcher's "is a retune worth a restart?" test all derive from this, and
+/// they must not be able to drift apart.
+///
+/// Ref: PostgreSQL docs §20.4; pganalyze shared_buffers benchmark (2024) —
+/// 25% is optimal up to ~64 GB; gains plateau above 40% due to double-buffering.
+pub fn shared_buffers_mb(ram_bytes: u64) -> u64 {
+    (ram_bytes / (1024 * 1024) / 4).max(128)
+}
+
+/// Number of 2 MB hugepages needed to back `shared_buffers_mb`, plus 32 pages
+/// (64 MB) of headroom for WAL buffers and the rest of the shared-memory segment.
+pub fn nr_hugepages_for(shared_buffers_mb: u64) -> u64 {
+    shared_buffers_mb / 2 + 32
+}
+
 /// Postmaster-context parameters — require a Postgres restart to take effect.
-/// Written once at boot; not touched by the memory watcher.
+///
+/// Written at boot, and rewritten by the memory watcher's retune cycle when
+/// virtio-mem changes visible RAM enough to move `shared_buffers` — the postmaster
+/// is then restarted behind a pgbouncer PAUSE so the new values take effect.
 pub fn tuning_conf_boot(ram_bytes: u64, vcpus: u32) -> String {
     let ram_mb = ram_bytes / (1024 * 1024);
     let pool_size = pgbouncer_pool_size(vcpus); // server connections PgBouncer opens
@@ -307,10 +329,7 @@ pub fn tuning_conf_boot(ram_bytes: u64, vcpus: u32) -> String {
     // Ref: PostgreSQL wiki "Number Of Database Connections"; Mattermost PgBouncer study
     let max_connections = (pool_size + vcpus * 2 + 10).clamp(100, (ram_mb / 50).max(100));
 
-    // shared_buffers: 25% of RAM, floor 128MB.
-    // Ref: PostgreSQL docs §20.4; pganalyze shared_buffers benchmark (2024) —
-    // 25% is optimal up to ~64 GB; gains plateau above 40% due to double-buffering.
-    let shared_buffers_mb = (ram_mb / 4).max(128);
+    let shared_buffers_mb = shared_buffers_mb(ram_bytes);
 
     // wal_buffers: replicates Postgres auto-tune (wal_buffers=-1 = shared_buffers/32).
     // 16 MB ceiling is the historical single-WAL-segment size and is sufficient for

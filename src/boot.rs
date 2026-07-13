@@ -136,8 +136,7 @@ async fn do_boot_primary(cfg: &MmdsConfig) -> Result<(), BootError> {
     write_config_files(cfg, &tls)?;
     info!("boot: step 7/8 write_pitr_config");
     write_pitr_config(cfg)?;
-    let shared_buffers_mb = (cfg.ram_bytes / (1024 * 1024) / 4).max(128);
-    apply_kernel_settings(shared_buffers_mb);
+    apply_kernel_settings(config::shared_buffers_mb(cfg.ram_bytes));
 
     info!("boot: step 8/8 run_hook_scripts");
     run_hook_scripts(HOOKS_PRE_START).await?;
@@ -190,8 +189,7 @@ async fn do_boot_replica(cfg: &MmdsConfig) -> Result<(), BootError> {
     // root-owned; postgres refuses to start on a non-postgres-owned data dir.
     chown_data_tree();
 
-    let shared_buffers_mb = (cfg.ram_bytes / (1024 * 1024) / 4).max(128);
-    apply_kernel_settings(shared_buffers_mb);
+    apply_kernel_settings(config::shared_buffers_mb(cfg.ram_bytes));
 
     run_hook_scripts(HOOKS_PRE_START).await?;
 
@@ -1124,47 +1122,101 @@ fn apply_kernel_settings(shared_buffers_mb: u64) {
         Err(e) => warn!("could not set transparent hugepages: {e}"),
     }
 
-    // Static hugepages: reserve enough 2 MB pages to back shared_buffers, plus
-    // 32 pages (64 MB) of overhead for WAL buffers and other shared memory in
-    // the same segment.
-    // Percona benchmark: TLB faults drop from ~200k/s to near zero with hugepages.
-    // Ref: Percona "Benchmark PostgreSQL with Linux HugePages";
-    //      PostgreSQL docs §19.4 "Managing Kernel Resources"
-    let nr_hugepages = shared_buffers_mb / 2 + 32;
-    let hugepages_reserved =
-        match std::fs::write("/proc/sys/vm/nr_hugepages", format!("{nr_hugepages}\n")) {
-            Ok(()) => {
-                info!(
-                    "reserved {nr_hugepages} hugepages ({} MB)",
-                    nr_hugepages * 2
-                );
-                true
-            }
-            Err(e) => {
-                warn!("could not set nr_hugepages: {e}");
-                false
-            }
-        };
+    apply_hugepages(shared_buffers_mb);
+}
 
-    // The tuning conf hardcodes `huge_pages = on`. That's the right
-    // production default — postgres fails fast if its hugepage reservation
-    // wasn't successfully provisioned, rather than silently falling back
-    // to regular pages and giving up the TLB win. In environments where
-    // we *couldn't* reserve hugepages (unprivileged containers, dev hosts
-    // with locked-down sysfs), forcing `on` would make postgres refuse to
-    // start. Detect that and override with `try` via a high-numbered
-    // conf.d file so postgres still boots cleanly.
-    if !hugepages_reserved {
-        let override_path = format!("{PGDATA}/conf.d/99-hugepages-fallback.conf");
-        let body = "# Generated automatically when nr_hugepages reservation\n\
-                    # failed at boot (apply_kernel_settings). Postgres tries\n\
-                    # hugepages and falls back to anonymous shmem if unavailable.\n\
-                    huge_pages = try\n";
-        match config::write_atomic(Path::new(&override_path), body) {
-            Ok(()) => info!("huge_pages override written to {override_path} (fallback to try)"),
-            Err(e) => warn!("could not write huge_pages override: {e}"),
+/// Reserve the hugepages that must back `shared_buffers_mb`, and keep the
+/// `huge_pages = try` fallback file in step with whether that succeeded.
+///
+/// Called at boot, and again by the supervisor's retune cycle when virtio-mem
+/// grows RAM enough to move `shared_buffers` — the reservation has to be resized
+/// *before* the postmaster restarts into the new `shared_buffers`, or it won't
+/// come back up.
+///
+/// Percona benchmark: TLB faults drop from ~200k/s to near zero with hugepages.
+/// Ref: Percona "Benchmark PostgreSQL with Linux HugePages";
+///      PostgreSQL docs §19.4 "Managing Kernel Resources"
+pub fn apply_hugepages(shared_buffers_mb: u64) {
+    let reserved = reserve_hugepages(config::nr_hugepages_for(shared_buffers_mb));
+
+    // `01-tuning.conf` hardcodes `huge_pages = on`: the right production default,
+    // because postgres then fails fast rather than silently giving up the TLB win.
+    // But `on` also means postgres REFUSES TO START if the reservation came up
+    // short — so whenever it does, we must override to `try` via a high-numbered
+    // conf.d file, or the postmaster never comes back.
+    //
+    // Two ways it comes up short: an environment where we can't write the sysctl
+    // at all (unprivileged containers, locked-down dev hosts), and a reservation
+    // sized against hot-added RAM, which lands in ZONE_MOVABLE and may not be able
+    // to back hugepages at all. Both are handled here, and the
+    // override is REMOVED again once a reservation succeeds, so a transient
+    // shortfall doesn't strand us on `try` forever.
+    let override_path = format!("{PGDATA}/conf.d/99-hugepages-fallback.conf");
+    if reserved {
+        match std::fs::remove_file(&override_path) {
+            Ok(()) => info!("hugepages reserved; cleared {override_path}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("could not remove {override_path}: {e}"),
         }
+        return;
     }
+    let body = "# Generated automatically when the nr_hugepages reservation came\n\
+                # up short (boot::apply_hugepages). Postgres tries hugepages and\n\
+                # falls back to anonymous shmem rather than refusing to start.\n\
+                huge_pages = try\n";
+    match config::write_atomic(Path::new(&override_path), body) {
+        Ok(()) => info!("huge_pages override written to {override_path} (fallback to try)"),
+        Err(e) => warn!("could not write huge_pages override: {e}"),
+    }
+}
+
+const NR_HUGEPAGES: &str = "/proc/sys/vm/nr_hugepages";
+
+/// Reserve `want` 2 MB hugepages, returning true only if the kernel actually
+/// handed over every one of them.
+///
+/// Writing `nr_hugepages` is a *request*, not a guarantee: hugetlb pages must be
+/// physically contiguous, so the kernel reserves as many as it can and silently
+/// clamps the rest. The write returns `Ok(())` either way. Checking only the
+/// write result — as this did before — treats a partial reservation as a full
+/// one, and `huge_pages = on` then makes postgres refuse to start, because it
+/// cannot map its whole shared-memory segment.
+///
+/// This matters more than it looks here. The VM boots with only part of its RAM
+/// online; memory hot-added later lands in `ZONE_MOVABLE`, which the kernel keeps
+/// for migratable allocations so the memory can be removed again. A hugepage
+/// reservation sized against grown RAM can therefore come up short even though
+/// the RAM is "there". Read the number back and believe the kernel, not the
+/// request.
+fn reserve_hugepages(want: u64) -> bool {
+    if let Err(e) = std::fs::write(NR_HUGEPAGES, format!("{want}\n")) {
+        warn!("could not set nr_hugepages: {e}");
+        return false;
+    }
+    let got = match std::fs::read_to_string(NR_HUGEPAGES) {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("could not parse nr_hugepages read-back: {e}");
+                return false;
+            }
+        },
+        Err(e) => {
+            warn!("could not read back nr_hugepages: {e}");
+            return false;
+        }
+    };
+    if got < want {
+        warn!(
+            "hugepage reservation short: asked {want} ({} MB), kernel gave {got} ({} MB) \
+             — falling back to huge_pages=try so postgres still starts",
+            want * 2,
+            got * 2
+        );
+        return false;
+    }
+    info!("reserved {got} hugepages ({} MB)", got * 2);
+    true
 }
 
 // ---------------------------------------------------------------------------
