@@ -538,9 +538,14 @@ plus the vCPU-derived parallelism knobs (`max_worker_processes`,
 
 **Why.** Static defaults are wrong everywhere except one size. The
 image runs on 4 GB / 2 vCPU dev boxes and 256 GB / 64 vCPU production
-boxes from the same artifact. Resizing a box (`byd pg scale`) should
-leave the database correctly tuned without a manual step. Regenerating
-every boot makes that automatic.
+boxes from the same artifact. Regenerating every boot makes that
+automatic.
+
+**Boot-time tuning is not sufficient on its own — see F-011.** The VM's
+visible RAM changes at runtime: the guest boots with only part of its
+memory online and the rest is hot-plugged in later. So "the RAM at boot"
+is not the RAM the database ends up with, and a boot-only tuner leaves a
+grown instance sized for its smallest moment.
 
 **Why cgroup-aware.** Inside Docker for `beyond dev`, `/proc/meminfo`
 reports host RAM, not the container's cgroup limit. If we set
@@ -698,6 +703,50 @@ well-known PG footgun. Disable it. Use explicit huge pages
 (`vm.nr_hugepages` + `huge_pages = on`) for `shared_buffers` if we
 want them; PG default `huge_pages = try` is fine without explicit
 setup.
+
+### F-011 — Follow elastic memory: retune + restart the postmaster behind a PgBouncer PAUSE
+
+**Decision.** The memory watcher follows virtio-mem RAM changes across
+*both* tuning halves, not just the reload-safe one:
+
+- `02-memory.conf` (sighup-context: `effective_cache_size`, `work_mem`,
+  `maintenance_work_mem`, the per-gather knobs) — rewritten and applied
+  with `pg_reload_conf()`, as before.
+- `01-tuning.conf` (postmaster-context: `shared_buffers`,
+  `max_connections`, `wal_buffers`, the worker counts) — Postgres fixes
+  these at postmaster start and cannot be talked out of them. The
+  watcher therefore asks the supervisor loop for a **retune cycle**:
+  rewrite the conf, resize the hugepage reservation, `PAUSE` every
+  PgBouncer worker (SIGUSR1), fast-shutdown and respawn the postmaster,
+  then `RESUME` (SIGUSR2) on every path out — including failure.
+
+Gated by hysteresis: only when `shared_buffers` would move by ≥25%
+(`RETUNE_MIN_RATIO`), and at most once per `RETUNE_MIN_INTERVAL`.
+
+**Why.** The VM's memory is elastic: it boots with only part of its RAM
+online and the rest is hot-plugged in as the workload needs it.
+`shared_buffers` is the single most important memory knob in Postgres and
+the one that *cannot* change without a restart — so a guest that only
+reads RAM at boot stays permanently mis-tuned for the memory it actually
+ends up with.
+
+The alternative — pinning databases to a fixed size at boot — was
+rejected: it opts Postgres out of elastic memory entirely, and costs a
+capacity knob we don't want. The guest should participate in elasticity,
+not sit outside it.
+
+**Why the restart is safe.** PgBouncer's `PAUSE` disconnects each server
+connection *after waiting for it to be released* per pool mode, and new
+client queries then queue rather than error ("new client connections to
+a paused database will wait until RESUME"). Clients see a stall, not a
+dropped connection. Verified end-to-end on a live primitive: a client
+querying once/sec across the retune logged **75 successes, 0 errors**,
+while `shared_buffers` went 183MB → 503MB and the postmaster restarted.
+
+**Cost.** The restart drops the buffer pool cold. The OS page cache
+survives in the same guest, so re-warm is mostly from cache rather than
+disk; `pg_prewarm` is not in the image today.
+
 
 ---
 
