@@ -4,6 +4,11 @@ on:
     types: [published]
 jobs:
   build:
+    # `release: published` fires for EVERY release in this repo, including the
+    # `server/v*` ones — which have nothing to do with the sink. Without this
+    # guard the sink build runs on a server release and then fails trying to
+    # publish sink binaries against a server tag. Sink releases are `sink/v*`.
+    if: startsWith(github.ref_name, 'sink/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -18,12 +23,20 @@ jobs:
         run: cross build --release -p beyond-pg-sink --target aarch64-unknown-linux-gnu
       - name: Rename binaries
         run: |
-          cp target/x86_64-unknown-linux-gnu/release/beyond-pg-sink beyond-pg-sink-${{ github.ref_name }}-linux-amd64
-          cp target/aarch64-unknown-linux-gnu/release/beyond-pg-sink beyond-pg-sink-${{ github.ref_name }}-linux-arm64
+          # Tags are `sink/vX.Y.Z`, so ref_name carries a slash. Interpolating it
+          # straight into a filename makes the shell read everything before the
+          # slash as a directory ("beyond-pg-sink-sink/v0.1.0-linux-amd64"), and
+          # `cp` fails with "No such file or directory". Use the bare version.
+          VERSION="${GITHUB_REF_NAME##*/}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          cp target/x86_64-unknown-linux-gnu/release/beyond-pg-sink "beyond-pg-sink-${VERSION}-linux-amd64"
+          cp target/aarch64-unknown-linux-gnu/release/beyond-pg-sink "beyond-pg-sink-${VERSION}-linux-arm64"
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload ${{ github.ref_name }} \
-            beyond-pg-sink-${{ github.ref_name }}-linux-amd64 \
-            beyond-pg-sink-${{ github.ref_name }}-linux-arm64
+          # Asset names use the bare version; the release is still addressed by
+          # the full tag.
+          gh release upload "$GITHUB_REF_NAME" \
+            "beyond-pg-sink-${VERSION}-linux-amd64" \
+            "beyond-pg-sink-${VERSION}-linux-arm64"
