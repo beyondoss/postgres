@@ -195,7 +195,15 @@ fn setup_network() {
     }
     if let Some(ref gua) = parse_cmdline_ipv6_ext(&cmdline) {
         run_ip(
-            &["-6", "addr", "add", &format!("{gua}/128"), "dev", "eth0", "nodad"],
+            &[
+                "-6",
+                "addr",
+                "add",
+                &format!("{gua}/128"),
+                "dev",
+                "eth0",
+                "nodad",
+            ],
             &format!("add IPv6 GUA {gua}/128"),
         );
     }

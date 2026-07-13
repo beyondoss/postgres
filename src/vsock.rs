@@ -205,8 +205,7 @@ mod tests {
             #[serde(with = "serde_bytes")]
             bytes: Vec<u8>,
         }
-        let outer: OuterIn =
-            rmp_serde::from_slice(&frame[5..]).expect("decode AppMessagePayload");
+        let outer: OuterIn = rmp_serde::from_slice(&frame[5..]).expect("decode AppMessagePayload");
 
         // 3. Inner envelope: [ServiceKind::Ready=12][msgpack_named(ReadyPayload)].
         let (kind, rest) = outer.bytes.split_first().expect("non-empty inner bytes");
@@ -219,7 +218,8 @@ mod tests {
         //    omitted, so the driver's `ReadyPayload` decode yields
         //    `http_port: None`.
         assert_eq!(
-            rest, &[0x80],
+            rest,
+            &[0x80],
             "ReadyPayload must serialize as an empty msgpack map (http_port omitted)"
         );
     }

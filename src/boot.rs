@@ -289,7 +289,12 @@ fn materialize_template_into(
     // Idempotent clean slate. `pgdata` may exist empty (partial-PGDATA cleanup
     // recreated it above); a prior interrupted materialize may have left a wal
     // dir or *.staging dirs.
-    for p in [&main_staging, &wal_staging, &pgdata.to_string(), &wal_target.to_string()] {
+    for p in [
+        &main_staging,
+        &wal_staging,
+        &pgdata.to_string(),
+        &wal_target.to_string(),
+    ] {
         rm_rf(p)?;
     }
 
@@ -372,7 +377,6 @@ fn cp_a(src: &str, dst: &str) -> Result<(), BootError> {
         ))))
     }
 }
-
 
 /// chown `/var/lib/postgresql` → postgres recursively. A fresh durable volume
 /// mounts root-owned over the image dir, and a root-run `pg_basebackup` (replica
@@ -737,7 +741,10 @@ mod tests {
         .unwrap();
 
         assert!(pgdata.join("PG_VERSION").exists());
-        assert!(!pgdata.join("garbage").exists(), "stale staging must not leak in");
+        assert!(
+            !pgdata.join("garbage").exists(),
+            "stale staging must not leak in"
+        );
     }
 
     // -----------------------------------------------------------------------

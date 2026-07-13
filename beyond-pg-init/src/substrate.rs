@@ -93,8 +93,12 @@ fn read_workingset_refault_file() -> Option<u64> {
 /// Parse `workingset_refault_file` from `/proc/vmstat` text. Split out from the
 /// file read so it's testable without `/proc`.
 fn parse_workingset_refault_file(raw: &str) -> Option<u64> {
-    raw.lines()
-        .find_map(|l| l.strip_prefix("workingset_refault_file ")?.trim().parse().ok())
+    raw.lines().find_map(|l| {
+        l.strip_prefix("workingset_refault_file ")?
+            .trim()
+            .parse()
+            .ok()
+    })
 }
 
 /// Read Linux PSI memory pressure `(some.avg10, full.avg10)` from
@@ -339,7 +343,9 @@ fn spawn_log_sink(log_tx: tokio::sync::mpsc::Sender<LogFrameBytes>) {
         let listener = match UnixListener::bind(path) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("[init] WARNING: log sink bind {path} failed: {e}; workload logs disabled");
+                eprintln!(
+                    "[init] WARNING: log sink bind {path} failed: {e}; workload logs disabled"
+                );
                 return;
             }
         };
@@ -430,7 +436,7 @@ mod tests {
     /// `vsock_protocol::GuestResourceStatsPayload` decoder: BE length, the type
     /// byte, then a MessagePack map whose keys match the host struct. `seq` and
     /// `disk_used_bytes` are required host fields; `disk_total_bytes` is omitted
-    /// so the host skips disk billing; the PSI keys carry the signal.
+    /// so the host skips disk billing; the PSI and refault keys carry the signal.
     #[test]
     fn resource_stats_frame_is_stable() {
         let payload = GuestResourceStatsPayload {
@@ -438,6 +444,7 @@ mod tests {
             disk_used_bytes: 0,
             psi_mem_some_avg10: Some(12.34),
             psi_mem_full_avg10: Some(0.5),
+            workingset_refault_file: Some(123_456),
         };
         let body = rmp_serde::to_vec_named(&payload).unwrap();
         let frame = encode_frame(MSG_GUEST_RESOURCE_STATS, &body);
@@ -453,9 +460,44 @@ mod tests {
         assert!(obj.contains_key("psi_mem_some_avg10"));
         assert!(obj.contains_key("psi_mem_full_avg10"));
         assert!(
+            obj.contains_key("workingset_refault_file"),
+            "the refault counter must reach the host — it is the ONLY signal that \
+             sees this VM outgrow its RAM (PSI, swap and major faults all read \
+             zero on a page-cache-bound workload)"
+        );
+        assert!(
             !obj.contains_key("disk_total_bytes"),
             "disk_total omitted so the host skips disk billing"
         );
+    }
+
+    #[test]
+    fn refault_frame_omits_the_key_when_unavailable() {
+        // The field is Option: a kernel without the counter must simply omit it,
+        // not send a bogus 0 that the host would read as "no refaults".
+        let payload = GuestResourceStatsPayload {
+            seq: 0,
+            disk_used_bytes: 0,
+            psi_mem_some_avg10: Some(1.0),
+            psi_mem_full_avg10: Some(0.0),
+            workingset_refault_file: None,
+        };
+        let body = rmp_serde::to_vec_named(&payload).unwrap();
+        let v: serde_json::Value = rmp_serde::from_slice(&body).unwrap();
+        assert!(
+            !v.as_object()
+                .unwrap()
+                .contains_key("workingset_refault_file")
+        );
+    }
+
+    #[test]
+    fn parses_workingset_refault_file() {
+        let raw = "nr_free_pages 12345\nworkingset_refault_anon 0\nworkingset_refault_file 297848\npgmajfault 8\n";
+        assert_eq!(parse_workingset_refault_file(raw), Some(297_848));
+        // Absent on kernels that don't export it — must be None, not 0.
+        assert_eq!(parse_workingset_refault_file("nr_free_pages 1\n"), None);
+        assert_eq!(parse_workingset_refault_file(""), None);
     }
 
     #[test]
