@@ -1986,8 +1986,24 @@ const RETUNE_MIN_RATIO: f64 = 1.25;
 /// Floor on the interval between retune cycles, so a flapping balloon can't put
 /// the postmaster into a restart loop.
 const RETUNE_MIN_INTERVAL: Duration = Duration::from_secs(120);
-/// Grace for pgbouncer to finish draining server connections after PAUSE.
+/// CAP on how long to wait for pgbouncer to drain server connections after PAUSE.
+/// Not a fixed sleep — see `pg::wait_quiesced`, which returns as soon as no client
+/// backend is running a query (normally milliseconds).
 const RETUNE_PAUSE_GRACE: Duration = Duration::from_secs(3);
+/// How long visible RAM must hold steady before a retune is allowed.
+///
+/// The host grows a starved VM in steps, not one jump — measured on a real climb:
+/// 128 → 384 → 640 → 896 → 1152 MiB, roughly 80s apart. Retuning as soon as
+/// `shared_buffers` crosses the ratio means restarting *mid-climb* and then again
+/// when the next steps land: that same climb cost 2 restarts (2 client stalls).
+///
+/// Waiting for RAM to settle first coalesces the whole climb into ONE restart.
+/// It must exceed the inter-step interval or it would fire between steps, hence
+/// 90s. The cost is that `shared_buffers` lags the memory by up to ~90s — cheap,
+/// because the reload-safe half (`effective_cache_size`, `work_mem`) is applied
+/// immediately on every step, and the newly-plugged RAM is already working as
+/// page cache regardless.
+const RETUNE_SETTLE: Duration = Duration::from_secs(90);
 /// How long to wait for the restarted postmaster before resuming pgbouncer anyway.
 const RETUNE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -2009,38 +2025,46 @@ async fn memory_watcher_task(vcpus: u32, initial_ram_bytes: u64, retune_tx: mpsc
     // from. Only a completed retune moves this.
     let mut tuned_ram_bytes = initial_ram_bytes;
     let mut last_retune: Option<Instant> = None;
+    // When visible RAM last CHANGED. A scale-up arrives as a series of steps, so
+    // a retune must wait for this to go quiet — see RETUNE_SETTLE.
+    let mut ram_changed_at = Instant::now();
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let ram_bytes = match read_memtotal_bytes().await {
             Some(v) => v,
             None => continue,
         };
-        // Skip if change is ≤ 5% — avoids churn from minor balloon adjustments.
-        let delta = ram_bytes.abs_diff(last_ram_bytes);
-        if delta * 20 <= last_ram_bytes {
-            continue;
-        }
-        last_ram_bytes = ram_bytes;
 
-        // --- reload-safe half: apply in place ---
-        let content = config::tuning_conf_adaptive(ram_bytes, vcpus);
-        match config::write_atomic(std::path::Path::new(&config::memory_conf_path()), &content) {
-            Ok(()) => info!(
-                "memory watcher: updated 02-memory.conf (ram_mb={})",
-                ram_bytes / (1024 * 1024)
-            ),
-            Err(e) => {
-                warn!("memory watcher: write failed: {e}");
-                continue;
+        // --- RAM moved: apply the reload-safe half NOW, and restart the settle
+        //     clock so a climb in progress can't trigger a restart per step. ---
+        // Ignore changes ≤ 5% — avoids churn from minor balloon adjustments.
+        let delta = ram_bytes.abs_diff(last_ram_bytes);
+        if delta * 20 > last_ram_bytes {
+            last_ram_bytes = ram_bytes;
+            ram_changed_at = Instant::now();
+
+            let content = config::tuning_conf_adaptive(ram_bytes, vcpus);
+            match config::write_atomic(std::path::Path::new(&config::memory_conf_path()), &content)
+            {
+                Ok(()) => info!(
+                    "memory watcher: updated 02-memory.conf (ram_mb={})",
+                    ram_bytes / (1024 * 1024)
+                ),
+                Err(e) => warn!("memory watcher: write failed: {e}"),
+            }
+            match pg::reload().await {
+                Ok(()) => info!("memory watcher: reloaded postgres config"),
+                Err(e) => warn!("memory watcher: pg_reload_conf failed: {e}"),
             }
         }
-        match pg::reload().await {
-            Ok(()) => info!("memory watcher: reloaded postgres config"),
-            Err(e) => warn!("memory watcher: pg_reload_conf failed: {e}"),
-        }
 
-        // --- postmaster-context half: needs a restart, so ask the loop for one ---
-        if !shared_buffers_moved_enough(tuned_ram_bytes, ram_bytes) {
+        // --- postmaster-context half: needs a restart, so it waits for quiet ---
+        if !shared_buffers_moved_enough(tuned_ram_bytes, last_ram_bytes) {
+            continue;
+        }
+        // Still climbing: retuning now means retuning again when the next step
+        // lands. Coalesce the whole scale-up into one restart.
+        if ram_changed_at.elapsed() < RETUNE_SETTLE {
             continue;
         }
         if last_retune.is_some_and(|t| t.elapsed() < RETUNE_MIN_INTERVAL) {
@@ -2048,14 +2072,14 @@ async fn memory_watcher_task(vcpus: u32, initial_ram_bytes: u64, retune_tx: mpsc
             continue;
         }
         info!(
-            "memory watcher: RAM {} MB -> shared_buffers would move {} MB -> {} MB; requesting retune",
-            ram_bytes / (1024 * 1024),
+            "memory watcher: RAM settled at {} MB -> shared_buffers {} MB -> {} MB; requesting retune",
+            last_ram_bytes / (1024 * 1024),
             config::shared_buffers_mb(tuned_ram_bytes),
-            config::shared_buffers_mb(ram_bytes),
+            config::shared_buffers_mb(last_ram_bytes),
         );
-        match retune_tx.try_send(ram_bytes) {
+        match retune_tx.try_send(last_ram_bytes) {
             Ok(()) => {
-                tuned_ram_bytes = ram_bytes;
+                tuned_ram_bytes = last_ram_bytes;
                 last_retune = Some(Instant::now());
             }
             // Full = a retune is already queued; dropping this one is correct,
@@ -2108,7 +2132,15 @@ async fn retune_postmaster(
     for w in pgb_extra {
         pause_pgbouncer(w);
     }
-    tokio::time::sleep(RETUNE_PAUSE_GRACE).await;
+
+    // Wait for the pool to ACTUALLY drain rather than sleeping a fixed grace.
+    // PAUSE releases each server connection as it goes idle, which normally takes
+    // milliseconds; the old blind 3s sleep was the entire client-visible stall
+    // (measured: 3056 ms, of which 3000 ms was the sleep). Cap it at the same 3s
+    // so a stuck long-running query can't hold the retune open forever — at the
+    // cap we proceed anyway, and the fast shutdown aborts whatever is left.
+    let drained = pg::wait_quiesced(RETUNE_PAUSE_GRACE).await;
+    info!("retune: pool drained in {} ms", drained.as_millis());
 
     let result = restart_postmaster(pg, log_tx).await;
 
@@ -2198,6 +2230,33 @@ mod tests {
     #[test]
     fn retune_ignores_noise() {
         assert!(!shared_buffers_moved_enough(2016 * MIB, 2020 * MIB));
+    }
+
+    #[test]
+    fn a_whole_scale_up_crosses_the_ratio_more_than_once() {
+        // The reason RETUNE_SETTLE exists. A real climb, MEASURED on a live VM:
+        // 128 → 384 → 640 → 896 → 1152 MiB plugged, ~80s apart. Without waiting
+        // for RAM to settle, the ratio test fires TWICE mid-climb (observed: 2
+        // restarts, 2 client stalls of ~3.5s). Settling coalesces it into one.
+        //
+        // MemTotal at each step, as measured (MiB):
+        let climb = [863u64, 1119, 1375, 1631, 1887];
+        let mut tuned = 735 * MIB; // boot size
+        let mut restarts = 0;
+        for mem in climb {
+            if shared_buffers_moved_enough(tuned, mem * MIB) {
+                restarts += 1;
+                tuned = mem * MIB;
+            }
+        }
+        assert!(
+            restarts > 1,
+            "a single scale-up crosses the ratio more than once ({restarts}) — \
+             which is exactly why the retune waits for RAM to settle first"
+        );
+
+        // And settling to the END of that climb is a single crossing.
+        assert!(shared_buffers_moved_enough(735 * MIB, 1887 * MIB));
     }
 
     #[test]
