@@ -149,6 +149,60 @@ pub async fn psql_env(sql: &str, env: &[(&str, &str)]) -> Result<(), PgError> {
     Err(PgError::NonZeroExit { code, stderr })
 }
 
+/// Number of client backends currently running a query (excluding the caller).
+///
+/// Used to observe when PgBouncer has actually finished pausing: `PAUSE` releases
+/// each server connection as it goes idle, so once no client backend is executing
+/// anything, there is no in-flight work for a fast shutdown to abort.
+///
+/// `None` if the query fails (postgres already down, or unreachable) — the caller
+/// treats that as "nothing in flight", which is the safe reading: there is no
+/// live transaction to protect.
+pub async fn active_backends() -> Option<u32> {
+    let mut cmd = Command::new("psql");
+    cmd.args([
+        "-U",
+        POSTGRES_USER,
+        "-h",
+        PG_SOCKET_DIR,
+        "-p",
+        &PG_PORT.to_string(),
+        "-d",
+        "postgres",
+        "-tAc",
+        "SELECT count(*) FROM pg_stat_activity \
+         WHERE backend_type = 'client backend' \
+           AND pid <> pg_backend_pid() \
+           AND state <> 'idle'",
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null());
+    drop_to_postgres_user(&mut cmd);
+
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Wait until no client backend is running a query, up to `timeout`.
+///
+/// Returns the time actually waited. This replaces a blind fixed sleep after
+/// signalling PgBouncer to PAUSE: in the common case the pool drains in
+/// milliseconds, and the retune's client-visible stall shrinks accordingly.
+pub async fn wait_quiesced(timeout: Duration) -> Duration {
+    let start = Instant::now();
+    loop {
+        match active_backends().await {
+            // 0 = drained. None = postgres unreachable ⇒ nothing to drain.
+            Some(0) | None => return start.elapsed(),
+            Some(_) if start.elapsed() >= timeout => return start.elapsed(),
+            Some(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+}
+
 /// Build the dollar-quoted `ALTER ROLE … WITH PASSWORD` statement (no trailing
 /// semicolon, so it composes into a larger script). Dollar-quoting guards against
 /// single-quote injection; the `$_beyond_$` tag is unlikely to appear in a
