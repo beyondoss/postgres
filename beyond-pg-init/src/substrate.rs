@@ -19,9 +19,28 @@
 //! ever changes the wire, that fixture must change in lockstep.
 //!
 //! Soft-fail throughout: no AF_VSOCK (e.g. a Docker test box) or a failed
-//! connect is logged and the thread exits — never fatal. The supervise loop
+//! FIRST connect is logged and the thread exits — never fatal. The supervise loop
 //! owns shutdown via signalfd (instd also sends SIGTERM), so this thread never
 //! powers the VM off.
+//!
+//! # Reconnect
+//!
+//! Once connected, a dropped connection is redialled rather than ending the
+//! thread. "Connection open" is literally how the host knows this guest exists:
+//! instd pings every ~10s and marks the VM `Degraded (guest disconnected)` after
+//! 30s of silence. So a thread that exited on EOF left the VM running but
+//! permanently invisible to the host — no ready, no heartbeat replies, no PSI
+//! reports, no workload logs — and nothing ever restored it. Any instd restart
+//! (every `deploy:compute:local`) did exactly that.
+//!
+//! Only a *first* connect failure is still soft-fail: that means there is no
+//! substrate here at all (Docker tests, no AF_VSOCK), so there is nothing to
+//! redial. Having connected once proves a substrate exists, and a host that went
+//! away is a host that is coming back — so we retry with capped backoff, forever.
+//! Reconnects re-send `Ready` with `reconnect: true`.
+//!
+//! An explicit `Shutdown` frame still ends the loop (it is not a disconnect), and
+//! poweroff remains the supervise loop's job.
 
 use serde::Serialize;
 
@@ -39,6 +58,12 @@ const MSG_GUEST_RESOURCE_STATS: u8 = 0xA2; // Agent → host: periodic resource 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 /// How often to report guest memory pressure to the host.
 const RESOURCE_STATS_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+/// First delay before redialling a dropped substrate connection.
+const INITIAL_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+/// Ceiling for the reconnect backoff. instd marks the guest disconnected after
+/// ~30s of silence, so keep retries well inside that window — a VM that comes
+/// back within one host restart should never be seen as gone.
+const MAX_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Agent → host "ready after boot" payload. A field-compatible subset of
 /// `vsock_protocol::ReadyPayload` — only the always-present fields; the rest are
@@ -184,42 +209,95 @@ fn run() {
     runtime.block_on(handshake());
 }
 
+/// Why [`keep_alive`] gave the connection back.
+enum ConnEnd {
+    /// EOF / read / write error — the host went away. Redial.
+    Disconnected,
+    /// Host sent an explicit `Shutdown`. Not a disconnect: stop for good and let
+    /// the supervise loop own the poweroff.
+    Shutdown,
+}
+
 async fn handshake() {
     use tokio::io::AsyncWriteExt;
     use tokio_vsock::{VsockAddr, VsockStream};
 
-    let payload = ReadyPayload {
-        agent_version: format!("beyond-pg-init/{}", env!("CARGO_PKG_VERSION")),
-        boot_time_ms: read_uptime_ms(),
-        reconnect: false,
-    };
-    let frame = match encode_ready_frame(&payload) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("[init] WARNING: encode Ready frame failed: {e}");
-            return;
-        }
-    };
+    // Bound ONCE, outside the reconnect loop: the log sink owns a unix listener,
+    // and rebinding it per reconnect would unlink the socket out from under the
+    // previous accept task and race it. The receiver simply carries over — the
+    // supervisor keeps relaying into the same channel across a host bounce.
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<LogFrameBytes>(1024);
+    spawn_log_sink(log_tx);
 
-    let mut conn = match VsockStream::connect(VsockAddr::new(HOST_CID, SUBSTRATE_PORT)).await {
-        Ok(c) => c,
-        Err(e) => {
-            // Soft-fail: no AF_VSOCK (Docker tests) or no host listener just
-            // means there's no substrate to report to. Let the thread exit.
-            eprintln!(
-                "[init] WARNING: substrate vsock connect failed; guest-ready unreported: {e}"
-            );
-            return;
+    // False until we have connected at least once. It gates BOTH the `reconnect`
+    // flag in the Ready payload and the soft-fail: a first-connect failure means
+    // there is no substrate here (Docker tests, no AF_VSOCK) and there is nothing
+    // to redial, so keep the original behaviour and let the thread exit.
+    let mut connected_once = false;
+    let mut backoff = INITIAL_RECONNECT_DELAY;
+
+    loop {
+        let mut conn = match VsockStream::connect(VsockAddr::new(HOST_CID, SUBSTRATE_PORT)).await {
+            Ok(c) => c,
+            Err(e) => {
+                if !connected_once {
+                    eprintln!(
+                        "[init] WARNING: substrate vsock connect failed; guest-ready unreported: {e}"
+                    );
+                    return;
+                }
+                eprintln!(
+                    "[init] substrate vsock redial failed ({e}); retrying in {}ms",
+                    backoff.as_millis()
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_RECONNECT_DELAY);
+                continue;
+            }
+        };
+
+        let payload = ReadyPayload {
+            agent_version: format!("beyond-pg-init/{}", env!("CARGO_PKG_VERSION")),
+            boot_time_ms: read_uptime_ms(),
+            reconnect: connected_once,
+        };
+        let frame = match encode_ready_frame(&payload) {
+            Ok(f) => f,
+            // Encoding cannot start working on a retry — this is a bug, not an
+            // outage. Bail rather than spin.
+            Err(e) => {
+                eprintln!("[init] WARNING: encode Ready frame failed: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = conn.write_all(&frame).await {
+            if !connected_once {
+                eprintln!("[init] WARNING: substrate Ready write failed: {e}");
+                return;
+            }
+            eprintln!("[init] substrate Ready write failed on redial ({e}); retrying");
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_RECONNECT_DELAY);
+            continue;
         }
-    };
-    if let Err(e) = conn.write_all(&frame).await {
-        eprintln!("[init] WARNING: substrate Ready write failed: {e}");
-        return;
+        let _ = conn.flush().await;
+
+        if connected_once {
+            eprintln!("[init] substrate vsock reconnected; guest re-reported ready");
+        } else {
+            eprintln!("[init] substrate vsock handshake complete; guest reported ready");
+        }
+        connected_once = true;
+        backoff = INITIAL_RECONNECT_DELAY;
+
+        match keep_alive(&mut conn, &mut log_rx).await {
+            ConnEnd::Shutdown => return,
+            ConnEnd::Disconnected => {
+                eprintln!("[init] substrate vsock connection lost; redialling");
+            }
+        }
     }
-    let _ = conn.flush().await;
-    eprintln!("[init] substrate vsock handshake complete; guest reported ready");
-
-    keep_alive(conn).await;
 }
 
 /// Bytes received from the supervisor's log sink: one already-framed substrate
@@ -239,23 +317,18 @@ type LogFrameBytes = Vec<u8>;
 /// after 30s of silence, so heartbeat replies must never be starved. The
 /// `select!` keeps both inbound-vsock and inbound-logs serviced; all vsock
 /// writes happen on this one task so there's no write interleaving.
-async fn keep_alive<S>(mut conn: S)
+async fn keep_alive<S>(
+    conn: &mut S,
+    log_rx: &mut tokio::sync::mpsc::Receiver<LogFrameBytes>,
+) -> ConnEnd
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // Bounded so a log storm can never grow memory without bound; the supervisor
-    // already rate-limits + drops upstream, and a full channel here just applies
-    // backpressure onto the supervisor's relay write (its problem to shed, not
-    // ours to buffer). Heartbeats are never affected — they're read straight off
-    // the vsock in the same select.
-    let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<LogFrameBytes>(1024);
-    spawn_log_sink(log_tx);
-
     // Periodic guest memory-pressure (PSI) report for the host memory
-    // controller. Fire-and-forget like heartbeats; a write error breaks the
-    // loop and the thread exits (same as any vsock failure).
+    // controller. Fire-and-forget like heartbeats; a write error ends this
+    // connection and the caller redials (same as any vsock failure).
     let mut psi_interval = tokio::time::interval(RESOURCE_STATS_PERIOD);
     psi_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -266,7 +339,7 @@ where
             _ = psi_interval.tick() => {
                 if let Some(frame) = encode_resource_stats_frame() {
                     if conn.write_all(&frame).await.is_err() {
-                        break;
+                        return ConnEnd::Disconnected;
                     }
                     let _ = conn.flush().await;
                 }
@@ -274,29 +347,29 @@ where
             // Inbound substrate frames (heartbeat / shutdown / ignored).
             read = conn.read_exact(&mut len_buf) => {
                 if read.is_err() {
-                    break; // EOF / error → thread exits.
+                    return ConnEnd::Disconnected; // EOF / error → redial.
                 }
                 let len = u32::from_be_bytes(len_buf);
                 if len == 0 || len > MAX_FRAME {
                     eprintln!("[init] substrate vsock: bad frame length {len}; closing");
-                    break;
+                    return ConnEnd::Disconnected;
                 }
                 let mut frame = vec![0u8; len as usize];
                 if conn.read_exact(&mut frame).await.is_err() {
-                    break;
+                    return ConnEnd::Disconnected;
                 }
                 match frame[0] {
                     MSG_HEARTBEAT => {
                         let body = rmp_serde::to_vec_named(&HeartbeatPayload { timestamp: 0 })
                             .unwrap_or_default();
                         if conn.write_all(&encode_frame(MSG_HEARTBEAT_RESP, &body)).await.is_err() {
-                            break;
+                            return ConnEnd::Disconnected;
                         }
                         let _ = conn.flush().await;
                     }
                     MSG_SHUTDOWN => {
                         eprintln!("[init] substrate requested shutdown; vsock loop exiting");
-                        break;
+                        return ConnEnd::Shutdown;
                     }
                     _ => {} // ReadyAck etc. — nothing to do here.
                 }
@@ -308,7 +381,7 @@ where
                 match maybe_frame {
                     Some(bytes) => {
                         if conn.write_all(&bytes).await.is_err() {
-                            break;
+                            return ConnEnd::Disconnected;
                         }
                         let _ = conn.flush().await;
                     }
@@ -498,6 +571,66 @@ mod tests {
         // Absent on kernels that don't export it — must be None, not 0.
         assert_eq!(parse_workingset_refault_file("nr_free_pages 1\n"), None);
         assert_eq!(parse_workingset_refault_file(""), None);
+    }
+
+    /// The whole point of the reconnect work: EOF is NOT a shutdown.
+    ///
+    /// If these two ever collapse into the same answer again, a host restart
+    /// takes the guest's substrate channel down permanently — the VM keeps
+    /// running while instd marks it `Degraded (guest disconnected)` and nothing
+    /// ever redials.
+    #[tokio::test]
+    async fn eof_is_a_disconnect_not_a_shutdown() {
+        let (mine, theirs) = tokio::io::duplex(1024);
+        drop(theirs); // host went away mid-connection
+
+        let (_tx, mut log_rx) = tokio::sync::mpsc::channel::<LogFrameBytes>(1);
+        let mut conn = mine;
+
+        assert!(
+            matches!(
+                keep_alive(&mut conn, &mut log_rx).await,
+                ConnEnd::Disconnected
+            ),
+            "a dropped connection must ask the caller to redial, not end the thread"
+        );
+    }
+
+    /// An explicit Shutdown frame must still stop for good — it is not a
+    /// disconnect, and redialling through it would fight the supervise loop's
+    /// poweroff.
+    #[tokio::test]
+    async fn explicit_shutdown_frame_stops_for_good() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mine, mut theirs) = tokio::io::duplex(1024);
+        let body = rmp_serde::to_vec_named(&HeartbeatPayload { timestamp: 0 }).unwrap();
+        theirs
+            .write_all(&encode_frame(MSG_SHUTDOWN, &body))
+            .await
+            .unwrap();
+
+        let (_tx, mut log_rx) = tokio::sync::mpsc::channel::<LogFrameBytes>(1);
+        let mut conn = mine;
+
+        assert!(
+            matches!(keep_alive(&mut conn, &mut log_rx).await, ConnEnd::Shutdown),
+            "an explicit Shutdown must not be retried as if the host had merely bounced"
+        );
+    }
+
+    /// A redial re-reports readiness with `reconnect: true` so the host can tell
+    /// a returning guest from a freshly booted one.
+    #[test]
+    fn redial_marks_the_ready_frame_as_a_reconnect() {
+        let p = ReadyPayload {
+            agent_version: "beyond-pg-init/0.1.0".to_string(),
+            boot_time_ms: 0,
+            reconnect: true,
+        };
+        let frame = encode_ready_frame(&p).unwrap();
+        let v: serde_json::Value = rmp_serde::from_slice(&frame[5..]).unwrap();
+        assert_eq!(v.as_object().unwrap()["reconnect"], serde_json::json!(true));
     }
 
     #[test]
