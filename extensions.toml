@@ -30,11 +30,11 @@ pg_trgm = "1.6"
 # 2026-06; verified via `apt-cache madison postgresql-18-<name>` against
 # apt.postgresql.org noble-pgdg). pg_cron + pg_partman are non-negotiable
 # (pg_cron: REQUIRED + shared_preload; pg_partman: queue partitioned queues).
-pgvector = "0.8.2"
+pgvector = "0.8.7"
 postgis = "3.6.4"
 pg_cron = "1.6.7"
 pg_partman = "5.4.3"
-hypopg = "1.4.2"
+hypopg = "1.4.5"
 pg_repack = "1.5.3"
 # Dropped — no PGDG build for noble+pg18 as of 2026-06 (re-add a pin once PGDG
 # ships one): pgvectorscale (no postgresql-18-pgvectorscale), pg_jsonschema (no
