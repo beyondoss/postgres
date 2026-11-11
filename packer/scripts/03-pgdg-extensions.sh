@@ -16,7 +16,7 @@ pin_install() {
   full_ver=$(apt-cache madison "${pkg}" \
     | awk -F'|' '{print $2}' \
     | tr -d ' ' \
-    | grep "${upstream_ver}" \
+    | { grep -F "${upstream_ver}" || true; } \
     | head -1)
   if [[ -z "${full_ver}" ]]; then
     echo "ERROR: ${pkg} version matching '${upstream_ver}' not found in apt cache" >&2
