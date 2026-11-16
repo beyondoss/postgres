@@ -770,6 +770,8 @@ resized VM picks up new tuning automatically.
 
 ### G-002 — MMDS for superuser password and tier configuration
 
+**Update.** `POSTGRES_PASSWORD` no longer comes from MMDS: the node generates it and PID 1 reads it from the sealed env relay (`beyond-pg-init/ARCHITECTURE.md`, "The database's password"); the rest of this entry stands.
+
 **Decision.** `beyond-pg` reads `POSTGRES_PASSWORD`,
 `POSTGRES_DATABASE`, `BEYOND_PG_TIER`, `BEYOND_VOLUME_EPHEMERAL`,
 `BEYOND_PG_ARCHIVE_TARGET` directly from MMDS at

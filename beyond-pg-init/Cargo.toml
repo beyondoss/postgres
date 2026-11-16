@@ -25,3 +25,4 @@ nix = { version = "0.31", features = ["mount"] }
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "io-util", "sync"] }
 tokio-vsock = "0.7"
 rmp-serde = "1"
+serde_bytes = "0.11"

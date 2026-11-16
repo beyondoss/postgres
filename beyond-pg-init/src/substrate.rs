@@ -203,6 +203,7 @@ fn run() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("[init] WARNING: substrate-vsock tokio runtime build failed: {e}");
+            crate::env_relay::no_substrate();
             return;
         }
     };
@@ -244,6 +245,7 @@ async fn handshake() {
                     eprintln!(
                         "[init] WARNING: substrate vsock connect failed; guest-ready unreported: {e}"
                     );
+                    crate::env_relay::no_substrate();
                     return;
                 }
                 eprintln!(
@@ -267,6 +269,7 @@ async fn handshake() {
             // outage. Bail rather than spin.
             Err(e) => {
                 eprintln!("[init] WARNING: encode Ready frame failed: {e}");
+                crate::env_relay::no_substrate();
                 return;
             }
         };
@@ -274,6 +277,7 @@ async fn handshake() {
         if let Err(e) = conn.write_all(&frame).await {
             if !connected_once {
                 eprintln!("[init] WARNING: substrate Ready write failed: {e}");
+                crate::env_relay::no_substrate();
                 return;
             }
             eprintln!("[init] substrate Ready write failed on redial ({e}); retrying");
@@ -332,9 +336,19 @@ where
     let mut psi_interval = tokio::time::interval(RESOURCE_STATS_PERIOD);
     psi_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // The database's password: asked for until the driver answers (it answers once the API has stored the value).
+    let mut ask_interval = tokio::time::interval(crate::env_relay::ASK_EVERY);
+    ask_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     let mut len_buf = [0u8; 4];
     loop {
         tokio::select! {
+            _ = ask_interval.tick(), if crate::env_relay::needs_password() => {
+                if conn.write_all(&crate::env_relay::ask_frame()).await.is_err() {
+                    return ConnEnd::Disconnected;
+                }
+                let _ = conn.flush().await;
+            }
             // Periodic PSI report.
             _ = psi_interval.tick() => {
                 if let Some(frame) = encode_resource_stats_frame() {
@@ -367,6 +381,8 @@ where
                         }
                         let _ = conn.flush().await;
                     }
+                    // A primitive message from the driver: the env answer, if that is what it is.
+                    crate::env_relay::MSG_APP => crate::env_relay::offer(&frame[1..]),
                     MSG_SHUTDOWN => {
                         eprintln!("[init] substrate requested shutdown; vsock loop exiting");
                         return ConnEnd::Shutdown;

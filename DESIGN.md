@@ -371,7 +371,7 @@ subcommand because there's no external invoker that needs a CLI surface.
 1. **Read MMDS** (direct HTTP to `169.254.169.254`; retry with backoff; env var fallback for local dev). Read:
    - `BEYOND_PG_TIER` (default `single`)
    - `BEYOND_VOLUME_EPHEMERAL` (default `false`)
-   - `POSTGRES_PASSWORD` (required; fail closed if missing)
+   - `POSTGRES_PASSWORD` (required; fail closed if missing). Not from MMDS on Beyond: `beyond-pg-init` takes it from the sealed env relay and writes it into the metadata file first
    - `POSTGRES_DATABASE` (default `postgres`)
    - `BEYOND_PG_ARCHIVE_TARGET` (optional)
    - `BEYOND_PG_WAL_SINK` (optional; HTTP endpoint of WAL sink; enables Tier 1.5 durability)
