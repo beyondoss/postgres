@@ -298,6 +298,33 @@ fn fetch_mmds() {
     }
 }
 
+/// The database's password comes from the sealed env relay (`env_relay`), written into the metadata file the supervisor reads, before the
+/// supervisor starts. With a substrate and no password within the wait, init exits: a database is never started without one, and never with one
+/// MMDS carried. With no substrate at all (the Docker test image) the metadata is used as it is.
+pub fn adopt_relay_password() {
+    let path = beyond_pg_core::mmds::MMDS_PATH;
+    let read = || {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    };
+    match crate::env_relay::wait(crate::env_relay::WAIT) {
+        crate::env_relay::Outcome::Password(pw) => {
+            write_mmds_file(&crate::env_relay::with_password(read(), &pw));
+            eprintln!("[init] database password received from the env relay");
+        }
+        crate::env_relay::Outcome::NoSubstrate => {
+            eprintln!("[init] no substrate: using the metadata file as it is");
+        }
+        crate::env_relay::Outcome::TimedOut => {
+            write_mmds_file(&crate::env_relay::without_password(read()));
+            eprintln!("[init] FATAL: the env relay gave no database password");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn write_mmds_file(json: &serde_json::Value) {
     let path = beyond_pg_core::mmds::MMDS_PATH;
     let tmp = format!("{path}.tmp");

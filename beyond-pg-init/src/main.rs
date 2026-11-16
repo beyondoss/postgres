@@ -9,6 +9,7 @@
 
 #[cfg(target_os = "linux")]
 mod bootsetup;
+mod env_relay;
 #[cfg(target_os = "linux")]
 mod substrate;
 #[cfg(target_os = "linux")]
@@ -31,6 +32,8 @@ fn main() -> ! {
     // before considering the create successful. Spawned after boot setup (so
     // the network/MMDS are up) and before the supervise loop takes over.
     substrate::spawn_handshake();
+    // The password is the one thing the supervisor cannot start without, and it comes from the env relay over that connection.
+    bootsetup::adopt_relay_password();
     supervise::run();
 }
 
