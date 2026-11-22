@@ -11,7 +11,7 @@
 //!    a watcher elsewhere triggers reloads on rotation. See
 //!    `../beyond/boxes/docs/09-internal-tls.md`.
 //! 3. **Self-signed** (fallback): for dev/test and any environment without
-//!    the platform contract. Generates an Ed25519 cert under `PGDATA/beyond/`
+//!    the platform contract. Generates an ECDSA P-256 cert under `PGDATA/beyond/`
 //!    and renews it within 30 days of expiry.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -163,7 +163,7 @@ pub fn ensure_cert(pgdata: &Path) -> Result<TlsCertOutcome, TlsError> {
 
     match outcome {
         TlsCertOutcome::Generated => info!("tls: no cert found, generating self-signed cert"),
-        TlsCertOutcome::Renewed => info!("tls: cert within 30-day expiry window, renewing"),
+        TlsCertOutcome::Renewed => info!("tls: cert expiring or not P-256, renewing"),
         _ => unreachable!(),
     }
 
@@ -190,6 +190,12 @@ fn cert_needs_renewal(path: &Path) -> bool {
     match x509_parser::pem::parse_x509_pem(&pem) {
         Ok((_, pem_obj)) => match pem_obj.parse_x509() {
             Ok(cert) => {
+                // A cert from before the P-256 switch (Ed25519) cannot do SCRAM
+                // channel binding: re-issue it. Idempotent: the new cert passes.
+                if cert.signature_algorithm.algorithm != OID_ECDSA_WITH_SHA256 {
+                    info!("tls: cert is not ECDSA P-256/SHA-256, re-issuing");
+                    return true;
+                }
                 let not_after = cert.validity().not_after.timestamp();
                 if not_after < threshold {
                     info!("tls: cert expires at unix:{not_after}, threshold unix:{threshold}");
@@ -210,6 +216,10 @@ fn cert_needs_renewal(path: &Path) -> bool {
     }
 }
 
+/// ecdsa-with-SHA256 (1.2.840.10045.4.3.2).
+const OID_ECDSA_WITH_SHA256: x509_parser::oid_registry::Oid<'static> =
+    x509_parser::oid_registry::OID_SIG_ECDSA_WITH_SHA256;
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -222,10 +232,12 @@ fn now_secs() -> u64 {
 // ---------------------------------------------------------------------------
 
 fn generate_cert(cert_path: &Path, key_path: &Path) -> Result<(), TlsError> {
-    // Ed25519: fast signing on every TLS handshake (the reason we picked it over
-    // P-256). The rootfs must ship an OpenSSL that can load Ed25519 keys — see
-    // the image build; Postgres loads the server key through OpenSSL.
-    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)?;
+    // ECDSA P-256 / SHA-256. SCRAM channel binding (tls-server-end-point, RFC 5929)
+    // hashes the certificate with the hash of its signature algorithm; Ed25519 has
+    // none, so libpq with `channel_binding=require` fails ("could not find digest
+    // for NID UNDEF"). P-256 signs with SHA-256, so binding works. Signing cost
+    // per handshake is higher than Ed25519 (see DECISIONS.md).
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
 
     let mut params = CertificateParams::default();
     params
@@ -248,48 +260,12 @@ fn generate_cert(cert_path: &Path, key_path: &Path) -> Result<(), TlsError> {
     crate::config::write_atomic(cert_path, &cert.pem())?;
     // Key is written with mode 0o600 set *before* content. This closes the
     // window in which a chmod-after-write approach would leave the private
-    // key briefly readable under a wider umask.
-    //
-    // rcgen (aws-lc-rs) serializes Ed25519 keys as PKCS#8 *v2* (OneAsymmetricKey
-    // with the trailing public-key field). OpenSSL 3.0.13 — the version on the
-    // ubuntu-noble base image, which Postgres links against — cannot decode v2
-    // Ed25519 keys and rejects them with `unsupported`, so Postgres can't load
-    // its server key. Re-emit as standard PKCS#8 *v1* (identical Ed25519 key and
-    // performance; v2 only appends the public key, which the cert already
-    // carries). Falls back to rcgen's PEM if the key isn't the expected Ed25519
-    // shape (e.g. a future algorithm change).
-    let key_pem =
-        ed25519_pkcs8_v1_pem(&key_pair.serialize_der()).unwrap_or_else(|| key_pair.serialize_pem());
-    crate::config::write_atomic_bytes_with_mode(key_path, key_pem.as_bytes(), 0o600)?;
+    // key briefly readable under a wider umask. rcgen's PKCS#8 PEM for P-256 is
+    // read by the OpenSSL 3.0.13 Postgres links against (the Ed25519 v2
+    // encoding was not, which is why this once re-encoded the key).
+    crate::config::write_atomic_bytes_with_mode(key_path, key_pair.serialize_pem().as_bytes(), 0o600)?;
 
     Ok(())
-}
-
-/// Re-encode an Ed25519 private key from rcgen's PKCS#8 v2 DER to the
-/// universally-accepted PKCS#8 v1 PEM. Returns `None` if `der_v2` is not a
-/// recognizable Ed25519 PKCS#8 (so the caller keeps rcgen's own encoding).
-fn ed25519_pkcs8_v1_pem(der_v2: &[u8]) -> Option<String> {
-    use base64::Engine as _;
-    // The privateKey field encodes the 32-byte seed identically in v1 and v2 as
-    // the byte run `04 22 04 20 <seed>` (OCTET STRING { OCTET STRING(32) }).
-    const PRIV_PREFIX: [u8; 4] = [0x04, 0x22, 0x04, 0x20];
-    let pos = der_v2.windows(4).position(|w| w == PRIV_PREFIX)?;
-    let seed = der_v2.get(pos + 4..pos + 4 + 32)?;
-    // Canonical 48-byte Ed25519 PKCS#8 v1:
-    //   SEQ { INTEGER 0, SEQ { OID 1.3.101.112 }, OCTET STRING { OCTET STRING(32) seed } }
-    let mut der_v1 = vec![
-        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
-        0x20,
-    ];
-    der_v1.extend_from_slice(seed);
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&der_v1);
-    let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
-    for line in b64.as_bytes().chunks(64) {
-        pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
-        pem.push('\n');
-    }
-    pem.push_str("-----END PRIVATE KEY-----\n");
-    Some(pem)
 }
 
 /// Hostname for the cert CN. Reads `/etc/hostname` (written by `init::run()`
@@ -525,6 +501,27 @@ mod tests {
         assert_eq!(outcome, TlsCertOutcome::Renewed);
     }
 
+    /// A still-valid Ed25519 cert from before the P-256 switch cannot bind a
+    /// SCRAM channel: it is re-issued once as ECDSA P-256/SHA-256, then left alone.
+    #[test]
+    fn test_ed25519_cert_reissued_as_p256_once() {
+        let (_dir, pgdata) = pgdata();
+        let beyond_dir = pgdata.join("beyond");
+        std::fs::create_dir_all(&beyond_dir).unwrap();
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let cert = CertificateParams::default().self_signed(&key_pair).unwrap();
+        std::fs::write(beyond_dir.join("server.crt"), cert.pem()).unwrap();
+        std::fs::write(beyond_dir.join("server.key"), key_pair.serialize_pem()).unwrap();
+
+        assert_eq!(ensure_cert(&pgdata).unwrap(), TlsCertOutcome::Renewed);
+        let pem = std::fs::read(beyond_dir.join("server.crt")).unwrap();
+        let (_, pem_obj) = parse_x509_pem(&pem).unwrap();
+        let cert = pem_obj.parse_x509().unwrap();
+        assert_eq!(cert.signature_algorithm.algorithm, OID_ECDSA_WITH_SHA256);
+
+        assert_eq!(ensure_cert(&pgdata).unwrap(), TlsCertOutcome::StillValid);
+    }
+
     /// If `.user-managed` sentinel exists, `ensure_cert` must return `UserManaged`
     /// without writing any files.
     #[test]
@@ -610,7 +607,7 @@ mod tests {
     /// Write a self-signed cert that expires in `days_until_expiry` days,
     /// used to simulate a near-expiry cert for renewal tests.
     fn write_expiring_cert(cert_path: &Path, key_path: &Path, days_until_expiry: i64) {
-        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut params = CertificateParams::default();
         // Use ::time:: prefix to avoid shadowing by x509_parser::prelude::*.
         let now = ::time::OffsetDateTime::now_utc();
