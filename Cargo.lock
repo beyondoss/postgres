@@ -275,7 +275,6 @@ dependencies = [
 name = "beyond-pg"
 version = "0.1.0"
 dependencies = [
- "base64",
  "beyond-handoff",
  "beyond-pg-core",
  "clap",
