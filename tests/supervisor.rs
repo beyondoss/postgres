@@ -433,6 +433,10 @@ impl SupervisorHarness {
         let mut args: Vec<String> = vec![
             "run".into(),
             "-d".into(),
+            // Docker's default seccomp profile may refuse AF_VSOCK, which the cold start binds for its RPC by default: use the unix socket the
+            // supervisor offers for tests (`rpc::bind_cold_start`).
+            "-e".into(),
+            "BEYOND_PG_RPC_UNIX_PATH=/run/beyond-pg-rpc.sock".into(),
             "--platform".into(),
             self.platform.into(),
             "-v".into(),
@@ -545,6 +549,9 @@ impl SupervisorHarness {
         let mut args = vec![
             "run".to_owned(),
             "-d".to_owned(),
+            // See `start_extra_args`: AF_VSOCK may be refused by Docker's default seccomp profile.
+            "-e".to_owned(),
+            "BEYOND_PG_RPC_UNIX_PATH=/run/beyond-pg-rpc.sock".to_owned(),
             "--platform".to_owned(),
             self.platform.to_owned(),
             "-v".to_owned(),
@@ -693,6 +700,8 @@ fn supervisor_with_only_a_verifier_accepts_the_original_password_over_scram() {
         container.exec(&[
             "env",
             &format!("PGPASSWORD={password}"),
+            // The server's TLS certificate has no signature digest libpq can bind the channel to ("could not find digest for NID UNDEF").
+            "PGCHANNELBINDING=disable",
             "psql",
             "-h",
             "127.0.0.1",
