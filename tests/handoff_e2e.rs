@@ -500,6 +500,18 @@ fn handoff_swap_keeps_postgres_pids_unchanged() {
         panic!("lifecycle socket never appeared at {sock_path:?}");
     }
 
+    // The supervisor binds its handoff socket only after postgres is ready and
+    // post-start has run, later than pg_isready and init's lifecycle socket. An
+    // upgrade sent before it exists fails with ENOENT on the connect.
+    assert!(
+        container.wait_for(
+            &["test", "-S", "/var/lib/beyond-pg/state/handoff.sock"],
+            Duration::from_secs(60),
+        ),
+        "supervisor never bound its handoff socket\nlogs:\n{}",
+        container.logs()
+    );
+
     // Trigger handoff. The new binary is the same one — we're testing the
     // *protocol*, not version differences.
     let resp = lifecycle_upgrade(&sock_path, "/usr/local/bin/beyond-pg").unwrap_or_else(|e| {

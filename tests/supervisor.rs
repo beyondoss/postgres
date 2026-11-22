@@ -782,21 +782,26 @@ fn supervisor_tls_handshake_cost() {
 /// cold start respawns that many.
 ///
 /// CI-only (like the sibling supervisor lifecycle tests): uses the standard
-/// unprivileged harness. Assumes a CI runner with >= 8 cores so `read_vcpus` →
-/// `pgbouncer_max_workers >= 2` (so a warm-started extra is within the cap).
+/// unprivileged harness. The container is pinned to an 8-CPU cgroup quota so `read_vcpus` →
+/// `pgbouncer_max_workers >= 2` (a warm-started extra is within the cap) on any host.
 /// NOTE: do NOT run this with `--privileged` on the shared homelab host — the
 /// supervisor's boot reserves host hugepages and writes host sysctls, mutating
 /// kernel state shared with production. That's exactly why the harness is
 /// unprivileged; the trade-off is this test can only boot in CI's permissive
 /// Docker, not on a host with a restrictive seccomp profile.
 #[test]
-#[ignore = "requires Docker + musl target + beyond-pg-test:latest image (>= 8 cores)"]
+#[ignore = "requires Docker + musl target + beyond-pg-test:latest image"]
 fn supervisor_warm_starts_pooler_after_restart() {
     let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some(harness) = SupervisorHarness::new() else {
         return;
     };
-    let container = harness.start(&[]);
+    // The pooler cap is vcpus / 4, and the supervisor reads vcpus from the cgroup
+    // quota. Pin the quota to 8 CPUs so the test does not depend on the host's core
+    // count (a 4-core CI runner caps the pooler at 1 and warm-start restores none).
+    // `--cpus` refuses more CPUs than the host has; a raw quota does not.
+    let container =
+        harness.start_extra_args(&[], &[], &["--cpu-period=100000", "--cpu-quota=800000"]);
 
     assert!(
         container.wait_postgres_ready(Duration::from_secs(90)),
@@ -1121,7 +1126,10 @@ fn supervisor_cdc_restarts_on_crash() {
             .expect("chmod cdc stub");
     }
 
-    let stub_path = stub.path().display().to_string();
+    // Close the write handle NamedTempFile keeps open: execve of a file that is
+    // open for writing fails with ETXTBSY, which killed the supervisor at spawn.
+    let stub = stub.into_temp_path();
+    let stub_path = stub.display().to_string();
     let container = harness.start_extra(
         &[("BEYOND_PG_CDC_ENABLED", "true")],
         &[(&stub_path, "/usr/local/bin/beyond-pg-cdc")],
