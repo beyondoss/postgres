@@ -230,7 +230,8 @@ fn start_init_container(
         "printf '%s\\n' '#!/bin/sh' ",
         "'for a in \"$@\"; do case \"$a\" in --pwfile=*) chmod 0644 \"${a#--pwfile=}\" 2>/dev/null;; esac; done' ",
         "'chown postgres:postgres /var/lib/postgresql/18 /var/lib/postgresql/18/main 2>/dev/null || true' ",
-        "'exec gosu postgres /usr/lib/postgresql/18/bin/initdb \"$@\"' ",
+        "'[ \"$(id -u)\" != 0 ] || exec gosu postgres /usr/lib/postgresql/18/bin/initdb \"$@\"' ",
+            "'exec /usr/lib/postgresql/18/bin/initdb \"$@\"' ",
         "> /usr/local/bin/initdb && chmod +x /usr/local/bin/initdb; ",
         "exec /usr/local/bin/beyond-pg-init",
     );
