@@ -754,7 +754,7 @@ fn supervisor_tls_handshake_cost() {
     assert!(container.wait_post_start_done(Duration::from_secs(30)), "post-start did not complete\n{}", container.logs());
     let time_connects = |sslmode: &str| -> Vec<u64> {
         let script = format!(
-            "for i in $(seq 35); do s=$(date +%s%N); PGPASSWORD='{PASSWORD}' PGSSLMODE={sslmode} psql -h 127.0.0.1 -p 5433 -U postgres -d postgres -tAc 'select 1' >/dev/null 2>&1 || echo FAIL; e=$(date +%s%N); echo T $(( (e-s)/1000 )); done"
+            "for i in $(seq 35); do s=$(date +%s%N); PGPASSWORD='{PASSWORD}' PGCHANNELBINDING=disable PGSSLMODE={sslmode} psql -h 127.0.0.1 -p 5433 -U postgres -d postgres -tAc 'select 1' >/dev/null 2>&1 || echo FAIL; e=$(date +%s%N); echo T $(( (e-s)/1000 )); done"
         );
         let out = container.exec(&["sh", "-c", &script]);
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
