@@ -747,12 +747,14 @@ fn supervisor_with_only_a_verifier_accepts_the_original_password_over_scram() {
 fn supervisor_tls_handshake_cost() {
     let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let harness = SupervisorHarness::new().expect("Docker, the musl target and beyond-pg-test:latest are required");
-    let container = harness.start(&[]);
+    const PASSWORD: &str = "correct horse battery";
+    const VERIFIER: &str = "SCRAM-SHA-256$4096:cbHdwWtOk0dwNZAaQVTR9g==$NYFMnqzwzMV7CTFaCfBP5J3y41xmTmDJPDLE96pN3/o=:P8VydXaJRrINE2cDxQRh2CZobwRK3EbticDXin423Nc=";
+    let container = harness.start(&[("POSTGRES_PASSWORD", VERIFIER)]);
     assert!(container.wait_postgres_ready(Duration::from_secs(90)), "Postgres never became ready\n{}", container.logs());
     assert!(container.wait_post_start_done(Duration::from_secs(30)), "post-start did not complete\n{}", container.logs());
     let time_connects = |sslmode: &str| -> Vec<u64> {
         let script = format!(
-            "for i in $(seq 35); do s=$(date +%s%N); PGSSLMODE={sslmode} psql -h 127.0.0.1 -p 5433 -U postgres -d postgres -tAc 'select 1' >/dev/null 2>&1 || echo FAIL; e=$(date +%s%N); echo T $(( (e-s)/1000 )); done"
+            "for i in $(seq 35); do s=$(date +%s%N); PGPASSWORD='{PASSWORD}' PGSSLMODE={sslmode} psql -h 127.0.0.1 -p 5433 -U postgres -d postgres -tAc 'select 1' >/dev/null 2>&1 || echo FAIL; e=$(date +%s%N); echo T $(( (e-s)/1000 )); done"
         );
         let out = container.exec(&["sh", "-c", &script]);
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
