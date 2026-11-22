@@ -420,7 +420,8 @@ impl SupervisorHarness {
             "printf '%s\\n' '#!/bin/sh' ",
             "'for a in \"$@\"; do case \"$a\" in --pwfile=*) chmod 0644 \"${a#--pwfile=}\" 2>/dev/null;; esac; done' ",
             "'chown postgres:postgres /var/lib/postgresql/18/main 2>/dev/null || true' ",
-            "'exec gosu postgres /usr/lib/postgresql/18/bin/initdb \"$@\"' ",
+            "'[ \"$(id -u)\" != 0 ] || exec gosu postgres /usr/lib/postgresql/18/bin/initdb \"$@\"' ",
+            "'exec /usr/lib/postgresql/18/bin/initdb \"$@\"' ",
             "> /usr/local/bin/initdb && ",
             "chmod +x /usr/local/bin/initdb; ",
             "trap 'kill \"$SVPID\" 2>/dev/null; wait \"$SVPID\"; exit $?' TERM INT; ",
@@ -432,6 +433,10 @@ impl SupervisorHarness {
         let mut args: Vec<String> = vec![
             "run".into(),
             "-d".into(),
+            // Docker's default seccomp profile may refuse AF_VSOCK, which the cold start binds for its RPC by default: use the unix socket the
+            // supervisor offers for tests (`rpc::bind_cold_start`).
+            "-e".into(),
+            "BEYOND_PG_RPC_UNIX_PATH=/run/beyond-pg-rpc.sock".into(),
             "--platform".into(),
             self.platform.into(),
             "-v".into(),
@@ -531,7 +536,8 @@ impl SupervisorHarness {
             "printf '%s\\n' '#!/bin/sh' ",
             "'for a in \"$@\"; do case \"$a\" in --pwfile=*) chmod 0644 \"${a#--pwfile=}\" 2>/dev/null;; esac; done' ",
             "'chown postgres:postgres /var/lib/postgresql/18/main 2>/dev/null || true' ",
-            "'exec gosu postgres /usr/lib/postgresql/18/bin/initdb \"$@\"' ",
+            "'[ \"$(id -u)\" != 0 ] || exec gosu postgres /usr/lib/postgresql/18/bin/initdb \"$@\"' ",
+            "'exec /usr/lib/postgresql/18/bin/initdb \"$@\"' ",
             "> /usr/local/bin/initdb && ",
             "chmod +x /usr/local/bin/initdb; ",
             "trap 'kill \"$SVPID\" 2>/dev/null; wait \"$SVPID\"; exit $?' TERM INT; ",
@@ -543,6 +549,9 @@ impl SupervisorHarness {
         let mut args = vec![
             "run".to_owned(),
             "-d".to_owned(),
+            // See `start_extra_args`: AF_VSOCK may be refused by Docker's default seccomp profile.
+            "-e".to_owned(),
+            "BEYOND_PG_RPC_UNIX_PATH=/run/beyond-pg-rpc.sock".to_owned(),
             "--platform".to_owned(),
             self.platform.to_owned(),
             "-v".to_owned(),
@@ -691,6 +700,8 @@ fn supervisor_with_only_a_verifier_accepts_the_original_password_over_scram() {
         container.exec(&[
             "env",
             &format!("PGPASSWORD={password}"),
+            // The server's TLS certificate has no signature digest libpq can bind the channel to ("could not find digest for NID UNDEF").
+            "PGCHANNELBINDING=disable",
             "psql",
             "-h",
             "127.0.0.1",
