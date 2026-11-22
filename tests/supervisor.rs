@@ -745,7 +745,7 @@ fn supervisor_with_only_a_verifier_accepts_the_original_password_over_scram() {
 /// cold start respawns that many.
 ///
 /// CI-only (like the sibling supervisor lifecycle tests): uses the standard
-/// unprivileged harness. The container is pinned to `--cpus=8` so `read_vcpus` →
+/// unprivileged harness. The container is pinned to an 8-CPU cgroup quota so `read_vcpus` →
 /// `pgbouncer_max_workers >= 2` (a warm-started extra is within the cap) on any host.
 /// NOTE: do NOT run this with `--privileged` on the shared homelab host — the
 /// supervisor's boot reserves host hugepages and writes host sysctls, mutating
@@ -760,9 +760,11 @@ fn supervisor_warm_starts_pooler_after_restart() {
         return;
     };
     // The pooler cap is vcpus / 4, and the supervisor reads vcpus from the cgroup
-    // quota. Pin the quota to 8 so the test does not depend on the host's core
+    // quota. Pin the quota to 8 CPUs so the test does not depend on the host's core
     // count (a 4-core CI runner caps the pooler at 1 and warm-start restores none).
-    let container = harness.start_extra_args(&[], &[], &["--cpus=8"]);
+    // `--cpus` refuses more CPUs than the host has; a raw quota does not.
+    let container =
+        harness.start_extra_args(&[], &[], &["--cpu-period=100000", "--cpu-quota=800000"]);
 
     assert!(
         container.wait_postgres_ready(Duration::from_secs(90)),
