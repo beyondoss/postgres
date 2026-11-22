@@ -1016,6 +1016,24 @@ it, never another VM, never the network. No auth needed, no firewall
 hole, no surface for credential theft. This is how every other Beyond
 guest agent talks to its host.
 
+### I-001a — The self-signed cert is ECDSA P-256, not Ed25519
+
+**Decision.** `generate_cert` issues an ECDSA P-256 / SHA-256 cert and a
+PKCS#8 key. A valid cert of any other signature algorithm (an older
+Ed25519 one) is re-issued at the next boot, once (`cert_needs_renewal`
+checks the signature OID; the new cert passes, so the check is idempotent).
+
+**Why.** SCRAM `tls-server-end-point` channel binding (RFC 5929) hashes the
+server cert with the hash of its signature algorithm. Ed25519 has no such
+hash, so libpq with `channel_binding=require` fails ("could not find digest
+for NID UNDEF") and every smoke had to run `channel_binding=disable`. P-256
+signs with SHA-256, so binding works.
+
+**Cost.** Ed25519 was chosen for faster handshake signing. P-256 signing is
+slower per handshake; the measured difference is in the PR that made this
+change. It also drops the PKCS#8 v1 re-encoding Ed25519 needed on noble's
+OpenSSL 3.0.13.
+
 ### I-004 — Prefer platform-provisioned TLS cert over self-signed
 
 **Decision.** When `/run/beyond/tls/cert.pem` exists, point

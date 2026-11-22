@@ -891,8 +891,9 @@ at boot from one of three sources (precedence in this order) and writes
    `pg_ctl reload` + `SIGHUP pgbouncer` on rotation. See
    `../beyond/boxes/docs/09-internal-tls.md`.
 3. **Self-signed fallback** (dev/test). Supervisor generates an
-   Ed25519 cert under `PGDATA/beyond/server.{crt,key}` and renews
-   within 30 days of expiry.
+   ECDSA P-256 (SHA-256) cert under `PGDATA/beyond/server.{crt,key}`
+   and renews within 30 days of expiry. A cert of any other signature
+   algorithm (an older Ed25519 one) is re-issued at boot, once.
 
 The resulting `06-tls.conf` overrides the `ssl_*_file` lines in
 `00-beyond.conf` (alpha order in `conf.d/` — last setting wins). For
