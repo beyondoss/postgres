@@ -700,8 +700,9 @@ fn supervisor_with_only_a_verifier_accepts_the_original_password_over_scram() {
         container.exec(&[
             "env",
             &format!("PGPASSWORD={password}"),
-            // The server's TLS certificate has no signature digest libpq can bind the channel to ("could not find digest for NID UNDEF").
-            "PGCHANNELBINDING=disable",
+            // tls-server-end-point binding needs a digest for the certificate's signature: Ed25519 has none ("could not find digest for NID UNDEF").
+            "PGCHANNELBINDING=require",
+            "PGSSLMODE=require",
             "psql",
             "-h",
             "127.0.0.1",
@@ -723,6 +724,7 @@ fn supervisor_with_only_a_verifier_accepts_the_original_password_over_scram() {
         container.logs()
     );
     assert!(!login("not the password").status.success(), "a wrong password logged in");
+    // Without channel binding the same login also works; with it required, the cert is what makes it succeed above.
 
     // The server stores exactly the verifier it was handed, and the original is nowhere in the container's metadata or environment.
     let stored = container.exec(&[
@@ -735,6 +737,41 @@ fn supervisor_with_only_a_verifier_accepts_the_original_password_over_scram() {
         &format!("grep -rqF '{PASSWORD}' /run/mmds /proc/1/environ /proc/self/environ 2>/dev/null; echo $?"),
     ]);
     assert_eq!(String::from_utf8_lossy(&leak.stdout).trim(), "1", "the original password is in the container's metadata or environment");
+    let _ = container.stop(Duration::from_secs(30));
+}
+
+/// Measurement, not a gate: connection time with TLS vs without, n=30 each, so the difference is the handshake (signing) cost of the
+/// server certificate's key type. Prints `HANDSHAKE ...` lines with p50/p95 in microseconds.
+#[test]
+#[ignore = "requires Docker + musl target + beyond-pg-test:latest image"]
+fn supervisor_tls_handshake_cost() {
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = SupervisorHarness::new().expect("Docker, the musl target and beyond-pg-test:latest are required");
+    const PASSWORD: &str = "correct horse battery";
+    const VERIFIER: &str = "SCRAM-SHA-256$4096:cbHdwWtOk0dwNZAaQVTR9g==$NYFMnqzwzMV7CTFaCfBP5J3y41xmTmDJPDLE96pN3/o=:P8VydXaJRrINE2cDxQRh2CZobwRK3EbticDXin423Nc=";
+    let container = harness.start(&[("POSTGRES_PASSWORD", VERIFIER)]);
+    assert!(container.wait_postgres_ready(Duration::from_secs(90)), "Postgres never became ready\n{}", container.logs());
+    assert!(container.wait_post_start_done(Duration::from_secs(30)), "post-start did not complete\n{}", container.logs());
+    let time_connects = |sslmode: &str| -> Vec<u64> {
+        let script = format!(
+            "for i in $(seq 35); do s=$(date +%s%N); PGPASSWORD='{PASSWORD}' PGCHANNELBINDING=disable PGSSLMODE={sslmode} psql -h 127.0.0.1 -p 5433 -U postgres -d postgres -tAc 'select 1' >/dev/null 2>&1 || echo FAIL; e=$(date +%s%N); echo T $(( (e-s)/1000 )); done"
+        );
+        let out = container.exec(&["sh", "-c", &script]);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(!text.contains("FAIL"), "a connect failed ({sslmode}): {text}");
+        let mut v: Vec<u64> = text.lines().filter_map(|l| l.strip_prefix("T ")?.trim().parse().ok()).skip(5).collect();
+        v.sort_unstable();
+        assert_eq!(v.len(), 30, "expected 30 samples after warm-up");
+        v
+    };
+    let pct = |v: &[u64], p: usize| v[(v.len() * p / 100).min(v.len() - 1)];
+    let tls = time_connects("require");
+    let plain = time_connects("disable");
+    println!(
+        "HANDSHAKE tls p50={}us p95={}us | plain p50={}us p95={}us | delta p50={}us p95={}us",
+        pct(&tls, 50), pct(&tls, 95), pct(&plain, 50), pct(&plain, 95),
+        pct(&tls, 50) as i64 - pct(&plain, 50) as i64, pct(&tls, 95) as i64 - pct(&plain, 95) as i64
+    );
     let _ = container.stop(Duration::from_secs(30));
 }
 
