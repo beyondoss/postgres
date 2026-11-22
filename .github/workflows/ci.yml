@@ -7,10 +7,13 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # aws-lc-sys (rustls) builds C for the musl test binary and looks for x86_64-linux-musl-gcc; musl-tools ships only musl-gcc.
+      CC_x86_64_unknown_linux_musl: musl-gcc
     steps:
       - uses: actions/checkout@v6
       - name: Install system dependencies
-        run: sudo apt-get install -y libreadline-dev uuid-dev
+        run: sudo apt-get install -y libreadline-dev uuid-dev musl-tools
       - uses: jdx/mise-action@v4
       - name: Install musl target
         run: rustup target add x86_64-unknown-linux-musl
