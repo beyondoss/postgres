@@ -27,6 +27,50 @@ use serde_json::json;
 // macOS Docker Desktop.  A single mutex is cheap — boot tests are I/O-bound.
 static DOCKER: Mutex<()> = Mutex::new(());
 
+/// The Postgres image every test container runs.
+///
+/// `initdb` runs as the image's `postgres` user (uid 999) and creates PGDATA
+/// 0700, so on a Linux host (bind mounts keep real uids) the unprivileged test
+/// process cannot even `stat` the files it asserts on. Rebuild the image once
+/// with `postgres` remapped to the host uid/gid: PGDATA is then owned by the
+/// test user, readable and removable by it. Under a uid-0 host (or Docker
+/// Desktop, where mounts are mapped) the stock image is used unchanged.
+fn pg_image() -> &'static str {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    static IMAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    IMAGE.get_or_init(|| {
+        let me = std::fs::metadata(env!("CARGO_MANIFEST_DIR")).expect("stat manifest dir");
+        let (uid, gid) = (me.uid(), me.gid());
+        if uid == 0 {
+            return "postgres:18".to_owned();
+        }
+        let tag = format!("beyond-pg-boot-test:{uid}-{gid}");
+        let dockerfile = format!(
+            "FROM postgres:18\n\
+             RUN groupmod -o -g {gid} postgres && usermod -o -u {uid} -g {gid} postgres \
+             && chown -R postgres:postgres /var/run/postgresql\n"
+        );
+        let mut child = std::process::Command::new("docker")
+            .args(["build", "-q", "-t", &tag, "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("docker build");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(dockerfile.as_bytes())
+            .expect("write Dockerfile");
+        assert!(
+            child.wait().expect("docker build wait").success(),
+            "docker build {tag} failed"
+        );
+        tag
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Build helper
 // ---------------------------------------------------------------------------
@@ -123,7 +167,7 @@ impl BootEnv {
     /// 1. chmod 0644s the pwfile (created 0600 root-owned by run_initdb), then
     /// 2. execs `gosu postgres /usr/lib/postgresql/18/bin/initdb`.
     fn run_boot(&self, binary: &Path, platform: &str, mmds_json: &str) -> std::process::Output {
-        self.run_boot_ex(binary, platform, mmds_json, &[], "postgres:18")
+        self.run_boot_ex(binary, platform, mmds_json, &[], pg_image())
     }
 
     /// Like `run_boot` but accepts extra docker args (inserted before the image name)
@@ -233,9 +277,20 @@ fn assert_boot_files(env: &BootEnv) {
         "pg_wal symlink points to wrong target"
     );
 
+    // boot drops the preload libraries whose .so is not installed; the stock
+    // postgres:18 image ships only the contrib ones.
+    let expected_conf = beyond_pg::config::BEYOND_CONF.replace(
+        "'pg_stat_statements,auto_explain,pg_cron,beyond_queue,pg_prewarm'",
+        "'pg_stat_statements,auto_explain,pg_prewarm'",
+    );
+    assert_ne!(
+        expected_conf,
+        beyond_pg::config::BEYOND_CONF,
+        "00-beyond.conf preload list changed: update this expectation"
+    );
     assert_eq!(
         std::fs::read_to_string(pgdata.join("postgresql.conf")).unwrap(),
-        beyond_pg::config::BEYOND_CONF,
+        expected_conf,
         "postgresql.conf content mismatch"
     );
 
@@ -307,7 +362,7 @@ fn assert_no_pitr_state(env: &BootEnv) {
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
 fn boot_initializes_fresh_pgdata() {
-    let _guard = DOCKER.lock().unwrap();
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some((binary, platform)) = build_linux_beyond_pg() else {
         return;
     };
@@ -349,7 +404,7 @@ fn boot_initializes_fresh_pgdata() {
             &format!("{pg_lib}:/var/lib/postgresql/18"),
             "-v",
             &format!("{etc_pg}:/etc/postgresql/18/main"),
-            "postgres:18",
+            pg_image(),
             "bash",
             "-c",
             "printf '%s\\n' \
@@ -386,7 +441,7 @@ fn boot_initializes_fresh_pgdata() {
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
 fn boot_is_idempotent() {
-    let _guard = DOCKER.lock().unwrap();
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some((binary, platform)) = build_linux_beyond_pg() else {
         return;
     };
@@ -440,7 +495,7 @@ fn boot_is_idempotent() {
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
 fn boot_with_platform_cert() {
-    let _guard = DOCKER.lock().unwrap();
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some((binary, platform)) = build_linux_beyond_pg() else {
         return;
     };
@@ -462,7 +517,7 @@ fn boot_with_platform_cert() {
     let tls_mount = format!("{}:/run/beyond/tls", tls_dir.path().display());
     let extra = ["-v", &tls_mount];
 
-    let out = env.run_boot_ex(&binary, platform, &mmds(&[]), &extra, "postgres:18");
+    let out = env.run_boot_ex(&binary, platform, &mmds(&[]), &extra, pg_image());
     eprintln!("stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success(), "boot exited {}", out.status);
 
@@ -506,7 +561,7 @@ fn boot_with_platform_cert() {
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
 fn boot_writes_pitr_config() {
-    let _guard = DOCKER.lock().unwrap();
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some((binary, platform)) = build_linux_beyond_pg() else {
         return;
     };
@@ -545,7 +600,7 @@ fn boot_writes_pitr_config() {
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
 fn boot_clears_pitr_state_on_second_boot() {
-    let _guard = DOCKER.lock().unwrap();
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some((binary, platform)) = build_linux_beyond_pg() else {
         return;
     };
@@ -584,7 +639,7 @@ fn boot_clears_pitr_state_on_second_boot() {
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
 fn boot_configures_wal_sink() {
-    let _guard = DOCKER.lock().unwrap();
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some((binary, platform)) = build_linux_beyond_pg() else {
         return;
     };
@@ -626,7 +681,7 @@ fn boot_configures_wal_sink() {
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
 fn boot_configures_ephemeral_volume() {
-    let _guard = DOCKER.lock().unwrap();
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some((binary, platform)) = build_linux_beyond_pg() else {
         return;
     };
@@ -669,7 +724,7 @@ fn boot_configures_ephemeral_volume() {
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
 fn boot_replica_with_preseeded_pgdata() {
-    let _guard = DOCKER.lock().unwrap();
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some((binary, platform)) = build_linux_beyond_pg() else {
         return;
     };
@@ -688,7 +743,7 @@ fn boot_replica_with_preseeded_pgdata() {
             "root",
             "-v",
             &format!("{pg_lib}:/var/lib/postgresql/18"),
-            "postgres:18",
+            pg_image(),
             "bash",
             "-c",
             "mkdir -p /var/lib/postgresql/18 && \
@@ -759,7 +814,7 @@ fn boot_replica_with_preseeded_pgdata() {
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
 fn boot_fetch_wal_gap() {
-    let _guard = DOCKER.lock().unwrap();
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some((binary, platform)) = build_linux_beyond_pg() else {
         return;
     };
@@ -784,7 +839,7 @@ fn boot_fetch_wal_gap() {
             platform,
             "-v",
             &format!("{pg_lib}:/var/lib/postgresql/18"),
-            "postgres:18",
+            pg_image(),
             "pg_controldata",
             "-D",
             "/var/lib/postgresql/18/main",
@@ -826,7 +881,9 @@ fn boot_fetch_wal_gap() {
     // Serves GET /list → segment name, GET /{segment} → bytes.
     // `--add-host=host.docker.internal:host-gateway` makes this hostname
     // resolvable inside the container on both macOS Docker Desktop and Linux Docker.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake WAL sink listener");
+    // Bind all interfaces: on Linux `host-gateway` is the docker bridge address, which a
+    // loopback-only listener never sees (Docker Desktop forwards to loopback; Linux does not).
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind fake WAL sink listener");
     let port = listener.local_addr().unwrap().port();
     let seg_name = redo_segment.clone();
     let seg_bytes = segment_bytes.clone();
@@ -839,7 +896,7 @@ fn boot_fetch_wal_gap() {
         platform,
         &mmds(&[("BEYOND_PG_WAL_SINK", &sink_url)]),
         &["--add-host=host.docker.internal:host-gateway"],
-        "postgres:18",
+        pg_image(),
     );
     eprintln!(
         "wal-gap boot stderr: {}",
@@ -973,40 +1030,25 @@ impl Drop for DockerNetwork {
     }
 }
 
-/// Python stub that replaces `aws` in containers.
-///
-/// Handles `aws s3 cp SRC DST [--no-progress]` and maps the S3 bucket
-/// `s3://beyond-test/wal/` to the local container path `/archive/`.
-const AWS_STUB_PY: &str = r#"#!/usr/bin/env python3
-import sys, os, shutil
-src, dst = sys.argv[3], sys.argv[4]
-PREFIX, LOCAL = "s3://beyond-test/wal/", "/archive/"
-fn = lambda p: LOCAL + p[len(PREFIX):] if p.startswith(PREFIX) else p
-s, d = fn(src), fn(dst)
-ddir = os.path.dirname(d)
-if ddir: os.makedirs(ddir, exist_ok=True)
-shutil.copy2(s, d)
-"#;
-
-/// Full PITR cycle: archive WAL from a live Postgres, then recover to a
-/// point-in-time using `recovery.signal` + `restore_command`.
+/// Full PITR cycle against the WAL sink: archive WAL from a live Postgres,
+/// then recover to a point in time with `recovery.signal` + the sink
+/// `restore_command` (`curl http://sink/%f`).
 ///
 /// Steps:
-///   1. Boot with `BEYOND_PG_ARCHIVE_TARGET` (no recovery target) — configures
-///      `archive_command` and `restore_command` but does not enter recovery.
-///   2. Start Postgres.  Insert rows into `before_pitr`.  Record timestamp T1.
-///      Insert rows into `after_pitr`.  Force WAL switch to flush archive.
-///   3. Stop Postgres.
-///   4. Boot again with `BEYOND_PG_ARCHIVE_TARGET` + `BEYOND_PG_RECOVERY_TARGET_TIME=T1`.
-///      Verifies `recovery.signal` is created and `05-pitr.conf` has the right content.
-///   5. Start Postgres in recovery mode.  Wait for it to replay to T1 and promote
-///      (`pg_is_in_recovery()` returns false).
-///   6. Assert `before_pitr` has 10 rows and `after_pitr` does not exist — proving
-///      Postgres recovered exactly to T1 and no further.
+///   1. Boot with no sink and no recovery target (plain primary).
+///   2. Start Postgres with `archive_command = cp`; insert rows into `before_pitr`,
+///      capture T1, insert rows into `after_pitr`, force a WAL switch to flush
+///      the archive. Stop Postgres.
+///   3. Delete the archived segments from `pg_wal` so recovery must fetch them.
+///   4. Boot again with `BEYOND_PG_WAL_SINK` + `BEYOND_PG_RECOVERY_TARGET_TIME=T1`.
+///      Verifies `recovery.signal` is created and `05-pitr.conf` has the target.
+///   5. Start Postgres with a stand-in sink (an HTTP server over the archive).
+///      Wait for it to replay to T1 and promote.
+///   6. Assert `before_pitr` has 10 rows and `after_pitr` does not exist.
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
 fn boot_pitr_recovery() {
-    let _guard = DOCKER.lock().unwrap();
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some((binary, platform)) = build_linux_beyond_pg() else {
         return;
     };
@@ -1021,51 +1063,26 @@ fn boot_pitr_recovery() {
             .expect("chmod archive dir");
     }
 
-    // Write the stub aws script and make it executable.
-    let aws_stub = tempfile::NamedTempFile::new().expect("aws stub");
-    std::fs::write(aws_stub.path(), AWS_STUB_PY).expect("write aws stub");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(aws_stub.path(), std::fs::Permissions::from_mode(0o755))
-            .expect("chmod aws stub");
-    }
-
     let archive = archive_dir.path().display().to_string();
-    let aws = aws_stub.path().display().to_string();
     let bin = binary.display().to_string();
     let pg_lib = env.pg_lib.path().display().to_string();
     let etc_pg = env.etc_pg.path().display().to_string();
 
-    let extra = &[
-        "-v",
-        &format!("{aws}:/usr/local/bin/aws"),
-        "-v",
-        &format!("{archive}:/archive"),
-    ];
-
     // ---------------------------------------------------------------------------
-    // Phase 1: boot with archive target only (no recovery target).
+    // Phase 1: plain primary boot (no sink, no recovery target).
     // ---------------------------------------------------------------------------
-    let boot1_mmds = mmds(&[("BEYOND_PG_ARCHIVE_TARGET", "s3://beyond-test/wal")]);
-    let boot1 = env.run_boot_ex(&binary, platform, &boot1_mmds, extra, "postgres:18");
+    let boot1 = env.run_boot(&binary, platform, &mmds(&[]));
     eprintln!("boot1 stderr: {}", String::from_utf8_lossy(&boot1.stderr));
     assert!(
         boot1.status.success(),
         "phase 1 boot failed: {}",
         boot1.status
     );
-    // No recovery.signal — archive target alone doesn't trigger recovery.
+    // No recovery.signal — a plain boot never enters recovery.
     assert!(
         !env.pgdata().join("recovery.signal").exists(),
-        "recovery.signal should not exist with archive target but no recovery time"
+        "recovery.signal should not exist without a recovery target"
     );
-
-    // Write the MMDS to a persistent file so the postgres container's
-    // `beyond-pg archive` subprocess can read it.
-    let mmds_file = tempfile::NamedTempFile::new().expect("mmds file");
-    std::fs::write(mmds_file.path(), &boot1_mmds).expect("write mmds");
-    let mmds_path = mmds_file.path().display().to_string();
 
     // ---------------------------------------------------------------------------
     // Phase 1 Postgres: insert data, archive WAL, capture T1.
@@ -1082,7 +1099,8 @@ fn boot_pitr_recovery() {
     //   - prints "RECOVERY_TARGET:<T1>" so the test can extract T1
     // ---------------------------------------------------------------------------
     let phase1_cmd = concat!(
-        "printf '%s\\n' 'huge_pages = try' \"shared_preload_libraries = ''\" ",
+        "printf '%s\\n' 'huge_pages = try' 'archive_mode = on' ",
+        "  \"archive_command = 'cp %p /archive/%f'\" \"shared_preload_libraries = ''\" ",
         "  >> /var/lib/postgresql/18/main/postgresql.auto.conf && ",
         "chown -R postgres:postgres /var/lib/postgresql/18/ && ",
         "mkdir -p /var/run/postgresql && chown postgres:postgres /var/run/postgresql && ",
@@ -1091,6 +1109,9 @@ fn boot_pitr_recovery() {
         "for i in $(seq 30); do pg_isready -h /var/run/postgresql -p 5433 -q && break; sleep 1; done && ",
         "gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -c ",
         "  'CREATE TABLE before_pitr (n int); INSERT INTO before_pitr SELECT generate_series(1,10)' && ",
+        // Segment break: everything after T1 lands in a later segment, which the
+        // test deletes locally so recovery must fetch it from the sink.
+        "gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -c 'SELECT pg_switch_wal()' && ",
         "sleep 2 && ",
         "T1=$(gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -tAc ",
         "  \"SELECT to_char(now(), 'YYYY-MM-DD HH24:MI:SS')\") && ",
@@ -1101,7 +1122,11 @@ fn boot_pitr_recovery() {
         // Wait for archive_command to complete (runs asynchronously in Postgres).
         "sleep 5 && ",
         "echo \"RECOVERY_TARGET:$T1\" && ",
-        "kill $PG_PID && wait $PG_PID 2>/dev/null; true",
+        // Crash it on purpose. The base is the last checkpoint (startup), which lives
+        // in the first segment; the test keeps that segment and deletes the later
+        // ones. A clean shutdown would put a checkpoint after T1 and make T1
+        // unreachable. (`kill $PG_PID` would not do: $! is the `&&` chain's subshell.)
+        "kill -9 $(head -1 /var/lib/postgresql/18/main/postmaster.pid); true",
     );
 
     let phase1_out = std::process::Command::new("docker")
@@ -1115,16 +1140,12 @@ fn boot_pitr_recovery() {
             "-v",
             &format!("{bin}:/usr/local/bin/beyond-pg"),
             "-v",
-            &format!("{aws}:/usr/local/bin/aws"),
-            "-v",
             &format!("{pg_lib}:/var/lib/postgresql/18"),
             "-v",
             &format!("{etc_pg}:/etc/postgresql/18/main"),
             "-v",
             &format!("{archive}:/archive"),
-            "-v",
-            &format!("{mmds_path}:/run/mmds/metadata.json"),
-            "postgres:18",
+            pg_image(),
             "bash",
             "-c",
             phase1_cmd,
@@ -1157,42 +1178,41 @@ fn boot_pitr_recovery() {
         .to_owned();
     eprintln!("recovery target T1 = {t1}");
 
-    // Verify at least one WAL segment was archived.
-    let archived: Vec<_> = std::fs::read_dir(archive_dir.path())
+    // At least two segments were archived: the one holding the base checkpoint and
+    // the later ones holding the changes the recovery must replay.
+    let mut archived: Vec<_> = std::fs::read_dir(archive_dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .filter(|n| n.to_string_lossy().len() == 24)
         .collect();
+    archived.sort();
     assert!(
-        !archived.is_empty(),
-        "no WAL segments were archived — archive_command or stub aws may have failed"
+        archived.len() >= 2,
+        "expected >= 2 archived WAL segments, got {archived:?}"
     );
 
-    // Delete archived segments from local pg_wal/ so recovery is forced to use
-    // restore_command (the aws stub). Only remove segments that exist in the archive
-    // — the segment started after pg_switch_wal() (containing the shutdown checkpoint)
-    // is not yet archived and must remain for recovery to find the starting checkpoint.
+    // Delete every archived segment after the first from local pg_wal/, so
+    // recovery must fetch them through restore_command (the sink). Postgres reads
+    // the checkpoint record from pg_wal only, so the first segment stays.
     {
         let wal_dir = env.pg_lib.path().join("wal");
-        let archived_names: std::collections::HashSet<_> =
-            archived.iter().map(|e| e.file_name()).collect();
-        for entry in std::fs::read_dir(&wal_dir).unwrap().filter_map(|e| e.ok()) {
-            if archived_names.contains(&entry.file_name()) {
-                std::fs::remove_file(entry.path()).ok();
-            }
+        for name in &archived[1..] {
+            std::fs::remove_file(wal_dir.join(name))
+                .unwrap_or_else(|e| panic!("remove {name:?} from pg_wal: {e}"));
         }
     }
 
     // ---------------------------------------------------------------------------
     // Phase 2: boot in PITR mode with recovery target T1.
     // ---------------------------------------------------------------------------
+    // The sink is not up during boot (the stand-in starts with Postgres in
+    // phase 2): fetch_wal_gap sees it unreachable and skips, as designed.
     let boot2_mmds = mmds(&[
-        ("BEYOND_PG_ARCHIVE_TARGET", "s3://beyond-test/wal"),
+        ("BEYOND_PG_WAL_SINK", "http://127.0.0.1:9997"),
         ("BEYOND_PG_RECOVERY_TARGET_TIME", &t1),
     ]);
-    // Update the MMDS file so `beyond-pg archive` reads the same target.
-    std::fs::write(mmds_file.path(), &boot2_mmds).expect("write boot2 mmds");
-
-    let boot2 = env.run_boot_ex(&binary, platform, &boot2_mmds, extra, "postgres:18");
+    let boot2 = env.run_boot(&binary, platform, &boot2_mmds);
     eprintln!("boot2 stderr: {}", String::from_utf8_lossy(&boot2.stderr));
     assert!(
         boot2.status.success(),
@@ -1212,10 +1232,12 @@ fn boot_pitr_recovery() {
     // ---------------------------------------------------------------------------
     // Phase 2 Postgres: start in recovery mode, wait for promotion, assert data.
     //
-    // Recovery replays archived WAL up to T1, then promotes.
+    // Recovery replays WAL fetched from the stand-in sink up to T1, then promotes.
     // After promotion pg_is_in_recovery() returns false.
     // ---------------------------------------------------------------------------
     let phase2_cmd = concat!(
+        "{ { which curl && which python3; } >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y curl python3 -qq); } && ",
+        "{ python3 -m http.server 9997 --directory /archive & } && sleep 1 && ",
         "printf '%s\\n' 'huge_pages = try' \"shared_preload_libraries = ''\" ",
         "  >> /var/lib/postgresql/18/main/postgresql.auto.conf && ",
         "chown -R postgres:postgres /var/lib/postgresql/18/ && ",
@@ -1253,16 +1275,12 @@ fn boot_pitr_recovery() {
             "-v",
             &format!("{bin}:/usr/local/bin/beyond-pg"),
             "-v",
-            &format!("{aws}:/usr/local/bin/aws"),
-            "-v",
             &format!("{pg_lib}:/var/lib/postgresql/18"),
             "-v",
             &format!("{etc_pg}:/etc/postgresql/18/main"),
             "-v",
             &format!("{archive}:/archive"),
-            "-v",
-            &format!("{mmds_path}:/run/mmds/metadata.json"),
-            "postgres:18",
+            pg_image(),
             "bash",
             "-c",
             phase2_cmd,
@@ -1301,7 +1319,7 @@ fn boot_pitr_recovery() {
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
 fn boot_replica_restore_command_curl() {
-    let _guard = DOCKER.lock().unwrap();
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some((binary, platform)) = build_linux_beyond_pg() else {
         return;
     };
@@ -1351,7 +1369,10 @@ fn boot_replica_restore_command_curl() {
         "  'CREATE TABLE curl_test (n int); INSERT INTO curl_test SELECT generate_series(1,10)' && ",
         "gosu postgres psql -h /var/run/postgresql -p 5433 -U postgres -c 'SELECT pg_switch_wal()' && ",
         "sleep 4 && ",
-        "kill $PG_PID && wait $PG_PID 2>/dev/null; true",
+        // Clean shutdown, not `kill $PG_PID`: $! is the subshell of the `&&` chain,
+        // so the kill never reached Postgres and the container's exit crashed it.
+        // Recovery then needs the checkpoint record from the segment this test deletes.
+        "gosu postgres pg_ctl stop -D /var/lib/postgresql/18/main -m fast -w; true",
     );
     let phase1_out = std::process::Command::new("docker")
         .args([
@@ -1369,7 +1390,7 @@ fn boot_replica_restore_command_curl() {
             &format!("{etc_pg}:/etc/postgresql/18/main"),
             "-v",
             &format!("{archive}:/archive"),
-            "postgres:18",
+            pg_image(),
             "bash",
             "-c",
             phase1_cmd,
@@ -1461,9 +1482,12 @@ fn boot_replica_restore_command_curl() {
     // -------------------------------------------------------------------------
     let phase2_cmd = concat!(
         // Install curl if missing (postgres:18 base may not include it)
-        "which curl 2>/dev/null || (apt-get update -qq && apt-get install -y curl -qq) && ",
+        // Braced so the install is not swept into the `&` of the next command:
+        // `a || b && c &` backgrounds the whole list, and Postgres then started
+        // before curl existed.
+        "{ { which curl && which python3; } >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y curl python3 -qq); } && ",
         // Start Python HTTP server serving the WAL archive
-        "python3 -m http.server 9997 --directory /archive & ",
+        "{ python3 -m http.server 9997 --directory /archive & } && ",
         "sleep 1 && ",
         // Postgres-specific test overrides
         "printf '%s\\n' 'huge_pages = try' \"shared_preload_libraries = ''\" ",
@@ -1508,7 +1532,7 @@ fn boot_replica_restore_command_curl() {
             &format!("{etc_pg}:/etc/postgresql/18/main"),
             "-v",
             &format!("{archive}:/archive"),
-            "postgres:18",
+            pg_image(),
             "bash",
             "-c",
             phase2_cmd,
@@ -1543,7 +1567,7 @@ fn boot_replica_restore_command_curl() {
 #[test]
 #[ignore = "requires Docker + musl target (aarch64 or x86_64)"]
 fn boot_replica_real_basebackup() {
-    let _guard = DOCKER.lock().unwrap();
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some((binary, platform)) = build_linux_beyond_pg() else {
         return;
     };
@@ -1571,7 +1595,7 @@ fn boot_replica_real_basebackup() {
         "POSTGRES_HOST_AUTH_METHOD=trust",
         "-e",
         "POSTGRES_PASSWORD=ignored",
-        "postgres:18",
+        pg_image(),
     ]);
 
     // Wait for primary to be ready.
@@ -1641,7 +1665,7 @@ fn boot_replica_real_basebackup() {
             ("BEYOND_PG_PRIMARY_CONNINFO", &conninfo),
         ]),
         &["--network", &network_name],
-        "postgres:18",
+        pg_image(),
     );
     eprintln!(
         "replica boot stdout: {}",

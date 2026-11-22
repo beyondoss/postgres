@@ -1084,7 +1084,10 @@ fn supervisor_cdc_restarts_on_crash() {
             .expect("chmod cdc stub");
     }
 
-    let stub_path = stub.path().display().to_string();
+    // Close the write handle NamedTempFile keeps open: execve of a file that is
+    // open for writing fails with ETXTBSY, which killed the supervisor at spawn.
+    let stub = stub.into_temp_path();
+    let stub_path = stub.display().to_string();
     let container = harness.start_extra(
         &[("BEYOND_PG_CDC_ENABLED", "true")],
         &[(&stub_path, "/usr/local/bin/beyond-pg-cdc")],
