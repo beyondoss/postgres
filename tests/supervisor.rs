@@ -669,6 +669,64 @@ fn supervisor_lifecycle_primary() {
     );
 }
 
+/// The VM is handed only a SCRAM-SHA-256 verifier of the superuser's password (the Beyond node derives it; see `env_relay`). initdb takes it
+/// as given and `ALTER ROLE postgres PASSWORD` on every start sets it again; a client that knows the ORIGINAL password logs in over SCRAM, a wrong
+/// one does not, and the container holds no copy of the original in its metadata or environment.
+#[test]
+#[ignore = "requires Docker + musl target + beyond-pg-test:latest image"]
+fn supervisor_with_only_a_verifier_accepts_the_original_password_over_scram() {
+    // PostgreSQL 17's own `rolpassword` for the password below (docker postgres:17, `SET password_encryption='scram-sha-256'`).
+    const PASSWORD: &str = "correct horse battery";
+    const VERIFIER: &str = "SCRAM-SHA-256$4096:cbHdwWtOk0dwNZAaQVTR9g==$NYFMnqzwzMV7CTFaCfBP5J3y41xmTmDJPDLE96pN3/o=:P8VydXaJRrINE2cDxQRh2CZobwRK3EbticDXin423Nc=";
+    let _guard = DOCKER.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = SupervisorHarness::new().expect("Docker, the musl target and beyond-pg-test:latest are required");
+    let container = harness.start(&[("POSTGRES_PASSWORD", VERIFIER)]);
+    if !container.wait_postgres_ready(Duration::from_secs(90)) {
+        eprintln!("logs:\n{}", container.logs());
+        panic!("Postgres never became ready");
+    }
+    assert!(container.wait_post_start_done(Duration::from_secs(30)), "post-start did not complete\n{}", container.logs());
+
+    let login = |password: &str| {
+        container.exec(&[
+            "env",
+            &format!("PGPASSWORD={password}"),
+            "psql",
+            "-h",
+            "127.0.0.1",
+            "-p",
+            "5433",
+            "-U",
+            "postgres",
+            "-d",
+            "postgres",
+            "-tAc",
+            "SELECT 'scram-login-ok'",
+        ])
+    };
+    let ok = login(PASSWORD);
+    assert!(
+        ok.status.success() && String::from_utf8_lossy(&ok.stdout).trim() == "scram-login-ok",
+        "the original password did not log in: {}\n{}",
+        String::from_utf8_lossy(&ok.stderr),
+        container.logs()
+    );
+    assert!(!login("not the password").status.success(), "a wrong password logged in");
+
+    // The server stores exactly the verifier it was handed, and the original is nowhere in the container's metadata or environment.
+    let stored = container.exec(&[
+        "gosu", "postgres", "psql", "-h", "/var/run/postgresql", "-p", "5433", "-tAc",
+        "SELECT rolpassword FROM pg_authid WHERE rolname='postgres'",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&stored.stdout).trim(), VERIFIER);
+    let leak = container.exec(&[
+        "sh", "-c",
+        &format!("grep -rqF '{PASSWORD}' /run/mmds /proc/1/environ /proc/self/environ 2>/dev/null; echo $?"),
+    ]);
+    assert_eq!(String::from_utf8_lossy(&leak.stdout).trim(), "1", "the original password is in the container's metadata or environment");
+    let _ = container.stop(Duration::from_secs(30));
+}
+
 /// Warm-start: a busy box that cold-restarts must come back at its pre-restart
 /// pooler size, not a single worker — the post-restart reconnect storm is peak
 /// handshake churn, the worst moment to be under-provisioned. children.json is
