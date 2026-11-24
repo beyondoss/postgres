@@ -4,6 +4,7 @@ members = [
   "beyond-pg-cdc",
   "beyond-pg-core",
   "beyond-pg-init",
+  "beyond-pg-kernels",
   "beyond-pg-sink",
   "wal-proto",
 ]
@@ -21,6 +22,7 @@ path = "src/main.rs"
 
 [dependencies]
 beyond-pg-core = { path = "./beyond-pg-core" }
+beyond-pg-kernels = { path = "./beyond-pg-kernels" }
 clap = { version = "4", features = ["derive"] }
 quinn = "0.11"
 rcgen = "0.14"
