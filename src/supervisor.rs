@@ -588,8 +588,11 @@ async fn run_inner_inner(role: MaybeRole) -> Result<(), Box<dyn std::error::Erro
         cold_start_wal_handle = wfh;
 
         // Replicas are read-only hot standbys — DDL is rejected during recovery.
-        if cfg.pg_tier != PgTier::Replica {
-            post_start(&cfg).await?;
+        // The start's plan is the kernel's (beyond-pg-kernels/src/start.rs): which starts run post_start, and that it opens by setting the
+        // role's password to the served value, so a data directory carrying another instance's hash (a fork, a restore) takes this one's.
+        let start = beyond_pg_kernels::start::plan(cfg.pg_tier == PgTier::Replica, false);
+        if start.post_start {
+            post_start(&cfg, start).await?;
         }
 
         let mut pgb = ChildState::new("pgbouncer");
@@ -1819,7 +1822,7 @@ async fn wait_for_sync_standby(name: &str, timeout: std::time::Duration) {
 // Post-start setup
 // ---------------------------------------------------------------------------
 
-async fn post_start(cfg: &MmdsConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn post_start(cfg: &MmdsConfig, start: beyond_pg_kernels::start::Plan) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve the extensions to (idempotently) create: required + optional,
     // filtered to those whose control file is present. A REQUIRED extension
     // missing its control file is downgraded to a warning (the standalone image
@@ -1852,7 +1855,7 @@ async fn post_start(cfg: &MmdsConfig) -> Result<(), Box<dyn std::error::Error>> 
     // process spawns + reconnects. Every statement is idempotent and, on a
     // well-formed image, a no-op or fast role op — so a failure is a real problem
     // and rightly aborts post_start (→ restart).
-    pg::psql_script(&build_post_start_script(cfg, &extensions))
+    pg::psql_script(&build_post_start_script(cfg, start, &extensions))
         .await
         .map_err(|e| format!("post-start setup failed: {e}"))?;
 
@@ -1869,15 +1872,17 @@ async fn post_start(cfg: &MmdsConfig) -> Result<(), Box<dyn std::error::Error>> 
 /// per `extensions` → (when WAL consumers exist) replicator role + password →
 /// (when CDC enabled) slot + publication. Every statement is `;`-terminated so
 /// the whole thing runs as one `psql -f -` with `ON_ERROR_STOP=1`.
-fn build_post_start_script(cfg: &MmdsConfig, extensions: &[&str]) -> String {
+fn build_post_start_script(cfg: &MmdsConfig, start: beyond_pg_kernels::start::Plan, extensions: &[&str]) -> String {
     let mut s = String::new();
 
     // 1. Reset the superuser password from the per-instance MMDS secret.
-    s.push_str(&pg::alter_role_password_sql(
-        "postgres",
-        &cfg.postgres_password,
-    ));
-    s.push_str(";\n");
+    if start.reset_role {
+        s.push_str(&pg::alter_role_password_sql(
+            "postgres",
+            &cfg.postgres_password,
+        ));
+        s.push_str(";\n");
+    }
 
     // 2. pgbouncer auth (role + SECURITY DEFINER lookup function + grants).
     s.push_str(crate::sql::PGBOUNCER_AUTH_SQL);
@@ -2286,7 +2291,7 @@ mod tests {
 
     #[test]
     fn post_start_script_is_one_terminated_batch() {
-        let s = build_post_start_script(&pg_cfg(None, None, false), &["vector", "postgis"]);
+        let s = build_post_start_script(&pg_cfg(None, None, false), beyond_pg_kernels::start::plan(false, false), &["vector", "postgis"]);
         // superuser password (dollar-quoted) + pgbouncer auth, each terminated.
         assert!(s.contains("ALTER ROLE postgres WITH PASSWORD $_beyond_$s3cr3t$_beyond_$;"));
         assert!(s.contains("CREATE SCHEMA IF NOT EXISTS pgbouncer;"));
@@ -2304,7 +2309,7 @@ mod tests {
     #[test]
     fn post_start_script_adds_replicator_and_cdc_when_enabled() {
         // WAL sink ⇒ replicator role (no password set); CDC ⇒ slot + publication.
-        let s = build_post_start_script(&pg_cfg(Some("rpw"), Some("http://sink:9000"), true), &[]);
+        let s = build_post_start_script(&pg_cfg(Some("rpw"), Some("http://sink:9000"), true), beyond_pg_kernels::start::plan(false, false), &[]);
         assert!(s.contains("CREATE ROLE replicator LOGIN REPLICATION PASSWORD NULL"));
         assert!(s.contains("ALTER ROLE replicator WITH PASSWORD $_beyond_$rpw$_beyond_$;"));
         assert!(s.contains("pg_create_logical_replication_slot('cdc'"));
@@ -2315,7 +2320,7 @@ mod tests {
     #[test]
     fn post_start_script_replicator_without_password_when_only_sink() {
         // wal_sink alone creates the role but sets NO password (PASSWORD NULL).
-        let s = build_post_start_script(&pg_cfg(None, Some("http://sink:9000"), false), &[]);
+        let s = build_post_start_script(&pg_cfg(None, Some("http://sink:9000"), false), beyond_pg_kernels::start::plan(false, false), &[]);
         assert!(s.contains("CREATE ROLE replicator"));
         assert!(!s.contains("ALTER ROLE replicator WITH PASSWORD"));
     }

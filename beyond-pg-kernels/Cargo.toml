@@ -1,0 +1,25 @@
+[package]
+name = "beyond-pg-kernels"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "UNLICENSED"
+description = "beyond-pg's pure decision kernels: no I/O, no clock, proven with Verus"
+
+[lib]
+name = "beyond_pg_kernels"
+
+[features]
+default = []
+# `start::plan`: a start that runs post_start leaves the role's password as it was (a fork or restore keeps the source's hash). `cargo verus verify --features mut_start_keeps_stored_role` must go red.
+mut_start_keeps_stored_role = []
+
+[dependencies]
+# The `verus!` macro and the spec library. A normal build erases every proof; only a `cargo verus` build checks them.
+vstd = "=0.0.0-2026-11-01-0251"
+
+[package.metadata.verus]
+verify = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)'] }

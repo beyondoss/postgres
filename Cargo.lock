@@ -277,6 +277,7 @@ version = "0.1.0"
 dependencies = [
  "beyond-handoff",
  "beyond-pg-core",
+ "beyond-pg-kernels",
  "clap",
  "libc",
  "nix 0.31.2",
@@ -335,6 +336,13 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-vsock",
+]
+
+[[package]]
+name = "beyond-pg-kernels"
+version = "0.1.0"
+dependencies = [
+ "vstd",
 ]
 
 [[package]]
@@ -619,6 +627,12 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
+name = "convert_case"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
 
 [[package]]
 name = "core-foundation"
@@ -3452,6 +3466,60 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "verus_builtin"
+version = "0.0.0-2026-11-01-0251"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5cecde3e49b95f670dee0000707b0fe24d3894ffec56d9e6c49f404878b30e9"
+
+[[package]]
+name = "verus_builtin_macros"
+version = "0.0.0-2026-11-01-0251"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94dbd5043818524d73436d4dd20a8f67f8f8c13dc00d2662d643ce994ff2dbb5"
+dependencies = [
+ "convert_case",
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
+ "verus_prettyplease",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_prettyplease"
+version = "0.0.0-2026-11-01-0251"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b2cf0618d8d5ed0cde78122effaf56f5be0a0d0e0f9066735fa9f17d6ba6a4a"
+dependencies = [
+ "proc-macro2",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_state_machines_macros"
+version = "0.0.0-2026-11-01-0251"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36b7a87f62a49719385cad07ad58ad9d17af29642dd331a5cdc25eba2423b716"
+dependencies = [
+ "indexmap 2.14.0",
+ "proc-macro2",
+ "quote",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_syn"
+version = "0.0.0-2026-11-01-0251"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "461620a5ec0fb547ba398e42fb25a017bd8764798a32099eed73c77dd979ac39"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "vsock"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3459,6 +3527,17 @@ checksum = "6ba782755fc073877e567c2253c0be48e4aa9a254c232d36d3985dfae0bd5205"
 dependencies = [
  "libc",
  "nix 0.31.2",
+]
+
+[[package]]
+name = "vstd"
+version = "0.0.0-2026-11-01-0251"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cfcc2fc379ffbcda31111f1a7da2a34d00bd984407cfa85d1edcf64da38dbd2"
+dependencies = [
+ "verus_builtin",
+ "verus_builtin_macros",
+ "verus_state_machines_macros",
 ]
 
 [[package]]
